@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: telegram-bot-mongodb
+    environment:
+      MONGO_INITDB_DATABASE: telegram_bot
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build: .
+    container_name: telegram-bot
+    env_file:
+      - .env
+    environment:
+      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DATABASE=telegram_bot
+      - HOLMES_CONFIG_PATH=/root/.holmes/config.yaml
+      - LOG_LEVEL=INFO
+      - RATE_LIMIT_PER_MINUTE=30
+      - PERMISSION_REQUEST_EXPIRY_MINUTES=10
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    volumes:
+      - holmes_config:/root/.holmes
+    restart: unless-stopped
+
+volumes:
+  mongodb_data:
+  holmes_config:

@@ -1,0 +1,16 @@
+# Core dependencies
+python-telegram-bot==21.4
+pymongo==4.8.0
+python-dotenv==1.0.1
+
+# HolmesGPT - installed via pipx in Dockerfile, but we need the Python package for imports
+# holmesgpt is installed via pipx in the base Dockerfile
+
+# Utilities
+structlog==24.1.0
+tenacity==8.2.3
+
+# Testing
+pytest==8.2.1
+pytest-asyncio==0.23.3
+pytest-mock==3.14.0
