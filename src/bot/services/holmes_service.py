@@ -185,18 +185,92 @@ class HolmesService:
             holmes_messages.append(holmes_msg)
         return holmes_messages
 
+    def _normalize_tool_result(self, tool_call: Any) -> dict:
+        """
+        Normalize MCP tool result to OpenAI-compatible format.
+
+        MCP tools return rich results with metadata. The LLM only needs:
+        - tool_call_id (to match the call)
+        - function.name (tool name)
+        - function.arguments (params as JSON string)
+        - content (result as string)
+        """
+        try:
+            # If already in correct format, return as-is
+            if isinstance(tool_call, dict) and "function" in tool_call:
+                return tool_call
+
+            # Extract from MCP result format
+            if isinstance(tool_call, dict):
+                tool_name = tool_call.get("tool_name") or tool_call.get("name")
+                params = tool_call.get("params", {})
+                data = tool_call.get("data", "")
+                tool_call_id = tool_call.get("tool_call_id") or tool_call.get("id")
+
+                # If data is a JSON string, parse it to extract clean content
+                content = data
+                if isinstance(data, str):
+                    try:
+                        import json
+                        parsed = json.loads(data)
+                        # Extract meaningful content from structured results
+                        if isinstance(parsed, dict) and "results" in parsed:
+                            # For search_contacts and similar - summarize results
+                            results = parsed["results"]
+                            if isinstance(results, list):
+                                content = f"Found {len(results)} results"
+                                for r in results[:3]:  # First 3 items
+                                    if isinstance(r, dict):
+                                        name = r.get("name") or r.get("username") or str(r)
+                                        content += f"\n- {name}"
+                        elif isinstance(parsed, dict):
+                            # Generic dict - stringify
+                            content = json.dumps(parsed, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        pass  # Keep original string
+
+                return {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(params, ensure_ascii=False) if params else "{}"
+                    }
+                }
+        except Exception as e:
+            logger.warning("Failed to normalize tool call, using fallback", error=str(e))
+
+        # Fallback: return minimal valid structure
+        return {
+            "id": "unknown",
+            "type": "function",
+            "function": {
+                "name": "unknown_tool",
+                "arguments": "{}"
+            }
+        }
+
     def _convert_llm_result_to_message(self, result: LLMResult) -> Message:
         """Convert LLMResult to our Message model."""
         # Convert ToolCallResult objects to serializable dictionaries
         tool_calls = []
         if result.tool_calls:
             for tc in result.tool_calls:
-                if hasattr(tc, 'to_client_dict'):
-                    tool_calls.append(tc.to_client_dict())
-                elif hasattr(tc, 'model_dump'):
-                    tool_calls.append(tc.model_dump())
-                else:
-                    tool_calls.append(tc)
+                try:
+                    if hasattr(tc, 'to_client_dict'):
+                        tc_dict = tc.to_client_dict()
+                    elif hasattr(tc, 'model_dump'):
+                        tc_dict = tc.model_dump()
+                    else:
+                        tc_dict = tc
+
+                    # Normalize to OpenAI format for LLM compatibility
+                    normalized = self._normalize_tool_result(tc_dict)
+                    tool_calls.append(normalized)
+                except Exception as e:
+                    logger.warning("Failed to serialize tool call, skipping", error=str(e))
+                    # Skip malformed tool calls rather than crashing
+                    continue
 
         return Message(
             role="assistant",
@@ -249,8 +323,13 @@ class HolmesService:
                 response_text, llm_result = await self._non_stream_chat_with_memory(holmes_messages, features, user_id)
 
                 # Save Holmes response with tool calls and metadata to conversation
-                assistant_msg = self._convert_llm_result_to_message(llm_result)
-                conversation.add_message(assistant_msg)
+                try:
+                    assistant_msg = self._convert_llm_result_to_message(llm_result)
+                    conversation.add_message(assistant_msg)
+                except Exception as e:
+                    logger.warning("Failed to save assistant message, continuing without tool calls", error=str(e))
+                    # Add a basic message without tool calls so conversation continues
+                    conversation.add_message(Message(role="assistant", content=response_text or ""))
 
                 # Update Holmes session memory
                 self.update_conversation_memory(conversation, {
@@ -261,7 +340,10 @@ class HolmesService:
                 return response_text
         except Exception as e:
             logger.error("Holmes chat error", user_id=user_id, error=str(e))
-            raise
+            # Return a user-friendly error instead of crashing
+            error_msg = "I encountered an error while processing your request. Please try again."
+            conversation.add_message(Message(role="assistant", content=error_msg))
+            return error_msg
 
     def _build_holmes_messages(self, messages: List[Dict[str, Any]], user_id: int) -> List[Dict[str, Any]]:
         """Build Holmes-compatible messages with proper system prompt and tool formatting."""
