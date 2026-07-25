@@ -40,16 +40,36 @@ class TestConversationService:
         mock_collection.find_one.assert_called_once_with({"user_id": 123456789})
 
     @pytest.mark.asyncio
-    async def test_get_conversation_new(self, conversation_service):
-        """Test getting new conversation (creates empty)."""
+    async def test_get_conversation_new_topic_isolated(self, conversation_service):
+        """Test that new forum topic gets isolated conversation (no fallback to user_id)."""
         mock_collection = MagicMock()
+        # No document for the specific topic
         mock_collection.find_one.return_value = None
         conversation_service._collection = mock_collection
 
-        conv = await conversation_service.get_conversation(123456789)
+        conv = await conversation_service.get_conversation(123456789, topic_id=999, chat_id=888)
 
         assert conv.user_id == 123456789
+        assert conv.topic_id == 999
+        assert conv.chat_id == 888
         assert len(conv.messages) == 0
+        # Should only query by topic_id+chat_id, not fall back to user_id
+        mock_collection.find_one.assert_called_once_with({"topic_id": 999, "chat_id": 888})
+
+    @pytest.mark.asyncio
+    async def test_get_conversation_private_chat_fallback(self, conversation_service, sample_conversation):
+        """Test that private chat (topic_id=0) falls back to user_id."""
+        mock_collection = MagicMock()
+        mock_collection.find_one.return_value = sample_conversation.to_dict()
+        conversation_service._collection = mock_collection
+
+        conv = await conversation_service.get_conversation(123456789, topic_id=0, chat_id=0)
+
+        assert conv.user_id == 123456789
+        assert conv.topic_id == 0
+        assert conv.chat_id == 0
+        assert len(conv.messages) == 2
+        mock_collection.find_one.assert_called_once_with({"user_id": 123456789})
 
     @pytest.mark.asyncio
     async def test_save_conversation_new(self, conversation_service, sample_conversation):

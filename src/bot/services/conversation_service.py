@@ -40,13 +40,15 @@ class ConversationService:
 
     async def get_conversation(self, user_id: int, topic_id: int = 0, chat_id: int = 0) -> Conversation:
         """Get or create conversation for a user/topic."""
-        # Try to find by topic_id and chat_id first (for forum topics)
+        # For forum topics: always use topic_id + chat_id (no fallback)
         if topic_id and chat_id:
             doc = self.collection.find_one({"topic_id": topic_id, "chat_id": chat_id})
             if doc:
                 return Conversation.from_dict(doc)
+            # Create new conversation for this specific topic
+            return Conversation(user_id=user_id, topic_id=topic_id, chat_id=chat_id)
 
-        # Fallback to user_id (for private chats or legacy)
+        # For private chats (no topic): use user_id only
         doc = self.collection.find_one({"user_id": user_id})
         if doc:
             return Conversation.from_dict(doc)
