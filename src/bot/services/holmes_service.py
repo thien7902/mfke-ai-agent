@@ -500,6 +500,9 @@ class HolmesService:
             event_name = event.event.name
             event_data = event.data
 
+            # DEBUG: Log all event types to understand what's emitted
+            logger.debug("Holmes stream event", event_name=event_name, data_keys=list(event_data.keys()) if isinstance(event_data, dict) else "non-dict")
+
             # Periodically check for investigation task updates (every ~5 events)
             last_task_check += 1
             if last_task_check >= 5:
@@ -517,10 +520,18 @@ class HolmesService:
 
             if event_name == "AI_MESSAGE":
                 content = event_data.get("content")
+                reasoning = event_data.get("reasoning") or event_data.get("thinking")
+
                 if content:
                     yield {
                         "type": "content",
                         "content": content
+                    }
+                # Also yield reasoning if present in the message
+                if reasoning:
+                    yield {
+                        "type": "thinking",
+                        "content": reasoning
                     }
             elif event_name == "TOOL_CALL":
                 # Tool call started

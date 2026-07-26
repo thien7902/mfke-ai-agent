@@ -311,12 +311,21 @@ class MessageHandler:
         chat_id: int,
         topic_id: int,
     ):
-        """Handle streaming response with real-time task updates."""
+        """Handle streaming response with clean task progress updates."""
         # Send initial empty message to edit
         message = await update.message.reply_text("🤔 Thinking...", message_thread_id=topic_id or None)
 
+        # IMMEDIATELY send a status message so user sees something
+        status_message = await update.message.reply_text(
+            "📍 **Status**: 🔄 Working...",
+            message_thread_id=topic_id or None,
+            parse_mode="Markdown"
+        )
+
         full_response = ""
         task_message = None
+        current_status = "🔄 Working..."
+        last_tool = None
         try:
             async_gen = await self.holmes.chat(
                 user_id=update.effective_user.id,
@@ -353,18 +362,50 @@ class MessageHandler:
                                 await task_message.edit_text(task_text, parse_mode="Markdown")
                             except Exception:
                                 pass
+                        # Update status based on current task
+                        current_status = self._get_status_from_tasks(tasks)
+                        try:
+                            await status_message.edit_text(f"📍 **Status**: {current_status}", parse_mode="Markdown")
+                        except Exception:
+                            pass
 
                 elif event_type == "tool_call":
                     tool_name = event.get("tool_name", "unknown")
-                    # Optionally show tool calls
-                    pass
+                    last_tool = tool_name
+                    # Update status with current tool (clean, no params)
+                    friendly_name = self._get_friendly_tool_name(tool_name)
+                    current_status = f"🔧 Using {friendly_name}..."
+                    try:
+                        await status_message.edit_text(
+                            f"📍 **Status**: {current_status}",
+                            message_thread_id=topic_id or None,
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
 
-                elif event_type == "thinking":
-                    # Optionally show AI reasoning
-                    pass
+                elif event_type == "tool_result":
+                    tool_name = event.get("tool_name", "unknown")
+                    if tool_name == last_tool:
+                        friendly_name = self._get_friendly_tool_name(tool_name)
+                        current_status = f"✅ Completed {friendly_name}"
+                        try:
+                            await status_message.edit_text(
+                                f"📍 **Status**: {current_status}",
+                                message_thread_id=topic_id or None,
+                                parse_mode="Markdown"
+                            )
+                        except Exception:
+                            pass
 
             # Final edit of main response
             await message.edit_text(full_response, message_thread_id=topic_id or None)
+
+            # Final status
+            try:
+                await status_message.edit_text("📍 **Status**: ✅ Done", parse_mode="Markdown")
+            except Exception:
+                pass
 
         except Exception as e:
             logger.error("Streaming error", error=str(e))
@@ -372,6 +413,39 @@ class MessageHandler:
 
         # Save conversation
         await self.conversations.save_conversation(conversation)
+
+    def _get_friendly_tool_name(self, tool_name: str) -> str:
+        """Convert technical tool names to user-friendly names."""
+        friendly_names = {
+            'get_shoot_kubeconfig': 'Getting cluster access',
+            'kubectl_get': 'Querying Kubernetes resources',
+            'kubectl_exec': 'Running commands in cluster',
+            'search_contacts': 'Searching contacts',
+            'get_cluster_info': 'Fetching cluster info',
+            'TodoWrite': 'Planning investigation',
+            'add_memory': 'Saving to memory',
+            'bash': 'Running shell command',
+            'read_file': 'Reading file',
+            'write_file': 'Writing file',
+        }
+        return friendly_names.get(tool_name, tool_name.replace('_', ' ').title())
+
+    def _get_status_from_tasks(self, tasks: list) -> str:
+        """Generate status text from task list."""
+        if not tasks:
+            return "🤔 Starting investigation..."
+
+        in_progress = [t for t in tasks if t.get('status', '').lower() in ('in_progress', '~', 'pending')]
+        completed = [t for t in tasks if t.get('status', '').lower() in ('completed', '✓', 'done')]
+
+        if in_progress:
+            task = in_progress[0]
+            content = task.get('Content', task.get('content', 'Working...'))
+            return f"🔄 {content}"
+        elif completed and len(completed) == len(tasks):
+            return "✅ Investigation complete"
+        else:
+            return f"📋 {len(completed)}/{len(tasks)} tasks done"
 
     def _format_task_list(self, tasks: list) -> str:
         """Format task list for Telegram display."""
@@ -443,8 +517,18 @@ class MessageHandler:
             message_thread_id=topic_id
         )
 
+        # IMMEDIATELY send a status message so user sees something
+        status_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text="📍 **Status**: 🔄 Working...",
+            message_thread_id=topic_id,
+            parse_mode="Markdown"
+        )
+
         full_response = ""
         task_message = None
+        current_status = "🔄 Working..."
+        last_tool = None
         try:
             async_gen = await self.holmes.chat(
                 user_id=user_id,
@@ -482,18 +566,50 @@ class MessageHandler:
                                 await task_message.edit_text(task_text, parse_mode="Markdown")
                             except Exception:
                                 pass
+                        # Update status based on current task
+                        current_status = self._get_status_from_tasks(tasks)
+                        try:
+                            await status_message.edit_text(f"📍 **Status**: {current_status}", parse_mode="Markdown")
+                        except Exception:
+                            pass
 
                 elif event_type == "tool_call":
                     tool_name = event.get("tool_name", "unknown")
-                    # Optionally show tool calls
-                    pass
+                    last_tool = tool_name
+                    # Update status with current tool (clean, no params)
+                    friendly_name = self._get_friendly_tool_name(tool_name)
+                    current_status = f"🔧 Using {friendly_name}..."
+                    try:
+                        await status_message.edit_text(
+                            f"📍 **Status**: {current_status}",
+                            message_thread_id=topic_id,
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
 
-                elif event_type == "thinking":
-                    # Optionally show AI reasoning
-                    pass
+                elif event_type == "tool_result":
+                    tool_name = event.get("tool_name", "unknown")
+                    if tool_name == last_tool:
+                        friendly_name = self._get_friendly_tool_name(tool_name)
+                        current_status = f"✅ Completed {friendly_name}"
+                        try:
+                            await status_message.edit_text(
+                                f"📍 **Status**: {current_status}",
+                                message_thread_id=topic_id,
+                                parse_mode="Markdown"
+                            )
+                        except Exception:
+                            pass
 
             # Final edit of main response
             await message.edit_text(full_response, message_thread_id=topic_id)
+
+            # Final status
+            try:
+                await status_message.edit_text("📍 **Status**: ✅ Done", parse_mode="Markdown")
+            except Exception:
+                pass
 
         except Exception as e:
             logger.error("Streaming error", error=str(e))
