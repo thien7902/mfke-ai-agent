@@ -76,13 +76,32 @@ class MessageHandler:
         self.permissions = permission_service
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle incoming text message."""
-        if not update.message or not update.message.text:
+        """Handle incoming text message, stickers, and emojis."""
+        if not update.message:
+            return
+
+        # Extract text content from various message types
+        message_text = None
+        if update.message.text:
+            message_text = update.message.text
+        elif update.message.sticker:
+            # Handle stickers - use emoji or description
+            message_text = update.message.sticker.emoji or f"[Sticker: {update.message.sticker.set_name}]"
+        elif update.message.emoji:
+            # Handle raw emoji messages (rare, but possible)
+            message_text = update.message.emoji
+        elif update.message.animation:
+            # Handle GIFs/animations
+            message_text = f"[Animation: {update.message.animation.file_name or 'GIF'}]"
+        elif update.message.photo:
+            # Handle photos
+            message_text = "[Photo]"
+        else:
+            # Ignore other message types (voice, video, document, etc.)
             return
 
         user = update.effective_user
         user_id = user.id
-        message_text = update.message.text
         message_id = update.message.message_id
 
         # Skip commands (they start with /)
