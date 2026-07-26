@@ -23,6 +23,21 @@ _TOPIC_CREATION_COOLDOWN = 10  # seconds - increased from 5
 _processed_messages: dict[int, float] = {}
 _MESSAGE_PROCESSING_TTL = 30  # seconds
 
+# Cache for progress topic IDs (main_topic_id -> progress_topic_id)
+_progress_topic_cache: dict[tuple, int] = {}  # (chat_id, main_topic_id) -> progress_topic_id
+
+# Per-topic locks to serialize message processing
+import asyncio
+_topic_locks: dict[tuple, asyncio.Lock] = {}  # (chat_id, topic_id) -> Lock
+
+
+def _get_topic_lock(chat_id: int, topic_id: int) -> asyncio.Lock:
+    """Get or create a lock for a specific topic."""
+    key = (chat_id, topic_id)
+    if key not in _topic_locks:
+        _topic_locks[key] = asyncio.Lock()
+    return _topic_locks[key]
+
 
 def _generate_topic_name(user_message: str, user_id: int) -> str:
     """Generate a topic name from user message: 2-3 word summary + random ID."""
@@ -108,9 +123,12 @@ class MessageHandler:
 
         logger.info("Received message", user_id=user_id, chat_id=chat_id, topic_id=topic_id, text=message_text[:50])
 
-        try:
-            # Get or create user
-            user_model = await self.permissions.get_or_create_user(
+        # Acquire per-topic lock to serialize messages in the same topic
+        lock = _get_topic_lock(chat_id, topic_id)
+        async with lock:
+            try:
+                # Get or create user
+                user_model = await self.permissions.get_or_create_user(
                 telegram_id=user_id,
                 username=user.username,
                 first_name=user.first_name,
@@ -179,6 +197,74 @@ class MessageHandler:
             f"Send a message here to start chatting with the AI!",
             message_thread_id=topic_id
         )
+
+    async def _get_or_create_progress_topic(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, main_topic_id: int) -> int:
+        """Get or create a progress tracking topic for a main conversation topic."""
+        cache_key = (chat_id, main_topic_id)
+
+        # Check cache first
+        if cache_key in _progress_topic_cache:
+            return _progress_topic_cache[cache_key]
+
+        # Try to find existing progress topic
+        # Progress topic name format: "📊 Progress: <main_topic_name>"
+        try:
+            # Get main topic info
+            main_topic = await context.bot.get_forum_topic(chat_id=chat_id, message_thread_id=main_topic_id)
+            main_topic_name = main_topic.name if main_topic else f"Topic {main_topic_id}"
+        except Exception:
+            main_topic_name = f"Topic {main_topic_id}"
+
+        progress_topic_name = f"📊 Progress: {main_topic_name}"[:100]
+
+        # Search for existing progress topic
+        try:
+            topics = await context.bot.get_forum_topics(chat_id=chat_id)
+            for topic in topics:
+                if topic.name == progress_topic_name:
+                    _progress_topic_cache[cache_key] = topic.message_thread_id
+                    return topic.message_thread_id
+        except Exception:
+            pass
+
+        # Create new progress topic
+        try:
+            progress_topic = await context.bot.create_forum_topic(
+                chat_id=chat_id,
+                name=progress_topic_name,
+                icon_color=0xFFA500  # Orange color for progress
+            )
+            progress_topic_id = progress_topic.message_thread_id
+            _progress_topic_cache[cache_key] = progress_topic_id
+
+            # Send initial message in progress topic
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"📊 **Progress Tracking for: {main_topic_name}**\n\n"
+                    f"Real-time investigation status will appear here.\n"
+                    f"Main conversation: #{main_topic_id}"
+                ),
+                message_thread_id=progress_topic_id,
+                parse_mode="Markdown"
+            )
+
+            logger.info("Created progress topic",
+                       chat_id=chat_id,
+                       main_topic_id=main_topic_id,
+                       progress_topic_id=progress_topic_id)
+
+            return progress_topic_id
+        except Exception as e:
+            logger.error("Failed to create progress topic",
+                        chat_id=chat_id,
+                        main_topic_id=main_topic_id,
+                        error=str(e))
+            return 0  # Return 0 to indicate no progress topic
+
+    def _get_progress_topic_id(self, chat_id: int, main_topic_id: int) -> int:
+        """Get cached progress topic ID."""
+        return _progress_topic_cache.get((chat_id, main_topic_id), 0)
 
     async def _handle_general_chat_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user, chat_id: int):
         """Handle messages in general chat (not in a topic) - create a new topic for each mention."""
