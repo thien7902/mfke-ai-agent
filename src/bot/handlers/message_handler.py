@@ -311,11 +311,12 @@ class MessageHandler:
         chat_id: int,
         topic_id: int,
     ):
-        """Handle streaming response."""
+        """Handle streaming response with real-time task updates."""
         # Send initial empty message to edit
         message = await update.message.reply_text("🤔 Thinking...", message_thread_id=topic_id or None)
 
         full_response = ""
+        task_message = None
         try:
             async_gen = await self.holmes.chat(
                 user_id=update.effective_user.id,
@@ -324,16 +325,45 @@ class MessageHandler:
                 user_permissions=user_permissions,
                 stream=True,
             )
-            async for chunk in async_gen:
-                full_response += chunk
-                # Edit message every few chunks to avoid rate limits
-                if len(full_response) % 50 == 0:
-                    try:
-                        await message.edit_text(full_response + "▌", message_thread_id=topic_id or None)
-                    except Exception:
-                        pass  # Ignore edit conflicts
+            async for event in async_gen:
+                event_type = event.get("type", "unknown")
 
-            # Final edit
+                if event_type == "content":
+                    full_response += event.get("content", "")
+                    # Edit message every few chunks to avoid rate limits
+                    if len(full_response) % 100 == 0:
+                        try:
+                            await message.edit_text(full_response + "▌", message_thread_id=topic_id or None)
+                        except Exception:
+                            pass  # Ignore edit conflicts
+
+                elif event_type == "task_update":
+                    # Display investigation task list
+                    tasks = event.get("tasks", [])
+                    task_text = self._format_task_list(tasks)
+                    if task_text:
+                        if task_message is None:
+                            task_message = await update.message.reply_text(
+                                task_text,
+                                message_thread_id=topic_id or None,
+                                parse_mode="Markdown"
+                            )
+                        else:
+                            try:
+                                await task_message.edit_text(task_text, parse_mode="Markdown")
+                            except Exception:
+                                pass
+
+                elif event_type == "tool_call":
+                    tool_name = event.get("tool_name", "unknown")
+                    # Optionally show tool calls
+                    pass
+
+                elif event_type == "thinking":
+                    # Optionally show AI reasoning
+                    pass
+
+            # Final edit of main response
             await message.edit_text(full_response, message_thread_id=topic_id or None)
 
         except Exception as e:
@@ -342,6 +372,29 @@ class MessageHandler:
 
         # Save conversation
         await self.conversations.save_conversation(conversation)
+
+    def _format_task_list(self, tasks: list) -> str:
+        """Format task list for Telegram display."""
+        if not tasks:
+            return ""
+
+        lines = ["📋 **Investigation Progress:**", ""]
+        for task in tasks:
+            task_id = task.get("ID", task.get("id", "?"))
+            content = task.get("Content", task.get("content", ""))
+            status = task.get("Status", task.get("status", ""))
+
+            # Status icons
+            if status in ("completed", "✓", "done"):
+                icon = "✅"
+            elif status in ("in_progress", "~", "pending"):
+                icon = "🔄"
+            else:
+                icon = "⏳"
+
+            lines.append(f"{icon} **Task {task_id}**: {content} `_({status})_`")
+
+        return "\n".join(lines)
 
     async def _handle_regular_response_in_topic(
         self,
@@ -391,6 +444,7 @@ class MessageHandler:
         )
 
         full_response = ""
+        task_message = None
         try:
             async_gen = await self.holmes.chat(
                 user_id=user_id,
@@ -399,16 +453,46 @@ class MessageHandler:
                 user_permissions=user_permissions,
                 stream=True,
             )
-            async for chunk in async_gen:
-                full_response += chunk
-                # Edit message every few chunks to avoid rate limits
-                if len(full_response) % 50 == 0:
-                    try:
-                        await message.edit_text(full_response + "▌", message_thread_id=topic_id)
-                    except Exception:
-                        pass  # Ignore edit conflicts
+            async for event in async_gen:
+                event_type = event.get("type", "unknown")
 
-            # Final edit
+                if event_type == "content":
+                    full_response += event.get("content", "")
+                    # Edit message every few chunks to avoid rate limits
+                    if len(full_response) % 100 == 0:
+                        try:
+                            await message.edit_text(full_response + "▌", message_thread_id=topic_id)
+                        except Exception:
+                            pass  # Ignore edit conflicts
+
+                elif event_type == "task_update":
+                    # Display investigation task list
+                    tasks = event.get("tasks", [])
+                    task_text = self._format_task_list(tasks)
+                    if task_text:
+                        if task_message is None:
+                            task_message = await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=task_text,
+                                message_thread_id=topic_id,
+                                parse_mode="Markdown"
+                            )
+                        else:
+                            try:
+                                await task_message.edit_text(task_text, parse_mode="Markdown")
+                            except Exception:
+                                pass
+
+                elif event_type == "tool_call":
+                    tool_name = event.get("tool_name", "unknown")
+                    # Optionally show tool calls
+                    pass
+
+                elif event_type == "thinking":
+                    # Optionally show AI reasoning
+                    pass
+
+            # Final edit of main response
             await message.edit_text(full_response, message_thread_id=topic_id)
 
         except Exception as e:

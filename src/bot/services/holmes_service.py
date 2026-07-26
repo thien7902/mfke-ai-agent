@@ -134,6 +134,9 @@ class HolmesService:
                 prerequisite_cache=PrerequisiteCacheMode.ENABLED,
             )
 
+            # Wrap TodoWrite tool to capture investigation task updates
+            self._wrap_todo_write_tool()
+
             # Initialize tool calling LLM using Config's built-in method
             self._tool_calling_llm = self._config.create_toolcalling_llm(
                 toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
@@ -151,6 +154,87 @@ class HolmesService:
         except Exception as e:
             logger.error("Failed to initialize Holmes service", error=str(e))
             raise
+
+    def _wrap_todo_write_tool(self):
+        """Wrap the TodoWrite tool to capture investigation task updates."""
+        if not self._tool_executor:
+            return
+
+        for toolset in self._tool_executor.toolsets:
+            for i, tool in enumerate(toolset.tools):
+                if tool.name == "TodoWrite":
+                    original_invoke = tool.invoke
+
+                    def make_wrapper(original_func):
+                        async def wrapped_invoke(params, context=None):
+                            # Call original tool
+                            result = await original_func(params, context)
+
+                            # Capture tasks from params or result
+                            logger.info("TodoWrite called", params=params, result_type=type(result).__name__)
+
+                            tasks = None
+                            if isinstance(params, dict):
+                                if "tasks" in params:
+                                    tasks = params["tasks"]
+                                elif "todos" in params:
+                                    tasks = params["todos"]
+
+                            # Also check result
+                            if tasks is None and result:
+                                if hasattr(result, 'data') and isinstance(result.data, dict):
+                                    if "tasks" in result.data:
+                                        tasks = result.data["tasks"]
+                                    elif "todos" in result.data:
+                                        tasks = result.data["todos"]
+                                elif isinstance(result, dict):
+                                    if "tasks" in result:
+                                        tasks = result["tasks"]
+                                    elif "todos" in result:
+                                        tasks = result["todos"]
+
+                            if tasks:
+                                self._last_investigation_tasks = tasks
+                                logger.info("Captured investigation tasks", num_tasks=len(tasks))
+                                # Print task details
+                                for t in tasks:
+                                    logger.info("Task", id=t.get('id'), content=t.get('content'), status=t.get('status'))
+
+                            return result
+                        return wrapped_invoke
+
+                    # Use object.__setattr__ for frozen Pydantic models
+                    object.__setattr__(tool, 'invoke', make_wrapper(original_invoke))
+                    logger.info("Wrapped TodoWrite tool for task tracking")
+                    break
+
+    def get_latest_investigation_tasks(self) -> List[Dict[str, Any]]:
+        """Get the latest investigation tasks captured from TodoWrite."""
+        return getattr(self, '_last_investigation_tasks', [])
+
+    def extract_tasks_from_metadata(self, conversation: Conversation) -> List[Dict[str, Any]]:
+        """Extract investigation tasks from Holmes conversation metadata."""
+        if not conversation.metadata:
+            return []
+
+        # Try various metadata keys where Holmes might store tasks
+        for key in ['investigation_tasks', 'tasks', 'todo_list', 'todo_tasks', 'agent_tasks']:
+            if key in conversation.metadata:
+                tasks = conversation.metadata[key]
+                if isinstance(tasks, list) and tasks:
+                    return tasks
+
+        # Also check nested metadata
+        if 'metadata' in conversation.metadata:
+            nested = conversation.metadata['metadata']
+            if isinstance(nested, dict):
+                for key in ['investigation_tasks', 'tasks', 'todo_list', 'todo_tasks', 'agent_tasks']:
+                    if key in nested:
+                        tasks = nested[key]
+                        if isinstance(tasks, list) and tasks:
+                            return tasks
+
+        return []
 
     async def close(self):
         """Close Holmes client."""
@@ -321,7 +405,7 @@ class HolmesService:
 
         try:
             if stream and features.get("streaming", False):
-                return self._stream_chat(holmes_messages, features, user_id)
+                return self._stream_chat(holmes_messages, features, user_id, conversation)
             else:
                 response_text, llm_result = await self._non_stream_chat_with_memory(holmes_messages, features, user_id)
 
@@ -393,9 +477,9 @@ class HolmesService:
         return result.result or "I apologize, but I couldn't generate a response.", result
 
     async def _stream_chat(
-        self, messages: List[Dict[str, Any]], features: Dict[str, bool], user_id: int
-    ) -> AsyncGenerator[str, None]:
-        """Streaming chat with Holmes."""
+        self, messages: List[Dict[str, Any]], features: Dict[str, bool], user_id: int, conversation: Conversation = None
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Streaming chat with Holmes, yielding structured events including task updates."""
         loop = asyncio.get_event_loop()
 
         def stream_generator():
@@ -407,12 +491,98 @@ class HolmesService:
 
         stream = await loop.run_in_executor(None, stream_generator)
 
-        # Yield chunks
+        # Track last seen tasks to avoid duplicate yields
+        last_tasks = []
+        last_task_check = 0
+
+        # Yield all event types for real-time updates
         for event in stream:
-            if event.event.name == "AI_MESSAGE":
-                content = event.data.get("content")
+            event_name = event.event.name
+            event_data = event.data
+
+            # Periodically check for investigation task updates (every ~5 events)
+            last_task_check += 1
+            if last_task_check >= 5:
+                last_task_check = 0
+                # Check both wrapped tool and conversation metadata
+                current_tasks = self.get_latest_investigation_tasks()
+                if conversation and not current_tasks:
+                    current_tasks = self.extract_tasks_from_metadata(conversation)
+                if current_tasks != last_tasks and current_tasks:
+                    last_tasks = current_tasks
+                    yield {
+                        "type": "task_update",
+                        "tasks": current_tasks
+                    }
+
+            if event_name == "AI_MESSAGE":
+                content = event_data.get("content")
                 if content:
-                    yield content
+                    yield {
+                        "type": "content",
+                        "content": content
+                    }
+            elif event_name == "TOOL_CALL":
+                # Tool call started
+                tool_name = event_data.get("tool_name", "unknown")
+                tool_params = event_data.get("params", {})
+                yield {
+                    "type": "tool_call",
+                    "tool_name": tool_name,
+                    "params": tool_params
+                }
+                # If it's a TodoWrite call, also yield task update immediately
+                if tool_name == "TodoWrite" and isinstance(tool_params, dict):
+                    if "tasks" in tool_params:
+                        yield {
+                            "type": "task_update",
+                            "tasks": tool_params["tasks"]
+                        }
+                    elif "todos" in tool_params:
+                        yield {
+                            "type": "task_update",
+                            "tasks": tool_params["todos"]
+                        }
+            elif event_name == "TOOL_RESULT":
+                # Tool completed
+                tool_name = event_data.get("tool_name", "unknown")
+                result = event_data.get("result", "")
+                yield {
+                    "type": "tool_result",
+                    "tool_name": tool_name,
+                    "result": result
+                }
+            elif event_name == "TASK_UPDATE":
+                # Investigation task list updated
+                tasks = event_data.get("tasks", [])
+                yield {
+                    "type": "task_update",
+                    "tasks": tasks
+                }
+            elif event_name == "THINKING":
+                # AI reasoning/thinking
+                thinking = event_data.get("content", "")
+                yield {
+                    "type": "thinking",
+                    "content": thinking
+                }
+            else:
+                # Pass through other events
+                yield {
+                    "type": "event",
+                    "event_name": event_name,
+                    "data": event_data
+                }
+
+        # Final check for any remaining task updates
+        current_tasks = self.get_latest_investigation_tasks()
+        if conversation and not current_tasks:
+            current_tasks = self.extract_tasks_from_metadata(conversation)
+        if current_tasks != last_tasks and current_tasks:
+            yield {
+                "type": "task_update",
+                "tasks": current_tasks
+            }
 
     async def execute_agent(
         self,
