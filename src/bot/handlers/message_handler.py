@@ -129,48 +129,47 @@ class MessageHandler:
             try:
                 # Get or create user
                 user_model = await self.permissions.get_or_create_user(
-                telegram_id=user_id,
-                username=user.username,
-                first_name=user.first_name,
-                last_name=user.last_name,
-            )
-
-            # Get conversation (by topic for forums, by user for private)
-            conversation = await self.conversations.get_conversation(
-                user_id, topic_id=topic_id, chat_id=chat_id
-            )
-
-            # Get user permissions
-            user_permissions = user_model.permissions
-
-            # Send typing indicator
-            await context.bot.send_chat_action(
-                chat_id=chat_id or update.effective_chat.id, action="typing", message_thread_id=topic_id or None
-            )
-
-            # Check if user has streaming permission
-            use_streaming = UserPermission.STREAMING_RESPONSES in user_permissions
-
-            if use_streaming:
-                await self._handle_streaming_response(
-                    update, conversation, user_permissions, message_text, chat_id, topic_id
-                )
-            else:
-                await self._handle_regular_response(
-                    update, conversation, user_permissions, message_text, chat_id, topic_id
+                    telegram_id=user_id,
+                    username=user.username,
+                    first_name=user.first_name,
+                    last_name=user.last_name,
                 )
 
-        except Exception as e:
-            # Safely convert error to string (handles non-serializable objects like ToolCallResult)
-            try:
-                error_str = str(e)
-            except Exception:
-                error_str = f"<unserializable error: {type(e).__name__}>"
-            logger.error("Error handling message", user_id=user_id, error=error_str)
-            await update.message.reply_text(
-                "❌ An error occurred while processing your message. Please try again.",
-                message_thread_id=topic_id or None
-            )
+                # Get conversation (by topic for forums, by user for private)
+                conversation = await self.conversations.get_conversation(
+                    user_id, topic_id=topic_id, chat_id=chat_id
+                )
+
+                # Get user permissions
+                user_permissions = user_model.permissions
+
+                # Send typing indicator
+                await context.bot.send_chat_action(
+                    chat_id=chat_id or update.effective_chat.id, action="typing", message_thread_id=topic_id or None
+                )
+
+                # Check if user has streaming permission
+                use_streaming = UserPermission.STREAMING_RESPONSES in user_permissions
+
+                if use_streaming:
+                    await self._handle_streaming_response(
+                        update, conversation, user_permissions, message_text, chat_id, topic_id
+                    )
+                else:
+                    await self._handle_regular_response(
+                        update, conversation, user_permissions, message_text, chat_id, topic_id
+                    )
+            except Exception as e:
+                # Safely convert error to string (handles non-serializable objects like ToolCallResult)
+                try:
+                    error_str = str(e)
+                except Exception:
+                    error_str = f"<unserializable error: {type(e).__name__}>"
+                logger.error("Error handling message", user_id=user_id, error=error_str)
+                await update.message.reply_text(
+                    "❌ An error occurred while processing your message. Please try again.",
+                    message_thread_id=topic_id or None
+                )
 
     async def handle_topic_created(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle when a new forum topic is created."""
@@ -398,6 +397,8 @@ class MessageHandler:
         topic_id: int,
     ):
         """Handle streaming response with clean task progress updates."""
+        import asyncio
+
         # Send initial empty message to edit
         message = await update.message.reply_text("🤔 Thinking...", message_thread_id=topic_id or None)
 
@@ -412,6 +413,7 @@ class MessageHandler:
         task_message = None
         current_status = "🔄 Working..."
         last_tool = None
+        stream_completed = False
         try:
             async_gen = await self.holmes.chat(
                 user_id=update.effective_user.id,
@@ -420,61 +422,51 @@ class MessageHandler:
                 user_permissions=user_permissions,
                 stream=True,
             )
-            async for event in async_gen:
-                event_type = event.get("type", "unknown")
 
-                if event_type == "content":
-                    full_response += event.get("content", "")
-                    # Edit message every few chunks to avoid rate limits
-                    if len(full_response) % 100 == 0:
-                        try:
-                            await message.edit_text(full_response + "▌", message_thread_id=topic_id or None)
-                        except Exception:
-                            pass  # Ignore edit conflicts
+            # Add timeout to prevent hanging indefinitely
+            async def process_stream():
+                nonlocal full_response, task_message, current_status, last_tool, stream_completed
+                async for event in async_gen:
+                    event_type = event.get("type", "unknown")
 
-                elif event_type == "task_update":
-                    # Display investigation task list
-                    tasks = event.get("tasks", [])
-                    task_text = self._format_task_list(tasks)
-                    if task_text:
-                        if task_message is None:
-                            task_message = await update.message.reply_text(
-                                task_text,
-                                message_thread_id=topic_id or None,
-                                parse_mode="Markdown"
-                            )
-                        else:
+                    if event_type == "content":
+                        full_response += event.get("content", "")
+                        # Edit message every few chunks to avoid rate limits
+                        if len(full_response) % 100 == 0:
                             try:
-                                await task_message.edit_text(task_text, parse_mode="Markdown")
+                                await message.edit_text(full_response + "▌", message_thread_id=topic_id or None)
+                            except Exception:
+                                pass  # Ignore edit conflicts
+
+                    elif event_type == "task_update":
+                        # Display investigation task list
+                        tasks = event.get("tasks", [])
+                        task_text = self._format_task_list(tasks)
+                        if task_text:
+                            if task_message is None:
+                                task_message = await update.message.reply_text(
+                                    task_text,
+                                    message_thread_id=topic_id or None,
+                                    parse_mode="Markdown"
+                                )
+                            else:
+                                try:
+                                    await task_message.edit_text(task_text, parse_mode="Markdown")
+                                except Exception:
+                                    pass
+                            # Update status based on current task
+                            current_status = self._get_status_from_tasks(tasks)
+                            try:
+                                await status_message.edit_text(f"📍 **Status**: {current_status}", parse_mode="Markdown")
                             except Exception:
                                 pass
-                        # Update status based on current task
-                        current_status = self._get_status_from_tasks(tasks)
-                        try:
-                            await status_message.edit_text(f"📍 **Status**: {current_status}", parse_mode="Markdown")
-                        except Exception:
-                            pass
 
-                elif event_type == "tool_call":
-                    tool_name = event.get("tool_name", "unknown")
-                    last_tool = tool_name
-                    # Update status with current tool (clean, no params)
-                    friendly_name = self._get_friendly_tool_name(tool_name)
-                    current_status = f"🔧 Using {friendly_name}..."
-                    try:
-                        await status_message.edit_text(
-                            f"📍 **Status**: {current_status}",
-                            message_thread_id=topic_id or None,
-                            parse_mode="Markdown"
-                        )
-                    except Exception:
-                        pass
-
-                elif event_type == "tool_result":
-                    tool_name = event.get("tool_name", "unknown")
-                    if tool_name == last_tool:
+                    elif event_type == "tool_call":
+                        tool_name = event.get("tool_name", "unknown")
+                        last_tool = tool_name
+                        # Update status with current tool (clean, no params)
                         friendly_name = self._get_friendly_tool_name(tool_name)
-                        current_status = f"✅ Completed {friendly_name}"
+                        current_status = f"🔧 Using {friendly_name}..."
                         try:
                             await status_message.edit_text(
                                 f"📍 **Status**: {current_status}",
@@ -484,18 +476,55 @@ class MessageHandler:
                         except Exception:
                             pass
 
+                    elif event_type == "tool_result":
+                        tool_name = event.get("tool_name", "unknown")
+                        if tool_name == last_tool:
+                            friendly_name = self._get_friendly_tool_name(tool_name)
+                            current_status = f"✅ Completed {friendly_name}"
+                            try:
+                                await status_message.edit_text(
+                                    f"📍 **Status**: {current_status}",
+                                    message_thread_id=topic_id or None,
+                                    parse_mode="Markdown"
+                                )
+                            except Exception:
+                                pass
+
+                stream_completed = True
+
+            # Wait for stream with timeout (120 seconds max)
+            try:
+                await asyncio.wait_for(process_stream(), timeout=120.0)
+            except asyncio.TimeoutError:
+                logger.warning("Streaming response timed out after 120 seconds", user_id=update.effective_user.id)
+                await status_message.edit_text("📍 **Status**: ⏱️ Timed out", parse_mode="Markdown")
+                full_response += "\n\n⚠️ Response timed out. Please try again."
+
             # Final edit of main response
-            await message.edit_text(full_response, message_thread_id=topic_id or None)
+            if full_response:
+                try:
+                    await message.edit_text(full_response, message_thread_id=topic_id or None)
+                except Exception as e:
+                    logger.warning("Failed to edit final message", error=str(e))
+                    # Try sending as new message if edit fails
+                    try:
+                        await update.message.reply_text(full_response, message_thread_id=topic_id or None)
+                    except Exception:
+                        pass
 
             # Final status
-            try:
-                await status_message.edit_text("📍 **Status**: ✅ Done", parse_mode="Markdown")
-            except Exception:
-                pass
+            if stream_completed:
+                try:
+                    await status_message.edit_text("📍 **Status**: ✅ Done", parse_mode="Markdown")
+                except Exception:
+                    pass
 
         except Exception as e:
-            logger.error("Streaming error", error=str(e))
-            await message.edit_text(full_response + "\n\n⚠️ Stream interrupted", message_thread_id=topic_id or None)
+            logger.error("Streaming error", error=str(e), exc_info=True)
+            try:
+                await message.edit_text(full_response + "\n\n⚠️ Stream interrupted", message_thread_id=topic_id or None)
+            except Exception:
+                pass
 
         # Save conversation
         await self.conversations.save_conversation(conversation)
@@ -596,6 +625,8 @@ class MessageHandler:
         user_id: int,
     ):
         """Handle streaming response in a specific topic (without update object)."""
+        import asyncio
+
         # Send initial empty message to edit
         message = await context.bot.send_message(
             chat_id=chat_id,
@@ -615,6 +646,7 @@ class MessageHandler:
         task_message = None
         current_status = "🔄 Working..."
         last_tool = None
+        stream_completed = False
         try:
             async_gen = await self.holmes.chat(
                 user_id=user_id,
@@ -623,62 +655,52 @@ class MessageHandler:
                 user_permissions=user_permissions,
                 stream=True,
             )
-            async for event in async_gen:
-                event_type = event.get("type", "unknown")
 
-                if event_type == "content":
-                    full_response += event.get("content", "")
-                    # Edit message every few chunks to avoid rate limits
-                    if len(full_response) % 100 == 0:
-                        try:
-                            await message.edit_text(full_response + "▌", message_thread_id=topic_id)
-                        except Exception:
-                            pass  # Ignore edit conflicts
+            # Add timeout to prevent hanging indefinitely
+            async def process_stream():
+                nonlocal full_response, task_message, current_status, last_tool, stream_completed
+                async for event in async_gen:
+                    event_type = event.get("type", "unknown")
 
-                elif event_type == "task_update":
-                    # Display investigation task list
-                    tasks = event.get("tasks", [])
-                    task_text = self._format_task_list(tasks)
-                    if task_text:
-                        if task_message is None:
-                            task_message = await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=task_text,
-                                message_thread_id=topic_id,
-                                parse_mode="Markdown"
-                            )
-                        else:
+                    if event_type == "content":
+                        full_response += event.get("content", "")
+                        # Edit message every few chunks to avoid rate limits
+                        if len(full_response) % 100 == 0:
                             try:
-                                await task_message.edit_text(task_text, parse_mode="Markdown")
+                                await message.edit_text(full_response + "▌", message_thread_id=topic_id)
+                            except Exception:
+                                pass  # Ignore edit conflicts
+
+                    elif event_type == "task_update":
+                        # Display investigation task list
+                        tasks = event.get("tasks", [])
+                        task_text = self._format_task_list(tasks)
+                        if task_text:
+                            if task_message is None:
+                                task_message = await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=task_text,
+                                    message_thread_id=topic_id,
+                                    parse_mode="Markdown"
+                                )
+                            else:
+                                try:
+                                    await task_message.edit_text(task_text, parse_mode="Markdown")
+                                except Exception:
+                                    pass
+                            # Update status based on current task
+                            current_status = self._get_status_from_tasks(tasks)
+                            try:
+                                await status_message.edit_text(f"📍 **Status**: {current_status}", parse_mode="Markdown")
                             except Exception:
                                 pass
-                        # Update status based on current task
-                        current_status = self._get_status_from_tasks(tasks)
-                        try:
-                            await status_message.edit_text(f"📍 **Status**: {current_status}", parse_mode="Markdown")
-                        except Exception:
-                            pass
 
-                elif event_type == "tool_call":
-                    tool_name = event.get("tool_name", "unknown")
-                    last_tool = tool_name
-                    # Update status with current tool (clean, no params)
-                    friendly_name = self._get_friendly_tool_name(tool_name)
-                    current_status = f"🔧 Using {friendly_name}..."
-                    try:
-                        await status_message.edit_text(
-                            f"📍 **Status**: {current_status}",
-                            message_thread_id=topic_id,
-                            parse_mode="Markdown"
-                        )
-                    except Exception:
-                        pass
-
-                elif event_type == "tool_result":
-                    tool_name = event.get("tool_name", "unknown")
-                    if tool_name == last_tool:
+                    elif event_type == "tool_call":
+                        tool_name = event.get("tool_name", "unknown")
+                        last_tool = tool_name
+                        # Update status with current tool (clean, no params)
                         friendly_name = self._get_friendly_tool_name(tool_name)
-                        current_status = f"✅ Completed {friendly_name}"
+                        current_status = f"🔧 Using {friendly_name}..."
                         try:
                             await status_message.edit_text(
                                 f"📍 **Status**: {current_status}",
@@ -688,18 +710,55 @@ class MessageHandler:
                         except Exception:
                             pass
 
+                    elif event_type == "tool_result":
+                        tool_name = event.get("tool_name", "unknown")
+                        if tool_name == last_tool:
+                            friendly_name = self._get_friendly_tool_name(tool_name)
+                            current_status = f"✅ Completed {friendly_name}"
+                            try:
+                                await status_message.edit_text(
+                                    f"📍 **Status**: {current_status}",
+                                    message_thread_id=topic_id,
+                                    parse_mode="Markdown"
+                                )
+                            except Exception:
+                                pass
+
+                stream_completed = True
+
+            # Wait for stream with timeout (120 seconds max)
+            try:
+                await asyncio.wait_for(process_stream(), timeout=120.0)
+            except asyncio.TimeoutError:
+                logger.warning("Streaming response timed out after 120 seconds", user_id=user_id)
+                await status_message.edit_text("📍 **Status**: ⏱️ Timed out", parse_mode="Markdown")
+                full_response += "\n\n⚠️ Response timed out. Please try again."
+
             # Final edit of main response
-            await message.edit_text(full_response, message_thread_id=topic_id)
+            if full_response:
+                try:
+                    await message.edit_text(full_response, message_thread_id=topic_id)
+                except Exception as e:
+                    logger.warning("Failed to edit final message", error=str(e))
+                    # Try sending as new message if edit fails
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text=full_response, message_thread_id=topic_id)
+                    except Exception:
+                        pass
 
             # Final status
-            try:
-                await status_message.edit_text("📍 **Status**: ✅ Done", parse_mode="Markdown")
-            except Exception:
-                pass
+            if stream_completed:
+                try:
+                    await status_message.edit_text("📍 **Status**: ✅ Done", parse_mode="Markdown")
+                except Exception:
+                    pass
 
         except Exception as e:
-            logger.error("Streaming error", error=str(e))
-            await message.edit_text(full_response + "\n\n⚠️ Stream interrupted", message_thread_id=topic_id)
+            logger.error("Streaming error", error=str(e), exc_info=True)
+            try:
+                await message.edit_text(full_response + "\n\n⚠️ Stream interrupted", message_thread_id=topic_id)
+            except Exception:
+                pass
 
         # Save conversation
         await self.conversations.save_conversation(conversation)
