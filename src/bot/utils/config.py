@@ -23,15 +23,16 @@ class Config:
 
     # Holmes
     holmes_config_path: str
+    holmes_system_prompt_additions: Optional[str] = None
 
     # Logging
-    log_level: str
+    log_level: str = "INFO"
 
     # Rate limiting
-    rate_limit_per_minute: int
+    rate_limit_per_minute: int = 30
 
     # Permission request expiry
-    permission_request_expiry_minutes: int
+    permission_request_expiry_minutes: int = 10
 
 
 def load_config() -> Config:
@@ -47,6 +48,7 @@ def load_config() -> Config:
         mongodb_database=os.getenv("MONGODB_DATABASE", "telegram_bot"),
         admin_user_ids=admin_user_ids,
         holmes_config_path=os.getenv("HOLMES_CONFIG_PATH", "/root/.holmes/config.yaml"),
+        holmes_system_prompt_additions=os.getenv("HOLMES_SYSTEM_PROMPT_ADDITIONS"),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "30")),
         permission_request_expiry_minutes=int(os.getenv("PERMISSION_REQUEST_EXPIRY_MINUTES", "10")),

@@ -310,8 +310,11 @@ class HolmesService:
         user_msg = Message(role="user", content=user_message)
         conversation.add_message(user_msg)
 
-        # Convert to Holmes format using build_initial_ask_messages for proper formatting
-        holmes_messages = self._convert_messages_to_holmes_format(conversation.messages)
+        # Convert to Holmes format using build_initial_ask_messages for proper formatting with system prompt additions
+        holmes_messages = self._build_holmes_messages(
+            self._convert_messages_to_holmes_format(conversation.messages),
+            user_id
+        )
 
         # Get feature flags from permissions
         features = self._get_user_permissions(user_permissions)
@@ -353,7 +356,7 @@ class HolmesService:
             file_paths=None,
             tool_executor=self._tool_executor,
             skills=self._config.get_skill_catalog() if self._config else None,
-            system_prompt_additions=None,
+            system_prompt_additions=bot_config.holmes_system_prompt_additions,
         ) + messages
 
     async def _non_stream_chat(
@@ -441,7 +444,10 @@ class HolmesService:
         user_msg = Message(role="user", content=f"[Agent Task: {agent_name}] {task}")
         conversation.add_message(user_msg)
 
-        holmes_messages = self._convert_messages_to_holmes_format(conversation.messages)
+        holmes_messages = self._build_holmes_messages(
+            self._convert_messages_to_holmes_format(conversation.messages),
+            user_id
+        )
         features = self._get_user_permissions(user_permissions)
 
         loop = asyncio.get_event_loop()
