@@ -50,6 +50,11 @@ class PrivilegeHandler:
 
         requester_id = update.effective_user.id
 
+        # Get current chat info for forum topic notification
+        chat = update.effective_chat
+        chat_id = chat.id
+        topic_id = update.message.message_thread_id or 0
+
         try:
             request = await self.permissions.create_permission_request(
                 requester_id=requester_id,
@@ -57,15 +62,15 @@ class PrivilegeHandler:
                 permission=permission,
             )
 
-            # Notify the target user with approve/deny buttons
-            await self._notify_user_for_approval(request, context)
+            # Notify the target user with approve/deny buttons in the same forum topic
+            await self._notify_user_for_approval(request, context, chat_id=chat_id, topic_id=topic_id)
 
             await update.message.reply_text(
                 f"✅ Permission request created!\n\n"
                 f"📋 **Request ID:** {request._id}\n"
                 f"👤 **Target User:** {target_user_id}\n"
                 f"🔐 **Permission:** {permission.value}\n\n"
-                f"The user has been notified to approve or deny this request."
+                f"The user has been notified in this topic to approve or deny this request."
             )
 
         except ValueError as e:
@@ -169,6 +174,15 @@ class PrivilegeHandler:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
         """Handle /approve command - user approves permission request."""
+        # Disable private chats
+        chat = update.effective_chat
+        if chat.type == "private":
+            await update.message.reply_text(
+                "🚫 Private chats are disabled. Please use the bot in a group forum topic.",
+                message_thread_id=None
+            )
+            return
+
         args = context.args
         if len(args) < 1:
             await update.message.reply_text("Usage: /approve <request_id>")
@@ -198,6 +212,15 @@ class PrivilegeHandler:
     @rate_limit
     async def deny_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /deny command - user denies permission request."""
+        # Disable private chats
+        chat = update.effective_chat
+        if chat.type == "private":
+            await update.message.reply_text(
+                "🚫 Private chats are disabled. Please use the bot in a group forum topic.",
+                message_thread_id=None
+            )
+            return
+
         args = context.args
         if len(args) < 1:
             await update.message.reply_text("Usage: /deny <request_id>")
@@ -223,9 +246,9 @@ class PrivilegeHandler:
             await update.message.reply_text("❌ An error occurred.")
 
     async def _notify_user_for_approval(
-        self, request, context: ContextTypes.DEFAULT_TYPE
+        self, request, context: ContextTypes.DEFAULT_TYPE, chat_id: int = None, topic_id: int = None
     ):
-        """Send notification to target user with approve/deny buttons."""
+        """Send notification to target user with approve/deny buttons in a forum topic."""
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ Approve", callback_data=f"approve_{request._id}"),
@@ -242,13 +265,15 @@ class PrivilegeHandler:
         )
 
         try:
+            # Send to the forum topic where the grant was initiated
             await context.bot.send_message(
-                chat_id=request.target_user_id,
+                chat_id=chat_id,
                 text=text,
                 reply_markup=keyboard,
+                message_thread_id=topic_id
             )
         except Exception as e:
-            logger.warning("Failed to notify user", user_id=request.target_user_id, error=str(e))
+            logger.warning("Failed to notify user in topic", user_id=request.target_user_id, error=str(e))
 
     async def _notify_admin_of_decision(
         self, request_id: str, approved: bool, context: ContextTypes.DEFAULT_TYPE
@@ -280,6 +305,14 @@ class PrivilegeHandler:
         """Handle inline keyboard callbacks for approve/deny."""
         query = update.callback_query
         await query.answer()
+
+        # Disable private chats for callbacks too
+        chat = update.effective_chat
+        if chat.type == "private":
+            await query.edit_message_text(
+                "🚫 Private chats are disabled. Please use the bot in a group forum topic."
+            )
+            return
 
         user_id = query.from_user.id
         data = query.data

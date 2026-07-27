@@ -22,6 +22,16 @@ class CommandHandler:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command."""
         user = update.effective_user
+
+        # Disable private chats
+        chat = update.effective_chat
+        if chat.type == "private":
+            await update.message.reply_text(
+                "🚫 Private chats are disabled. Please use the bot in a group forum topic.",
+                message_thread_id=None
+            )
+            return
+
         user_model = await self.permissions.get_or_create_user(
             telegram_id=user.id,
             username=user.username,
@@ -30,7 +40,6 @@ class CommandHandler:
         )
 
         # Check if we're in a forum topic
-        chat = update.effective_chat
         topic_id = update.message.message_thread_id or 0
 
         welcome_text = (
@@ -68,6 +77,16 @@ class CommandHandler:
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command."""
         user = update.effective_user
+
+        # Disable private chats
+        chat = update.effective_chat
+        if chat.type == "private":
+            await update.message.reply_text(
+                "🚫 Private chats are disabled. Please use the bot in a group forum topic.",
+                message_thread_id=None
+            )
+            return
+
         is_admin = await self.permissions.is_admin(user.id)
         topic_id = update.message.message_thread_id or 0
 
@@ -109,6 +128,16 @@ class CommandHandler:
     ):
         """Handle /permissions command - show user's permissions."""
         user = update.effective_user
+
+        # Disable private chats
+        chat = update.effective_chat
+        if chat.type == "private":
+            await update.message.reply_text(
+                "🚫 Private chats are disabled. Please use the bot in a group forum topic.",
+                message_thread_id=None
+            )
+            return
+
         user_model = await self.permissions.get_user(user.id)
         topic_id = update.message.message_thread_id or 0
 
@@ -130,8 +159,17 @@ class CommandHandler:
     async def clear_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /clear command - clear conversation history."""
         user = update.effective_user
-        topic_id = update.message.message_thread_id or 0
+
+        # Disable private chats
         chat = update.effective_chat
+        if chat.type == "private":
+            await update.message.reply_text(
+                "🚫 Private chats are disabled. Please use the bot in a group forum topic.",
+                message_thread_id=None
+            )
+            return
+
+        topic_id = update.message.message_thread_id or 0
         chat_id = chat.id if chat.type in ("group", "supergroup") and chat.is_forum else 0
 
         if self.conversations:
@@ -152,6 +190,14 @@ class CommandHandler:
         user = update.effective_user
         chat = update.effective_chat
         topic_id = update.message.message_thread_id or 0
+
+        # Disable private chats
+        if chat.type == "private":
+            await update.message.reply_text(
+                "🚫 Private chats are disabled. Please use the bot in a group forum topic.",
+                message_thread_id=None
+            )
+            return
 
         if chat.type in ("group", "supergroup") and chat.is_forum:
             if topic_id != 0:
@@ -191,14 +237,8 @@ class CommandHandler:
                     message_thread_id=None
                 )
         else:
-            # Private chat - just clear conversation
-            if self.conversations:
-                await self.conversations.clear_conversation(user.id)
-            else:
-                conv_service = ConversationService()
-                await conv_service.clear_conversation(user.id)
-
+            # Regular group (non-forum) - not supported
             await update.message.reply_text(
-                "🆕 New conversation started! Your history has been cleared.",
+                "🚫 This command only works in forum-enabled groups.",
                 message_thread_id=None
             )

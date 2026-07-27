@@ -125,19 +125,22 @@ class MessageHandler:
         chat_id = chat.id
         topic_id = update.message.message_thread_id or 0
 
-        # Only process messages in configured chats (private or specific forum chat)
+        # Only allow group/forum topic chats - DISABLE private chats
         if chat.type == "private":
-            # Private chat - use user_id as key
-            topic_id = 0
-            chat_id = 0
+            # Private chat - ignore with a message
+            await update.message.reply_text(
+                "🚫 Private chats are disabled. Please use the bot in a group forum topic.",
+                message_thread_id=None
+            )
+            return
         elif chat.type in ("group", "supergroup") and chat.is_forum:
             # Forum topic - use topic_id
             if not topic_id:
-                # Message in general chat, not a topic - ignore or create topic
+                # Message in general chat, not a topic - create topic if mentioning bot
                 await self._handle_general_chat_message(update, context, user, chat_id)
                 return
         else:
-            # Regular group - ignore
+            # Regular group (non-forum) - ignore
             return
 
         logger.info("Received message", user_id=user_id, chat_id=chat_id, topic_id=topic_id, text=message_text[:50])
