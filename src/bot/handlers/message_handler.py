@@ -176,11 +176,11 @@ class MessageHandler:
 
                 if use_streaming:
                     await self._handle_streaming_response(
-                        update, conversation, user_permissions, message_text, chat_id, topic_id
+                        context, update, conversation, user_permissions, message_text, chat_id, topic_id
                     )
                 else:
                     await self._handle_regular_response(
-                        update, conversation, user_permissions, message_text, chat_id, topic_id
+                        context, update, conversation, user_permissions, message_text, chat_id, topic_id
                     )
             except Exception as e:
                 # Safely convert error to string (handles non-serializable objects like ToolCallResult)
@@ -388,6 +388,7 @@ class MessageHandler:
 
     async def _handle_regular_response(
         self,
+        context: ContextTypes.DEFAULT_TYPE,
         update: Update,
         conversation: Conversation,
         user_permissions: list,
@@ -409,7 +410,7 @@ class MessageHandler:
 
         # Send response (split if too long)
         await send_long_message(
-            update.message.bot,
+            context.bot,
             chat_id,
             response,
             message_thread_id=topic_id or None
@@ -417,6 +418,7 @@ class MessageHandler:
 
     async def _handle_streaming_response(
         self,
+        context: ContextTypes.DEFAULT_TYPE,
         update: Update,
         conversation: Conversation,
         user_permissions: list,
@@ -537,7 +539,7 @@ class MessageHandler:
                     # Too long — split into multiple messages
                     try:
                         await send_long_message(
-                            update.message.bot,
+                            context.bot,
                             chat_id,
                             full_response,
                             message_thread_id=topic_id or None
