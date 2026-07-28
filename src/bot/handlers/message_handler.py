@@ -12,6 +12,7 @@ from src.bot.services.permission_service import PermissionService
 from src.bot.models.user import UserPermission
 from src.bot.models.conversation import Conversation
 from src.bot.utils.config import config
+from src.bot.utils.telegram_helpers import send_long_message, edit_or_send_long_message
 
 logger = structlog.get_logger(__name__)
 
@@ -406,8 +407,13 @@ class MessageHandler:
         # Save conversation
         await self.conversations.save_conversation(conversation)
 
-        # Send response
-        await update.message.reply_text(response, message_thread_id=topic_id or None)
+        # Send response (split if too long)
+        await send_long_message(
+            update.message.bot,
+            chat_id,
+            response,
+            message_thread_id=topic_id or None
+        )
 
     async def _handle_streaming_response(
         self,
@@ -528,9 +534,14 @@ class MessageHandler:
                     await message.edit_text(full_response, message_thread_id=topic_id or None)
                 except Exception as e:
                     logger.warning("Failed to edit final message", error=str(e))
-                    # Try sending as new message if edit fails
+                    # Too long — split into multiple messages
                     try:
-                        await update.message.reply_text(full_response, message_thread_id=topic_id or None)
+                        await send_long_message(
+                            update.message.bot,
+                            chat_id,
+                            full_response,
+                            message_thread_id=topic_id or None
+                        )
                     except Exception:
                         pass
 
@@ -629,10 +640,11 @@ class MessageHandler:
         # Save conversation
         await self.conversations.save_conversation(conversation)
 
-        # Send response in the topic
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=response,
+        # Send response in the topic (split if too long)
+        await send_long_message(
+            context.bot,
+            chat_id,
+            response,
             message_thread_id=topic_id
         )
 
@@ -762,9 +774,14 @@ class MessageHandler:
                     await message.edit_text(full_response, message_thread_id=topic_id)
                 except Exception as e:
                     logger.warning("Failed to edit final message", error=str(e))
-                    # Try sending as new message if edit fails
+                    # Too long — split into multiple messages
                     try:
-                        await context.bot.send_message(chat_id=chat_id, text=full_response, message_thread_id=topic_id)
+                        await send_long_message(
+                            context.bot,
+                            chat_id,
+                            full_response,
+                            message_thread_id=topic_id
+                        )
                     except Exception:
                         pass
 
