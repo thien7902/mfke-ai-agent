@@ -522,11 +522,11 @@ class MessageHandler:
 
                 stream_completed = True
 
-            # Wait for stream with timeout (120 seconds max)
+            # Wait for stream with timeout (240 seconds max)
             try:
-                await asyncio.wait_for(process_stream(), timeout=120.0)
+                await asyncio.wait_for(process_stream(), timeout=240.0)
             except asyncio.TimeoutError:
-                logger.warning("Streaming response timed out after 120 seconds", user_id=update.effective_user.id)
+                logger.warning("Streaming response timed out after 240 seconds", user_id=update.effective_user.id)
                 await status_message.edit_text("📍 **Status**: ⏱️ Timed out", parse_mode="Markdown")
                 full_response += "\n\n⚠️ Response timed out. Please try again."
 
@@ -762,11 +762,11 @@ class MessageHandler:
 
                 stream_completed = True
 
-            # Wait for stream with timeout (120 seconds max)
+            # Wait for stream with timeout (240 seconds max)
             try:
-                await asyncio.wait_for(process_stream(), timeout=120.0)
+                await asyncio.wait_for(process_stream(), timeout=240.0)
             except asyncio.TimeoutError:
-                logger.warning("Streaming response timed out after 120 seconds", user_id=user_id)
+                logger.warning("Streaming response timed out after 240 seconds", user_id=user_id)
                 await status_message.edit_text("📍 **Status**: ⏱️ Timed out", parse_mode="Markdown")
                 full_response += "\n\n⚠️ Response timed out. Please try again."
 

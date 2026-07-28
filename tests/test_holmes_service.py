@@ -8,6 +8,19 @@ from src.bot.models.user import UserPermission
 from holmes.core.tool_calling_llm import LLMResult
 
 
+def _make_stream_events(data_list):
+    """Create mock stream events with proper event.name attribute."""
+    from unittest.mock import MagicMock
+    events = []
+    for data in data_list:
+        mock_event = MagicMock()
+        mock_event.event = MagicMock()
+        mock_event.event.name = "AI_MESSAGE"
+        mock_event.data = data
+        events.append(mock_event)
+    return events
+
+
 class TestHolmesService:
     """Test HolmesService functionality."""
 
@@ -45,43 +58,44 @@ class TestHolmesService:
     @pytest.mark.asyncio
     async def test_initialize(self, holmes_service):
         """Test Holmes initialization."""
-        with patch("src.bot.services.holmes_service.DefaultLLM") as mock_llm_class, \
-             patch("src.bot.services.holmes_service.ToolExecutor") as mock_executor_class, \
-             patch("src.bot.services.holmes_service.ToolCallingLLM") as mock_tcllm_class, \
+        with patch("src.bot.services.holmes_service.Config") as mock_config_class, \
              patch("src.bot.services.holmes_service.TracingFactory") as mock_tracing_class, \
              patch.dict("os.environ", {"OPENAI_API_KEY": "test-key", "OPENAI_API_BASE": "https://api.openai.com/v1"}):
 
-            mock_llm = MagicMock()
-            mock_llm_class.return_value = mock_llm
+            mock_config = MagicMock()
+            mock_config_class.return_value = mock_config
 
-            mock_executor = MagicMock()
-            mock_executor_class.return_value = mock_executor
+            mock_tool_executor = MagicMock()
+            mock_config.create_tool_executor.return_value = mock_tool_executor
 
             mock_tcllm = MagicMock()
-            mock_tcllm_class.return_value = mock_tcllm
+            mock_config.create_toolcalling_llm.return_value = mock_tcllm
 
             mock_tracing = MagicMock()
             mock_tracing_class.return_value = mock_tracing
+            mock_tracing.create_tracer.return_value = MagicMock()
 
             await holmes_service.initialize()
 
             assert holmes_service._initialized is True
-            mock_llm_class.assert_called_once()
-            mock_executor_class.assert_called_once()
-            mock_tcllm_class.assert_called_once()
+            mock_config_class.assert_called_once()
+            mock_config.create_tool_executor.assert_called_once()
+            mock_config.create_toolcalling_llm.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_chat_non_streaming(self, holmes_service, sample_conversation, mock_llm_result):
         """Test non-streaming chat."""
-        with patch("src.bot.services.holmes_service.DefaultLLM"), \
-             patch("src.bot.services.holmes_service.ToolExecutor"), \
-             patch("src.bot.services.holmes_service.ToolCallingLLM") as mock_tcllm_class, \
+        with patch("src.bot.services.holmes_service.Config") as mock_config_class, \
              patch("src.bot.services.holmes_service.TracingFactory"), \
              patch.dict("os.environ", {"OPENAI_API_KEY": "test-key", "OPENAI_API_BASE": "https://api.openai.com/v1"}):
 
+            mock_config = MagicMock()
+            mock_config_class.return_value = mock_config
+            mock_config.create_tool_executor.return_value = MagicMock()
             mock_tcllm = MagicMock()
+            mock_config.create_toolcalling_llm.return_value = mock_tcllm
             mock_tcllm.call.return_value = mock_llm_result
-            mock_tcllm_class.return_value = mock_tcllm
+            mock_config.model = "openai/gpt-4o"
 
             await holmes_service.initialize()
 
@@ -94,34 +108,27 @@ class TestHolmesService:
             )
 
             assert response == "Test response"
-            assert len(sample_conversation.messages) == 3  # Original 2 + user message
+            assert len(sample_conversation.messages) == 4  # Original 2 + user message + assistant response
             mock_tcllm.call.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_chat_with_streaming(self, holmes_service, sample_conversation):
         """Test streaming chat."""
-        with patch("src.bot.services.holmes_service.DefaultLLM"), \
-             patch("src.bot.services.holmes_service.ToolExecutor"), \
-             patch("src.bot.services.holmes_service.ToolCallingLLM") as mock_tcllm_class, \
+        with patch("src.bot.services.holmes_service.Config") as mock_config_class, \
              patch("src.bot.services.holmes_service.TracingFactory"), \
              patch.dict("os.environ", {"OPENAI_API_KEY": "test-key", "OPENAI_API_BASE": "https://api.openai.com/v1"}):
 
+            mock_config = MagicMock()
+            mock_config_class.return_value = mock_config
+            mock_config.create_tool_executor.return_value = MagicMock()
             mock_tcllm = MagicMock()
+            mock_config.create_toolcalling_llm.return_value = mock_tcllm
 
-            # Create mock stream events
-            mock_event1 = MagicMock()
-            mock_event1.event.name = "AI_MESSAGE"
-            mock_event1.data = {"content": "Hello"}
-
-            mock_event2 = MagicMock()
-            mock_event2.event.name = "AI_MESSAGE"
-            mock_event2.data = {"content": " world"}
-
-            def mock_call_stream(*args, **kwargs):
-                return [mock_event1, mock_event2]
-
-            mock_tcllm.call_stream = mock_call_stream
-            mock_tcllm_class.return_value = mock_tcllm
+            mock_tcllm.call_stream = lambda *a, **kw: _make_stream_events([
+                {"content": "Hello"},
+                {"content": " world"},
+            ])
+            mock_config.model = "openai/gpt-4o"
 
             await holmes_service.initialize()
 
@@ -137,7 +144,9 @@ class TestHolmesService:
             async for chunk in async_gen:
                 chunks.append(chunk)
 
-            assert chunks == ["Hello", " world"]
+            assert len(chunks) == 2
+            assert chunks[0] == {"type": "content", "content": "Hello"}
+            assert chunks[1] == {"type": "content", "content": " world"}
 
     def test_get_user_permissions(self, holmes_service):
         """Test permission conversion."""
@@ -154,7 +163,7 @@ class TestHolmesService:
 
     def test_convert_messages_to_llm_format(self, holmes_service, sample_conversation):
         """Test message conversion to LLM format."""
-        llm_messages = holmes_service._convert_messages_to_llm_format(sample_conversation.messages)
+        llm_messages = holmes_service._convert_messages_to_holmes_format(sample_conversation.messages)
 
         assert len(llm_messages) == 2
         assert llm_messages[0]["role"] == "user"
@@ -165,15 +174,17 @@ class TestHolmesService:
     @pytest.mark.asyncio
     async def test_execute_agent(self, holmes_service, sample_conversation, mock_llm_result):
         """Test agent execution."""
-        with patch("src.bot.services.holmes_service.DefaultLLM"), \
-             patch("src.bot.services.holmes_service.ToolExecutor"), \
-             patch("src.bot.services.holmes_service.ToolCallingLLM") as mock_tcllm_class, \
+        with patch("src.bot.services.holmes_service.Config") as mock_config_class, \
              patch("src.bot.services.holmes_service.TracingFactory"), \
              patch.dict("os.environ", {"OPENAI_API_KEY": "test-key", "OPENAI_API_BASE": "https://api.openai.com/v1"}):
 
+            mock_config = MagicMock()
+            mock_config_class.return_value = mock_config
+            mock_config.create_tool_executor.return_value = MagicMock()
             mock_tcllm = MagicMock()
+            mock_config.create_toolcalling_llm.return_value = mock_tcllm
             mock_tcllm.call.return_value = mock_llm_result
-            mock_tcllm_class.return_value = mock_tcllm
+            mock_config.model = "openai/gpt-4o"
 
             await holmes_service.initialize()
 
@@ -191,9 +202,7 @@ class TestHolmesService:
     @pytest.mark.asyncio
     async def test_execute_agent_no_permission(self, holmes_service, sample_conversation):
         """Test agent execution without permission."""
-        with patch("src.bot.services.holmes_service.DefaultLLM"), \
-             patch("src.bot.services.holmes_service.ToolExecutor"), \
-             patch("src.bot.services.holmes_service.ToolCallingLLM"), \
+        with patch("src.bot.services.holmes_service.Config"), \
              patch("src.bot.services.holmes_service.TracingFactory"), \
              patch.dict("os.environ", {"OPENAI_API_KEY": "test-key", "OPENAI_API_BASE": "https://api.openai.com/v1"}):
 

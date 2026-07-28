@@ -66,13 +66,14 @@ def mock_update():
     update.effective_user.last_name = "User"
     update.effective_chat = MagicMock()
     update.effective_chat.id = 987654321
-    update.effective_chat.type = "private"  # Default to private chat
-    update.effective_chat.is_forum = False
+    update.effective_chat.type = "supergroup"
+    update.effective_chat.is_forum = True
     update.message = MagicMock()
     update.message.text = "Test message"
     update.message.reply_text = AsyncMock()
     update.message.edit_text = AsyncMock()
-    update.message.message_thread_id = None  # No topic in private chat
+    update.message.message_thread_id = 12345  # Simulate being in a forum topic
+    update.effective_chat.is_forum = True
     return update
 
 
@@ -102,7 +103,8 @@ def mock_callback_query():
 @pytest.fixture(autouse=True)
 def mock_config():
     """Mock configuration for tests."""
-    with patch("src.bot.utils.config.config") as mock:
+    with patch("src.bot.utils.config.config") as mock, \
+         patch("src.bot.utils.decorators.config", mock):
         mock.telegram_bot_token = "test_token"
         mock.mongodb_uri = "mongodb://localhost:27017"
         mock.mongodb_database = "test_db"

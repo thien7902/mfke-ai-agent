@@ -208,12 +208,16 @@ class TestMessageHandler:
         mock_conversation_service.get_conversation.return_value = mock_conversation
 
         mock_update.message.text = "Hello bot"
+        mock_context.bot.send_message = AsyncMock()
 
         await message_handler.handle_message(mock_update, mock_context)
 
         mock_holmes_service.chat.assert_called_once()
         mock_conversation_service.save_conversation.assert_called_once()
-        mock_update.message.reply_text.assert_called_once_with("Test response", message_thread_id=None)
+        mock_context.bot.send_message.assert_called_once()
+        call_args = mock_context.bot.send_message.call_args[1]
+        assert call_args["chat_id"] == mock_update.effective_chat.id
+        assert call_args["text"] == "Test response"
 
     @pytest.mark.asyncio
     async def test_handle_message_skip_commands(
