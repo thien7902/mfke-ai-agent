@@ -352,3 +352,29 @@ class PrivilegeHandler:
             except Exception as e:
                 logger.error("Callback deny error", error=str(e))
                 await query.edit_message_text("❌ An error occurred.")
+
+        elif data.startswith("tool_approve_"):
+            approval_id = data[13:]  # Remove "tool_approve_"
+            try:
+                # Import HolmesService to access the static method
+                from src.bot.services.holmes_service import HolmesService
+                HolmesService.handle_tool_approval_response(approval_id, True)
+                await query.edit_message_text(
+                    "✅ Tool execution approved!\n"
+                    "The AI will continue with the tool execution."
+                )
+            except Exception as e:
+                logger.error("Callback tool approve error", error=str(e))
+                await query.edit_message_text("❌ An error occurred.")
+
+        elif data.startswith("tool_deny_"):
+            approval_id = data[10:]  # Remove "tool_deny_"
+            try:
+                from src.bot.services.holmes_service import HolmesService
+                HolmesService.handle_tool_approval_response(approval_id, False)
+                await query.edit_message_text(
+                    "❌ Tool execution denied."
+                )
+            except Exception as e:
+                logger.error("Callback tool deny error", error=str(e))
+                await query.edit_message_text("❌ An error occurred.")
