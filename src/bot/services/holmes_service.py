@@ -264,6 +264,11 @@ class HolmesService:
     def _create_approval_callback(self, user_id: int, chat_id: int, topic_id: int, context: Any) -> Callable[[PendingToolApproval], Tuple[bool, Optional[str]]]:
         """Create an approval callback that sends request to Telegram and waits for response."""
         def approval_callback(approval: PendingToolApproval) -> Tuple[bool, Optional[str]]:
+            logger.info("Approval callback triggered",
+                       tool_name=approval.tool_name,
+                       user_id=user_id,
+                       chat_id=chat_id,
+                       topic_id=topic_id)
             # Generate unique approval ID
             import uuid
             approval_id = str(uuid.uuid4())
@@ -290,6 +295,7 @@ class HolmesService:
             try:
                 # Run the future in the thread pool context
                 result = asyncio.run_coroutine_threadsafe(future, loop).result(timeout=300)  # 5 min timeout
+                logger.info("Approval callback completed", approval_id=approval_id, result=result)
                 return result
             except Exception as e:
                 logger.error("Approval callback error", approval_id=approval_id, error=str(e))
@@ -593,9 +599,15 @@ class HolmesService:
 
         # Use approval callback if tool_approval feature is enabled and we have telegram context
         enable_approval = features.get("tool_approval", False) and telegram_context is not None
+        logger.debug("Non-stream chat with memory",
+                    user_id=user_id,
+                    tool_approval_feature=features.get("tool_approval", False),
+                    has_telegram_context=telegram_context is not None,
+                    enable_approval=enable_approval)
 
         if enable_approval:
             approval_callback = self._create_approval_callback(user_id, chat_id, topic_id, telegram_context)
+            logger.debug("Created approval callback", user_id=user_id)
             result: LLMResult = await loop.run_in_executor(
                 _holmes_executor,
                 lambda: self._tool_calling_llm.call(
@@ -606,6 +618,7 @@ class HolmesService:
             )
         else:
             # No interactive approval
+            logger.debug("Skipping approval callback", user_id=user_id)
             result: LLMResult = await loop.run_in_executor(
                 _holmes_executor,
                 lambda: self._tool_calling_llm.call(
