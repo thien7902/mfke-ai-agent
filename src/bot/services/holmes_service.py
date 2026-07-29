@@ -4,7 +4,8 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import AsyncGenerator, List, Optional, Dict, Any, Tuple
+from typing import AsyncGenerator, List, Optional, Dict, Any, Tuple, Callable
+from dataclasses import dataclass
 
 import structlog
 from holmes.config import Config
@@ -15,6 +16,7 @@ from holmes.core.tools import ToolsetTag, PrerequisiteCacheMode
 from holmes.core.prompt import build_initial_ask_messages
 from holmes.common.env_vars import DEFAULT_CLI_USER
 from holmes.core.oauth_utils import enable_disk_token_store
+from holmes.core.models import PendingToolApproval, ToolApprovalDecision
 
 from src.bot.utils.config import config as bot_config
 from src.bot.models.conversation import Conversation, Message
@@ -28,6 +30,17 @@ _CLI_REQUEST_CONTEXT = {"user_id": DEFAULT_CLI_USER}
 # Dedicated thread pool for Holmes calls to avoid blocking the event loop
 # and to allow concurrent processing of multiple requests
 _holmes_executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="holmes-")
+
+# Store pending approval callbacks for Telegram integration
+# Format: {approval_id: {"event": asyncio.Event, "result": (bool, str)}}
+_pending_approvals: Dict[str, Dict[str, Any]] = {}
+
+
+@dataclass
+class ApprovalResult:
+    """Result of a tool approval request."""
+    approved: bool
+    feedback: Optional[str] = None
 
 
 class HolmesService:
@@ -248,6 +261,95 @@ class HolmesService:
         self._config = None
         self._initialized = False
 
+    def _create_approval_callback(self, user_id: int, chat_id: int, topic_id: int, context: Any) -> Callable[[PendingToolApproval], Tuple[bool, Optional[str]]]:
+        """Create an approval callback that sends request to Telegram and waits for response."""
+        def approval_callback(approval: PendingToolApproval) -> Tuple[bool, Optional[str]]:
+            # Generate unique approval ID
+            import uuid
+            approval_id = str(uuid.uuid4())
+
+            # Store the approval request
+            loop = asyncio.get_event_loop()
+            future = loop.create_future()
+
+            _pending_approvals[approval_id] = {
+                "approval": approval,
+                "future": future,
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "topic_id": topic_id,
+            }
+
+            # Schedule the approval request to be sent to Telegram
+            asyncio.run_coroutine_threadsafe(
+                self._send_approval_request(approval_id, approval, user_id, chat_id, topic_id, context),
+                loop
+            )
+
+            # Wait for the result (with timeout)
+            try:
+                # Run the future in the thread pool context
+                result = asyncio.run_coroutine_threadsafe(future, loop).result(timeout=300)  # 5 min timeout
+                return result
+            except Exception as e:
+                logger.error("Approval callback error", approval_id=approval_id, error=str(e))
+                return False, str(e)
+            finally:
+                _pending_approvals.pop(approval_id, None)
+
+        return approval_callback
+
+    async def _send_approval_request(self, approval_id: str, approval: PendingToolApproval, user_id: int, chat_id: int, topic_id: int, context: Any):
+        """Send tool approval request to Telegram."""
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+            # Format the approval message
+            params_str = ""
+            if approval.params:
+                import json
+                params_str = json.dumps(approval.params, indent=2, ensure_ascii=False)
+                if len(params_str) > 500:
+                    params_str = params_str[:500] + "... (truncated)"
+
+            text = (
+                f"🔐 **Tool Approval Required**\n\n"
+                f"**Tool:** {approval.tool_name}\n"
+                f"**Description:** {approval.description}\n"
+                f"**Parameters:**\n```json\n{params_str}\n```\n\n"
+                f"Approve this tool execution?"
+            )
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"tool_approve_{approval_id}"),
+                    InlineKeyboardButton("❌ Deny", callback_data=f"tool_deny_{approval_id}"),
+                ]
+            ])
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=keyboard,
+                message_thread_id=topic_id if topic_id else None,
+                parse_mode="Markdown"
+            )
+
+            logger.info("Sent tool approval request", approval_id=approval_id, user_id=user_id)
+        except Exception as e:
+            logger.error("Failed to send approval request", approval_id=approval_id, error=str(e))
+            # Resolve the future with denial
+            if approval_id in _pending_approvals:
+                _pending_approvals[approval_id]["future"].set_result((False, str(e)))
+
+    def handle_tool_approval_response(self, approval_id: str, approved: bool, feedback: Optional[str] = None):
+        """Handle user's response to tool approval request."""
+        if approval_id in _pending_approvals:
+            future = _pending_approvals[approval_id]["future"]
+            if not future.done():
+                future.set_result((approved, feedback))
+            logger.info("Tool approval response received", approval_id=approval_id, approved=approved)
+
     def _get_user_permissions(self, user_permissions: List[UserPermission]) -> Dict[str, bool]:
         """Convert user permissions to Holmes feature flags."""
         return {
@@ -380,6 +482,9 @@ class HolmesService:
         conversation: Conversation,
         user_permissions: List[UserPermission],
         stream: bool = False,
+        telegram_context: Any = None,
+        chat_id: int = 0,
+        topic_id: int = 0,
     ) -> str | AsyncGenerator[str, None]:
         """
         Send a message to Holmes and get response.
@@ -390,6 +495,9 @@ class HolmesService:
             conversation: Current conversation history
             user_permissions: User's permissions
             stream: Whether to stream the response
+            telegram_context: Telegram context for sending approval requests
+            chat_id: Chat ID for approval messages
+            topic_id: Topic ID for approval messages
 
         Returns:
             Response text or async generator for streaming
@@ -413,7 +521,10 @@ class HolmesService:
             if stream and features.get("streaming", False):
                 return self._stream_chat(holmes_messages, features, user_id, conversation)
             else:
-                response_text, llm_result = await self._non_stream_chat_with_memory(holmes_messages, features, user_id)
+                # Pass telegram context for approval callback
+                response_text, llm_result = await self._non_stream_chat_with_memory(
+                    holmes_messages, features, user_id, telegram_context, chat_id, topic_id
+                )
 
                 # Save Holmes response with tool calls and metadata to conversation
                 try:
@@ -469,20 +580,39 @@ class HolmesService:
         return result.result or "I apologize, but I couldn't generate a response."
 
     async def _non_stream_chat_with_memory(
-        self, messages: List[Dict[str, Any]], features: Dict[str, bool], user_id: int
+        self,
+        messages: List[Dict[str, Any]],
+        features: Dict[str, bool],
+        user_id: int,
+        telegram_context: Any = None,
+        chat_id: int = 0,
+        topic_id: int = 0
     ) -> tuple[str, LLMResult]:
         """Non-streaming chat with Holmes, returning full result for memory storage."""
         loop = asyncio.get_event_loop()
 
-        # Note: Non-streaming call uses approval_callback, not enable_tool_approval
-        # For simplicity, we don't implement interactive approval in non-streaming mode
-        result: LLMResult = await loop.run_in_executor(
-            _holmes_executor,
-            lambda: self._tool_calling_llm.call(
-                messages=messages,
-                request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
-            ),
-        )
+        # Use approval callback if tool_approval feature is enabled and we have telegram context
+        enable_approval = features.get("tool_approval", False) and telegram_context is not None
+
+        if enable_approval:
+            approval_callback = self._create_approval_callback(user_id, chat_id, topic_id, telegram_context)
+            result: LLMResult = await loop.run_in_executor(
+                _holmes_executor,
+                lambda: self._tool_calling_llm.call(
+                    messages=messages,
+                    request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
+                    approval_callback=approval_callback,
+                ),
+            )
+        else:
+            # No interactive approval
+            result: LLMResult = await loop.run_in_executor(
+                _holmes_executor,
+                lambda: self._tool_calling_llm.call(
+                    messages=messages,
+                    request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
+                ),
+            )
 
         return result.result or "I apologize, but I couldn't generate a response.", result
 
@@ -494,7 +624,10 @@ class HolmesService:
 
         def stream_generator():
             # Enable tool approval based on user permission
-            enable_approval = features.get("tool_approval", False)
+            # Note: Streaming approval requires complex stream resumption.
+            # For now, disable tool approval in streaming mode.
+            # Non-streaming mode uses approval_callback which handles the loop internally.
+            enable_approval = False  # features.get("tool_approval", False)
             return self._tool_calling_llm.call_stream(
                 msgs=messages,
                 request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},

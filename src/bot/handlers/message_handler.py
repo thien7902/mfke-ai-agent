@@ -408,6 +408,9 @@ class MessageHandler:
             conversation=conversation,
             user_permissions=user_permissions,
             stream=False,
+            telegram_context=context,
+            chat_id=chat_id,
+            topic_id=topic_id,
         )
 
         # Save conversation
@@ -642,6 +645,9 @@ class MessageHandler:
             conversation=conversation,
             user_permissions=user_permissions,
             stream=False,
+            telegram_context=context,
+            chat_id=chat_id,
+            topic_id=topic_id,
         )
 
         # Save conversation
