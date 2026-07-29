@@ -456,12 +456,13 @@ class HolmesService:
         loop = asyncio.get_event_loop()
 
         # Run in dedicated executor since ToolCallingLLM.call is sync
+        # Note: Non-streaming call uses approval_callback, not enable_tool_approval
+        # For simplicity, we don't implement interactive approval in non-streaming mode
         result: LLMResult = await loop.run_in_executor(
             _holmes_executor,
             lambda: self._tool_calling_llm.call(
                 messages=messages,
                 request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
-                enable_tool_approval=features.get("tool_approval", False),
             ),
         )
 
@@ -473,12 +474,13 @@ class HolmesService:
         """Non-streaming chat with Holmes, returning full result for memory storage."""
         loop = asyncio.get_event_loop()
 
+        # Note: Non-streaming call uses approval_callback, not enable_tool_approval
+        # For simplicity, we don't implement interactive approval in non-streaming mode
         result: LLMResult = await loop.run_in_executor(
             _holmes_executor,
             lambda: self._tool_calling_llm.call(
                 messages=messages,
                 request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
-                enable_tool_approval=features.get("tool_approval", False),
             ),
         )
 
@@ -647,7 +649,6 @@ class HolmesService:
             lambda: self._tool_calling_llm.call(
                 messages=holmes_messages,
                 request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
-                enable_tool_approval=features.get("tool_approval", False),
             ),
         )
 
