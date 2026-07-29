@@ -177,9 +177,8 @@ class MessageHandler:
                 )
 
                 # Check if user has streaming permission
-                # Force non-streaming if tool_approval is enabled (approval requires non-streaming)
-                use_streaming = (UserPermission.STREAMING_RESPONSES in user_permissions and
-                                UserPermission.TOOL_APPROVAL not in user_permissions)
+                # Allow streaming with tool_approval to test streaming approval flow
+                use_streaming = UserPermission.STREAMING_RESPONSES in user_permissions
 
                 if use_streaming:
                     await self._handle_streaming_response(
@@ -463,6 +462,9 @@ class MessageHandler:
                 conversation=conversation,
                 user_permissions=user_permissions,
                 stream=True,
+                telegram_context=context,
+                chat_id=chat_id,
+                topic_id=topic_id,
             )
 
             # Add timeout to prevent hanging indefinitely
@@ -705,6 +707,9 @@ class MessageHandler:
                 conversation=conversation,
                 user_permissions=user_permissions,
                 stream=True,
+                telegram_context=context,
+                chat_id=chat_id,
+                topic_id=topic_id,
             )
 
             # Add timeout to prevent hanging indefinitely

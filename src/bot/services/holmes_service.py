@@ -24,6 +24,14 @@ from src.bot.models.user import UserPermission
 
 logger = structlog.get_logger(__name__)
 
+# Simple class for tool decisions expected by Holmes streaming API
+class ToolDecision:
+    def __init__(self, tool_call_id: str, decision: str, feedback: str, approval_token: str = None):
+        self.tool_call_id = tool_call_id
+        self.decision = decision
+        self.feedback = feedback
+        self.approval_token = approval_token
+
 # Request context for CLI-like usage
 _CLI_REQUEST_CONTEXT = {"user_id": DEFAULT_CLI_USER}
 
@@ -264,44 +272,50 @@ class HolmesService:
     def _create_approval_callback(self, user_id: int, chat_id: int, topic_id: int, context: Any) -> Callable[[PendingToolApproval], Tuple[bool, Optional[str]]]:
         """Create an approval callback that sends request to Telegram and waits for response."""
         def approval_callback(approval: PendingToolApproval) -> Tuple[bool, Optional[str]]:
-            logger.info("Approval callback triggered",
-                       tool_name=approval.tool_name,
-                       user_id=user_id,
-                       chat_id=chat_id,
-                       topic_id=topic_id)
-            # Generate unique approval ID
-            import uuid
-            approval_id = str(uuid.uuid4())
-
-            # Store the approval request
-            loop = asyncio.get_event_loop()
-            future = loop.create_future()
-
-            _pending_approvals[approval_id] = {
-                "approval": approval,
-                "future": future,
-                "user_id": user_id,
-                "chat_id": chat_id,
-                "topic_id": topic_id,
-            }
-
-            # Schedule the approval request to be sent to Telegram
-            asyncio.run_coroutine_threadsafe(
-                self._send_approval_request(approval_id, approval, user_id, chat_id, topic_id, context),
-                loop
-            )
-
-            # Wait for the result (with timeout)
             try:
-                # Run the future in the thread pool context
-                result = asyncio.run_coroutine_threadsafe(future, loop).result(timeout=300)  # 5 min timeout
-                logger.info("Approval callback completed", approval_id=approval_id, result=result)
-                return result
+                logger.warning("=== APPROVAL CALLBACK TRIGGERED ===",
+                           tool_name=approval.tool_name,
+                           tool_description=approval.description,
+                           params=approval.params,
+                           user_id=user_id,
+                           chat_id=chat_id,
+                           topic_id=topic_id)
+                # Generate unique approval ID
+                import uuid
+                approval_id = str(uuid.uuid4())
+
+                # Store the approval request
+                loop = asyncio.get_event_loop()
+                future = loop.create_future()
+
+                _pending_approvals[approval_id] = {
+                    "approval": approval,
+                    "future": future,
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "topic_id": topic_id,
+                }
+
+                # Schedule the approval request to be sent to Telegram
+                asyncio.run_coroutine_threadsafe(
+                    self._send_approval_request(approval_id, approval, user_id, chat_id, topic_id, context),
+                    loop
+                )
+
+                # Wait for the result (with timeout)
+                try:
+                    # Run the future in the thread pool context
+                    result = asyncio.run_coroutine_threadsafe(future, loop).result(timeout=300)  # 5 min timeout
+                    logger.warning("Approval callback completed", approval_id=approval_id, result=result)
+                    return result
+                except Exception as e:
+                    logger.error("Approval callback error", approval_id=approval_id, error=str(e))
+                    return False, str(e)
+                finally:
+                    _pending_approvals.pop(approval_id, None)
             except Exception as e:
-                logger.error("Approval callback error", approval_id=approval_id, error=str(e))
+                logger.error("Approval callback outer error", error=str(e))
                 return False, str(e)
-            finally:
-                _pending_approvals.pop(approval_id, None)
 
         return approval_callback
 
@@ -348,13 +362,60 @@ class HolmesService:
             if approval_id in _pending_approvals:
                 _pending_approvals[approval_id]["future"].set_result((False, str(e)))
 
-    def handle_tool_approval_response(self, approval_id: str, approved: bool, feedback: Optional[str] = None):
+    @staticmethod
+    def handle_tool_approval_response(approval_id: str, approved: bool, feedback: Optional[str] = None):
         """Handle user's response to tool approval request."""
+        logger.warning("handle_tool_approval_response CALLED", approval_id=approval_id, approved=approved, feedback=feedback)
         if approval_id in _pending_approvals:
             future = _pending_approvals[approval_id]["future"]
             if not future.done():
                 future.set_result((approved, feedback))
             logger.info("Tool approval response received", approval_id=approval_id, approved=approved)
+        else:
+            logger.warning("handle_tool_approval_response: approval_id not found", approval_id=approval_id)
+
+    async def _send_stream_approval_request(self, approval_id: str, tool_name: str, description: str, params: dict, user_id: int, chat_id: int, topic_id: int, context: Any, approval_token: str = None):
+        """Send streaming tool approval request to Telegram."""
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+            # Format the approval message
+            params_str = ""
+            if params:
+                import json
+                params_str = json.dumps(params, indent=2, ensure_ascii=False)
+                if len(params_str) > 500:
+                    params_str = params_str[:500] + "... (truncated)"
+
+            text = (
+                f"🔐 **Tool Approval Required (Streaming)**\n\n"
+                f"**Tool:** {tool_name}\n"
+                f"**Description:** {description}\n"
+                f"**Parameters:**\n```json\n{params_str}\n```\n\n"
+                f"Approve this tool execution?"
+            )
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"tool_approve_{approval_id}"),
+                    InlineKeyboardButton("❌ Deny", callback_data=f"tool_deny_{approval_id}"),
+                ]
+            ])
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=keyboard,
+                message_thread_id=topic_id if topic_id else None,
+                parse_mode="Markdown"
+            )
+
+            logger.info("Sent streaming tool approval request", approval_id=approval_id, user_id=user_id)
+        except Exception as e:
+            logger.error("Failed to send streaming approval request", approval_id=approval_id, error=str(e))
+            # Resolve the future with denial
+            if approval_id in _pending_approvals:
+                _pending_approvals[approval_id]["future"].set_result((False, str(e)))
 
     def _get_user_permissions(self, user_permissions: List[UserPermission]) -> Dict[str, bool]:
         """Convert user permissions to Holmes feature flags."""
@@ -525,7 +586,7 @@ class HolmesService:
 
         try:
             if stream and features.get("streaming", False):
-                return self._stream_chat(holmes_messages, features, user_id, conversation)
+                return self._stream_chat(holmes_messages, features, user_id, conversation, telegram_context, chat_id, topic_id)
             else:
                 # Pass telegram context for approval callback
                 response_text, llm_result = await self._non_stream_chat_with_memory(
@@ -599,15 +660,16 @@ class HolmesService:
 
         # Use approval callback if tool_approval feature is enabled and we have telegram context
         enable_approval = features.get("tool_approval", False) and telegram_context is not None
-        logger.debug("Non-stream chat with memory",
+        logger.warning("=== NON-STREAM CHAT ===",
                     user_id=user_id,
                     tool_approval_feature=features.get("tool_approval", False),
                     has_telegram_context=telegram_context is not None,
-                    enable_approval=enable_approval)
+                    enable_approval=enable_approval,
+                    features=features)
 
         if enable_approval:
             approval_callback = self._create_approval_callback(user_id, chat_id, topic_id, telegram_context)
-            logger.debug("Created approval callback", user_id=user_id)
+            logger.warning("Created approval callback", user_id=user_id)
             result: LLMResult = await loop.run_in_executor(
                 _holmes_executor,
                 lambda: self._tool_calling_llm.call(
@@ -618,7 +680,8 @@ class HolmesService:
             )
         else:
             # No interactive approval
-            logger.debug("Skipping approval callback", user_id=user_id)
+            logger.warning("Skipping approval callback - reason: tool_approval=%s, telegram_context=%s",
+                          features.get("tool_approval", False), telegram_context is not None)
             result: LLMResult = await loop.run_in_executor(
                 _holmes_executor,
                 lambda: self._tool_calling_llm.call(
@@ -630,28 +693,32 @@ class HolmesService:
         return result.result or "I apologize, but I couldn't generate a response.", result
 
     async def _stream_chat(
-        self, messages: List[Dict[str, Any]], features: Dict[str, bool], user_id: int, conversation: Conversation = None
+        self, messages: List[Dict[str, Any]], features: Dict[str, bool], user_id: int, conversation: Conversation = None,
+        telegram_context: Any = None, chat_id: int = 0, topic_id: int = 0
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Streaming chat with Holmes, yielding structured events including task updates."""
+        """Streaming chat with Holmes, yielding structured events including task updates and handling tool approval."""
         loop = asyncio.get_event_loop()
 
-        def stream_generator():
-            # Enable tool approval based on user permission
-            # Note: Streaming approval requires complex stream resumption.
-            # For now, disable tool approval in streaming mode.
-            # Non-streaming mode uses approval_callback which handles the loop internally.
-            enable_approval = False  # features.get("tool_approval", False)
+        def stream_generator(tool_decisions=None):
+            """Generate stream, optionally with tool decisions for resumption."""
+            enable_approval = features.get("tool_approval", False)
+            logger.warning("Stream generator", enable_approval=enable_approval, has_tool_decisions=tool_decisions is not None)
             return self._tool_calling_llm.call_stream(
                 msgs=messages,
                 request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
                 enable_tool_approval=enable_approval,
+                tool_decisions=tool_decisions,
             )
 
+        # Initial stream
         stream = await loop.run_in_executor(_holmes_executor, stream_generator)
 
         # Track last seen tasks to avoid duplicate yields
         last_tasks = []
         last_task_check = 0
+
+        # Store pending approvals for resumption
+        pending_tool_decisions = {}
 
         # Yield all event types for real-time updates
         for event in stream:
@@ -735,8 +802,140 @@ class HolmesService:
                     "type": "thinking",
                     "content": thinking
                 }
+            elif event_name == "APPROVAL_REQUIRED":
+                # Tool approval required - send to Telegram and wait for response
+                logger.warning("APPROVAL_REQUIRED event received", data_keys=list(event_data.keys()))
+
+                # Extract approval info from the event data
+                messages_list = event_data.get("messages", [])
+                pending_approvals = event_data.get("pending_approvals", [])
+
+                # Also check tool_calls in the last message for pending_approval
+                if not pending_approvals and messages_list:
+                    last_msg = messages_list[-1]
+                    tool_calls = last_msg.get("tool_calls", [])
+                    for tc in tool_calls:
+                        if tc.get("pending_approval"):
+                            pending_approvals.append({
+                                "tool_call_id": tc.get("id"),
+                                "tool_name": tc.get("function", {}).get("name"),
+                                "description": tc.get("function", {}).get("arguments", ""),
+                                "approval_token": tc.get("approval_token"),
+                                "params": tc.get("function", {}).get("arguments", {}),
+                            })
+
+                for approval in pending_approvals:
+                    tool_call_id = approval.get("tool_call_id")
+                    tool_name = approval.get("tool_name", "unknown")
+                    description = approval.get("description", "")
+                    approval_token = approval.get("approval_token")
+                    params = approval.get("params", {})
+
+                    # Generate approval ID
+                    import uuid
+                    approval_id = str(uuid.uuid4())
+
+                    # Store approval request
+                    future = loop.create_future()
+                    _pending_approvals[approval_id] = {
+                        "approval": approval,
+                        "future": future,
+                        "user_id": user_id,
+                        "chat_id": chat_id,
+                        "topic_id": topic_id,
+                        "tool_call_id": tool_call_id,
+                        "approval_token": approval_token,
+                    }
+
+                    # Send approval request to Telegram
+                    if telegram_context:
+                        asyncio.run_coroutine_threadsafe(
+                            self._send_stream_approval_request(approval_id, tool_name, description, params, user_id, chat_id, topic_id, telegram_context, approval_token),
+                            loop
+                        )
+
+                    # Wait for user response
+                    try:
+                        result = await asyncio.wrap_future(future)
+                        approved, feedback = result
+                        logger.warning("Approval received", approval_id=approval_id, approved=approved)
+
+                        # Build tool decision for stream resumption
+                        # Holmes expects ToolDecision objects with tool_call_id attribute
+                        tool_decision = ToolDecision(
+                            tool_call_id=tool_call_id,
+                            decision="approve" if approved else "deny",
+                            feedback=feedback or "",
+                            approval_token=approval_token
+                        )
+                        pending_tool_decisions[tool_call_id] = tool_decision
+
+                        yield {
+                            "type": "approval_result",
+                            "tool_call_id": tool_call_id,
+                            "approved": approved,
+                            "feedback": feedback
+                        }
+                    except Exception as e:
+                        logger.error("Approval error", approval_id=approval_id, error=str(e))
+                        tool_decision = ToolDecision(
+                            tool_call_id=tool_call_id,
+                            decision="deny",
+                            feedback=str(e),
+                            approval_token=approval_token
+                        )
+                        pending_tool_decisions[tool_call_id] = tool_decision
+                        yield {
+                            "type": "approval_result",
+                            "tool_call_id": tool_call_id,
+                            "approved": False,
+                            "feedback": str(e)
+                        }
+                    finally:
+                        _pending_approvals.pop(approval_id, None)
+
+                # After collecting all approvals, resume the stream with tool_decisions
+                if pending_tool_decisions:
+                    logger.warning("Resuming stream with tool decisions", decisions=list(pending_tool_decisions.values()))
+
+                    # Resume stream with tool decisions
+                    resumed_stream = await loop.run_in_executor(
+                        _holmes_executor,
+                        lambda: stream_generator(list(pending_tool_decisions.values()))
+                    )
+
+                    # Process resumed stream
+                    for resumed_event in resumed_stream:
+                        resumed_name = resumed_event.event.name
+                        resumed_data = resumed_event.data
+
+                        if resumed_name == "AI_MESSAGE":
+                            content = resumed_data.get("content")
+                            reasoning = resumed_data.get("reasoning") or resumed_data.get("thinking")
+                            if content:
+                                yield {"type": "content", "content": content}
+                            if reasoning:
+                                yield {"type": "thinking", "content": reasoning}
+                        elif resumed_name == "TOOL_CALL":
+                            tool_name = resumed_data.get("tool_name", "unknown")
+                            tool_params = resumed_data.get("params", {})
+                            yield {"type": "tool_call", "tool_name": tool_name, "params": tool_params}
+                        elif resumed_name == "TOOL_RESULT":
+                            tool_name = resumed_data.get("tool_name", "unknown")
+                            result = resumed_data.get("result", "")
+                            yield {"type": "tool_result", "tool_name": tool_name, "result": result}
+                        elif resumed_name == "TOKEN_COUNT":
+                            # Skip token count in resumed stream
+                            pass
+                        else:
+                            logger.warning("Resumed stream event", event_name=resumed_name, data=resumed_data)
+                            yield {"type": "event", "event_name": resumed_name, "data": resumed_data}
+
+                    # Clear pending decisions after resumption
+                    pending_tool_decisions.clear()
             else:
-                # Pass through other events
+                # Pass through other events - log to discover approval events
+                logger.warning("Unknown Holmes stream event", event_name=event_name, data=event_data)
                 yield {
                     "type": "event",
                     "event_name": event_name,
