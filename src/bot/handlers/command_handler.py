@@ -118,6 +118,7 @@ class CommandHandler:
                 "• tool_usage - Use AI tools\n"
                 "• conversation_memory - Persistent conversation memory\n"
                 "• streaming_responses - Real-time streaming responses\n"
+                "• tool_approval - Require approval before tool execution\n"
             )
 
         await update.message.reply_text(help_text, message_thread_id=topic_id or None)

@@ -118,8 +118,11 @@ class MessageHandler:
                 return
         _processed_messages[message_id] = current_time
 
-        # Clean up old entries
-        _processed_messages.clear()  # Simple cleanup - in production use a proper TTL cache
+        # Clean up old entries (older than TTL)
+        cutoff = current_time - _MESSAGE_PROCESSING_TTL
+        keys_to_remove = [k for k, v in _processed_messages.items() if v < cutoff]
+        for k in keys_to_remove:
+            del _processed_messages[k]
 
         # Get chat and topic info
         chat = update.effective_chat
@@ -148,7 +151,9 @@ class MessageHandler:
 
         # Acquire per-topic lock to serialize messages in the same topic
         lock = _get_topic_lock(chat_id, topic_id)
+        logger.debug("Acquiring topic lock", chat_id=chat_id, topic_id=topic_id)
         async with lock:
+            logger.debug("Topic lock acquired, processing message", chat_id=chat_id, topic_id=topic_id, user_id=user_id)
             try:
                 # Get or create user
                 user_model = await self.permissions.get_or_create_user(

@@ -15,6 +15,7 @@ class UserPermission(str, Enum):
     TOOL_USAGE = "tool_usage"
     CONVERSATION_MEMORY = "conversation_memory"
     STREAMING_RESPONSES = "streaming_responses"
+    TOOL_APPROVAL = "tool_approval"
 
 
 @dataclass

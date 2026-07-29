@@ -33,7 +33,8 @@ class PrivilegeHandler:
                 "• agent_execution\n"
                 "• tool_usage\n"
                 "• conversation_memory\n"
-                "• streaming_responses"
+                "• streaming_responses\n"
+                "• tool_approval"
             )
             return
 

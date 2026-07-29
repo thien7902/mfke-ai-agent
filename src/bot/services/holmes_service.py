@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import AsyncGenerator, List, Optional, Dict, Any, Tuple
 
@@ -23,6 +24,10 @@ logger = structlog.get_logger(__name__)
 
 # Request context for CLI-like usage
 _CLI_REQUEST_CONTEXT = {"user_id": DEFAULT_CLI_USER}
+
+# Dedicated thread pool for Holmes calls to avoid blocking the event loop
+# and to allow concurrent processing of multiple requests
+_holmes_executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="holmes-")
 
 
 class HolmesService:
@@ -250,6 +255,7 @@ class HolmesService:
             "tools": UserPermission.TOOL_USAGE in user_permissions,
             "memory": UserPermission.CONVERSATION_MEMORY in user_permissions,
             "streaming": UserPermission.STREAMING_RESPONSES in user_permissions,
+            "tool_approval": UserPermission.TOOL_APPROVAL in user_permissions,
         }
 
     def _convert_messages_to_holmes_format(self, messages: List[Message]) -> List[Dict[str, Any]]:
@@ -449,12 +455,13 @@ class HolmesService:
         """Non-streaming chat with Holmes."""
         loop = asyncio.get_event_loop()
 
-        # Run in executor since ToolCallingLLM.call is sync
+        # Run in dedicated executor since ToolCallingLLM.call is sync
         result: LLMResult = await loop.run_in_executor(
-            None,
+            _holmes_executor,
             lambda: self._tool_calling_llm.call(
                 messages=messages,
                 request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
+                enable_tool_approval=features.get("tool_approval", False),
             ),
         )
 
@@ -467,10 +474,11 @@ class HolmesService:
         loop = asyncio.get_event_loop()
 
         result: LLMResult = await loop.run_in_executor(
-            None,
+            _holmes_executor,
             lambda: self._tool_calling_llm.call(
                 messages=messages,
                 request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
+                enable_tool_approval=features.get("tool_approval", False),
             ),
         )
 
@@ -483,13 +491,15 @@ class HolmesService:
         loop = asyncio.get_event_loop()
 
         def stream_generator():
+            # Enable tool approval based on user permission
+            enable_approval = features.get("tool_approval", False)
             return self._tool_calling_llm.call_stream(
                 msgs=messages,
                 request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
-                enable_tool_approval=False,
+                enable_tool_approval=enable_approval,
             )
 
-        stream = await loop.run_in_executor(None, stream_generator)
+        stream = await loop.run_in_executor(_holmes_executor, stream_generator)
 
         # Track last seen tasks to avoid duplicate yields
         last_tasks = []
@@ -633,10 +643,11 @@ class HolmesService:
 
         loop = asyncio.get_event_loop()
         result: LLMResult = await loop.run_in_executor(
-            None,
+            _holmes_executor,
             lambda: self._tool_calling_llm.call(
                 messages=holmes_messages,
                 request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
+                enable_tool_approval=features.get("tool_approval", False),
             ),
         )
 

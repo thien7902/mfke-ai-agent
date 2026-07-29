@@ -3,6 +3,7 @@ import asyncio
 import logging
 import signal
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import structlog
 from telegram.ext import (
@@ -15,7 +16,8 @@ from telegram.ext import (
 
 from src.bot.utils.config import config
 from src.bot.utils.mongodb import MongoDB
-from src.bot.services.holmes_service import HolmesService
+from src.bot.utils.health import health_checker
+from src.bot.services.holmes_service import HolmesService, _holmes_executor
 from src.bot.services.conversation_service import ConversationService
 from src.bot.services.permission_service import PermissionService
 from src.bot.handlers.message_handler import MessageHandler
@@ -65,10 +67,12 @@ class TelegramBot:
         # Initialize MongoDB connection
         MongoDB.get_database()
         logger.info("MongoDB connected")
+        health_checker.set_mongodb_connected(True)
 
         # Initialize services
         self.holmes_service = HolmesService()
         await self.holmes_service.initialize()
+        health_checker.set_holmes_ready(True)
 
         self.conversation_service = ConversationService()
         self.permission_service = PermissionService()
@@ -77,6 +81,7 @@ class TelegramBot:
         self.application = (
             Application.builder()
             .token(config.telegram_bot_token)
+            .concurrent_updates(True)  # Enable concurrent update processing
             .build()
         )
 
@@ -138,11 +143,13 @@ class TelegramBot:
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True  # Clear any pending updates from other instances
         )
+        health_checker.set_bot_alive(True)
         logger.info("Bot started successfully")
 
     async def stop(self):
         """Stop the bot gracefully."""
         logger.info("Stopping bot...")
+        health_checker.set_bot_alive(False)
 
         if self.application:
             await self.application.updater.stop()
@@ -151,14 +158,22 @@ class TelegramBot:
 
         if self.holmes_service:
             await self.holmes_service.close()
+            health_checker.set_holmes_ready(False)
+
+        # Shutdown the Holmes thread pool executor
+        _holmes_executor.shutdown(wait=True)
 
         MongoDB.close()
+        health_checker.set_mongodb_connected(False)
 
         logger.info("Bot stopped")
 
 
 async def main():
     """Main entry point."""
+    # Start health check server first
+    await health_checker.start()
+
     bot = TelegramBot()
 
     # Setup signal handlers for graceful shutdown (Unix only)
@@ -191,6 +206,7 @@ async def main():
         sys.exit(1)
     finally:
         await bot.stop()
+        await health_checker.stop()
 
 
 if __name__ == "__main__":
