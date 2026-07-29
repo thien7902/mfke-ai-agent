@@ -177,7 +177,9 @@ class MessageHandler:
                 )
 
                 # Check if user has streaming permission
-                use_streaming = UserPermission.STREAMING_RESPONSES in user_permissions
+                # Force non-streaming if tool_approval is enabled (approval requires non-streaming)
+                use_streaming = (UserPermission.STREAMING_RESPONSES in user_permissions and
+                                UserPermission.TOOL_APPROVAL not in user_permissions)
 
                 if use_streaming:
                     await self._handle_streaming_response(
@@ -370,7 +372,9 @@ class MessageHandler:
             )
 
             # Check if user has streaming permission
-            use_streaming = UserPermission.STREAMING_RESPONSES in user_permissions
+            # Force non-streaming if tool_approval is enabled (approval requires non-streaming)
+            use_streaming = (UserPermission.STREAMING_RESPONSES in user_permissions and
+                            UserPermission.TOOL_APPROVAL not in user_permissions)
 
             # Use clean message (without @mention) for processing
             process_message = clean_message if clean_message else "Hello"
