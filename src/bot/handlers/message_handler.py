@@ -478,7 +478,7 @@ class MessageHandler:
                         # Edit message every few chunks to avoid rate limits
                         if len(full_response) % 100 == 0:
                             try:
-                                await message.edit_text(full_response + "▌", message_thread_id=topic_id or None)
+                                await message.edit_text(full_response + "▌")
                             except Exception:
                                 pass  # Ignore edit conflicts
 
@@ -514,7 +514,6 @@ class MessageHandler:
                         try:
                             await status_message.edit_text(
                                 f"📍 **Status**: {current_status}",
-                                message_thread_id=topic_id or None,
                                 parse_mode="Markdown"
                             )
                         except Exception:
@@ -528,7 +527,6 @@ class MessageHandler:
                             try:
                                 await status_message.edit_text(
                                     f"📍 **Status**: {current_status}",
-                                    message_thread_id=topic_id or None,
                                     parse_mode="Markdown"
                                 )
                             except Exception:
@@ -547,7 +545,7 @@ class MessageHandler:
             # Final edit of main response
             if full_response:
                 try:
-                    await message.edit_text(full_response, message_thread_id=topic_id or None)
+                    await message.edit_text(full_response)
                 except Exception as e:
                     logger.warning("Failed to edit final message", error=str(e))
                     # Too long — split into multiple messages
@@ -571,7 +569,7 @@ class MessageHandler:
         except Exception as e:
             logger.error("Streaming error", error=str(e), exc_info=True)
             try:
-                await message.edit_text(full_response + "\n\n⚠️ Stream interrupted", message_thread_id=topic_id or None)
+                await message.edit_text(full_response + "\n\n⚠️ Stream interrupted")
             except Exception:
                 pass
 
@@ -723,7 +721,7 @@ class MessageHandler:
                         # Edit message every few chunks to avoid rate limits
                         if len(full_response) % 100 == 0:
                             try:
-                                await message.edit_text(full_response + "▌", message_thread_id=topic_id)
+                                await message.edit_text(full_response + "▌")
                             except Exception:
                                 pass  # Ignore edit conflicts
 
@@ -760,7 +758,6 @@ class MessageHandler:
                         try:
                             await status_message.edit_text(
                                 f"📍 **Status**: {current_status}",
-                                message_thread_id=topic_id,
                                 parse_mode="Markdown"
                             )
                         except Exception:
@@ -774,7 +771,6 @@ class MessageHandler:
                             try:
                                 await status_message.edit_text(
                                     f"📍 **Status**: {current_status}",
-                                    message_thread_id=topic_id,
                                     parse_mode="Markdown"
                                 )
                             except Exception:
@@ -793,7 +789,7 @@ class MessageHandler:
             # Final edit of main response
             if full_response:
                 try:
-                    await message.edit_text(full_response, message_thread_id=topic_id)
+                    await message.edit_text(full_response)
                 except Exception as e:
                     logger.warning("Failed to edit final message", error=str(e))
                     # Too long — split into multiple messages
@@ -817,7 +813,7 @@ class MessageHandler:
         except Exception as e:
             logger.error("Streaming error", error=str(e), exc_info=True)
             try:
-                await message.edit_text(full_response + "\n\n⚠️ Stream interrupted", message_thread_id=topic_id)
+                await message.edit_text(full_response + "\n\n⚠️ Stream interrupted")
             except Exception:
                 pass
 
