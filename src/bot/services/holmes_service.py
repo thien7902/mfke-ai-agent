@@ -296,11 +296,20 @@ class HolmesService:
                 )
 
                 # Wait for the result (with timeout)
+                # The future belongs to the main event loop. We're in a thread-pool thread,
+                # so we need to block on the future using asyncio's sync waiting mechanism.
                 try:
-                    # Run the future in the thread pool context
-                    result = asyncio.run_coroutine_threadsafe(future, loop).result(timeout=300)  # 5 min timeout
+                    import concurrent.futures
+                    # Wrap the asyncio Future so we can wait on it from a sync thread
+                    result = asyncio.run_coroutine_threadsafe(
+                        asyncio.wait_for(future, timeout=300),
+                        loop
+                    ).result()
                     logger.warning("Approval callback completed", approval_id=approval_id, result=result)
                     return result
+                except asyncio.TimeoutError:
+                    logger.error("Approval callback timed out after 300s", approval_id=approval_id)
+                    return False, "Approval request timed out after 5 minutes"
                 except Exception as e:
                     logger.error("Approval callback error", approval_id=approval_id, error=str(e))
                     return False, str(e)
@@ -502,10 +511,19 @@ class HolmesService:
             }
         }
 
-    def _convert_llm_result_to_message(self, result: LLMResult) -> Message:
-        """Convert LLMResult to our Message model."""
-        # Convert ToolCallResult objects to serializable dictionaries
+    def _convert_llm_result_to_messages(self, result: LLMResult) -> List[Message]:
+        """Convert LLMResult to a list of Message objects.
+
+        Returns the assistant message (with tool_calls) followed by one
+        "tool" role message per tool call result. Without the tool-role
+        messages, the next turn's history has assistant tool_calls with no
+        matching result - Holmes then treats them as orphaned/abandoned and
+        overwrites them with a fake "cancelled" result, so the model loses
+        all memory of what it actually ran and found.
+        """
         tool_calls = []
+        tool_result_messages: List[Message] = []
+
         if result.tool_calls:
             for tc in result.tool_calls:
                 try:
@@ -524,7 +542,46 @@ class HolmesService:
                     # Skip malformed tool calls rather than crashing
                     continue
 
-        return Message(
+                # Persist the actual tool output as a "tool" role message so
+                # it survives into the next turn's conversation history.
+                # tc_dict is already the to_client_dict() output from Holmes.
+                try:
+                    tool_call_id = tc_dict.get("tool_call_id")
+                    tool_name = tc_dict.get("tool_name") or tc_dict.get("name")
+
+                    # Extract result content from nested structure
+                    result_data = tc_dict.get("result", {})
+                    if isinstance(result_data, dict):
+                        data = result_data.get("data", "")
+                        error = result_data.get("error")
+                        status = result_data.get("status")
+
+                        # Build content similar to format_tool_result_data
+                        content_parts = []
+                        if error:
+                            content_parts.append(f"Error: {error}")
+                        if data:
+                            if isinstance(data, str):
+                                content_parts.append(data)
+                            else:
+                                import json
+                                content_parts.append(json.dumps(data, ensure_ascii=False))
+
+                        content = "\n".join(content_parts) if content_parts else "(no output)"
+                    else:
+                        content = str(result_data) if result_data else "(no output)"
+
+                    if tool_call_id and tool_name:
+                        tool_result_messages.append(Message(
+                            role="tool",
+                            content=content,
+                            tool_call_id=tool_call_id,
+                            name=tool_name,
+                        ))
+                except Exception as e:
+                    logger.warning("Failed to build tool result message, skipping", error=str(e))
+
+        assistant_msg = Message(
             role="assistant",
             content=result.result or "",
             tool_calls=tool_calls,
@@ -534,6 +591,8 @@ class HolmesService:
                 "metadata": result.metadata,
             },
         )
+
+        return [assistant_msg] + tool_result_messages
 
     async def chat(
         self,
@@ -588,8 +647,8 @@ class HolmesService:
 
                 # Save Holmes response with tool calls and metadata to conversation
                 try:
-                    assistant_msg = self._convert_llm_result_to_message(llm_result)
-                    conversation.add_message(assistant_msg)
+                    for msg in self._convert_llm_result_to_messages(llm_result):
+                        conversation.add_message(msg)
                 except Exception as e:
                     logger.warning("Failed to save assistant message, continuing without tool calls", error=str(e))
                     # Add a basic message without tool calls so conversation continues
@@ -689,12 +748,92 @@ class HolmesService:
         self, messages: List[Dict[str, Any]], features: Dict[str, bool], user_id: int, conversation: Conversation = None,
         telegram_context: Any = None, chat_id: int = 0, topic_id: int = 0
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Streaming chat with Holmes, yielding structured events including task updates and handling tool approval."""
+        """Streaming chat with Holmes, yielding structured events including task updates and handling tool approval.
+
+        Accumulates assistant response and tool results so they can be persisted
+        to conversation history after the stream completes.
+        """
         task_state = {"last_tasks": []}
+        accumulated_content = ""
+        tool_calls_accumulated = []
+        tool_results_accumulated = []
+
         async for evt in self._run_holmes_stream(
             messages, None, features, user_id, conversation, telegram_context, chat_id, topic_id, task_state
         ):
+            event_type = evt.get("type")
+
+            # Accumulate content and tool call/result data for conversation persistence
+            if event_type == "content":
+                accumulated_content += evt.get("content", "")
+            elif event_type == "tool_call":
+                # Store tool call metadata (we'll reconstruct it later)
+                tool_calls_accumulated.append(evt)
+            elif event_type == "tool_result":
+                # Store tool result for persistence
+                tool_results_accumulated.append(evt)
+
             yield evt
+
+        # After stream ends, persist assistant message and tool results to conversation
+        if conversation:
+            try:
+                # Build assistant message with tool_calls array (OpenAI format)
+                assistant_tool_calls = []
+                for i, tc_evt in enumerate(tool_calls_accumulated):
+                    assistant_tool_calls.append({
+                        "id": f"call_{i}_{tc_evt.get('tool_name', 'unknown')}",
+                        "type": "function",
+                        "function": {
+                            "name": tc_evt.get("tool_name", "unknown"),
+                            "arguments": "{}",  # Params not easily available in stream events
+                        }
+                    })
+
+                assistant_msg = Message(
+                    role="assistant",
+                    content=accumulated_content,
+                    tool_calls=assistant_tool_calls if assistant_tool_calls else [],
+                )
+                conversation.add_message(assistant_msg)
+
+                # Add tool result messages
+                for tr_evt in tool_results_accumulated:
+                    result_data = tr_evt.get("result", "")
+                    tool_name = tr_evt.get("tool_name", "unknown")
+
+                    # Extract content from result structure
+                    content = "(no output)"
+                    if isinstance(result_data, dict):
+                        data = result_data.get("data", "")
+                        error = result_data.get("error")
+                        if error:
+                            content = f"Error: {error}"
+                        elif data:
+                            content = str(data) if not isinstance(data, str) else data
+                    elif result_data:
+                        content = str(result_data)
+
+                    # Match tool_call_id to the accumulated tool call
+                    tool_call_id = None
+                    for i, tc in enumerate(tool_calls_accumulated):
+                        if tc.get("tool_name") == tool_name:
+                            tool_call_id = f"call_{i}_{tool_name}"
+                            break
+
+                    tool_msg = Message(
+                        role="tool",
+                        content=content,
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                    )
+                    conversation.add_message(tool_msg)
+
+            except Exception as e:
+                logger.warning("Failed to persist streaming tool calls to conversation", error=str(e))
+                # Fallback: at least save the text response
+                if accumulated_content and not any(m.role == "assistant" and m.content == accumulated_content for m in conversation.messages[-3:]):
+                    conversation.add_message(Message(role="assistant", content=accumulated_content))
 
     async def _run_holmes_stream(
         self,
@@ -958,9 +1097,9 @@ class HolmesService:
         )
 
         if result.result:
-            # Add assistant response to conversation
-            assistant_msg = self._convert_llm_result_to_message(result)
-            conversation.add_message(assistant_msg)
+            # Add assistant response (and its tool-call results) to conversation
+            for msg in self._convert_llm_result_to_messages(result):
+                conversation.add_message(msg)
             return result.result
 
         return "Agent execution completed without output."
