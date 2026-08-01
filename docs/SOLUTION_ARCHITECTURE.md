@@ -14,16 +14,19 @@ MFKE GPT is an AI agent that investigates and answers operational questions thro
 
 ## 2. System Context
 
-```
-                 ┌─────────────────────────┐
-   Telegram      │   Telegram Bot Process   │
-   group chat  ─▶│  (long polling, PTB 21)  │
-                 │                          │
-                 │  handlers ─▶ services ─▶ │──▶ MFKE GPT Agent Core ──▶ LLM Provider
-                 │              │           │        │                (Anthropic/OpenAI)
-                 │              ▼           │        ▼
-                 │          MongoDB          │    Tool Executor ──▶ Investigation Tools
-                 └─────────────────────────┘        (kubectl, logs, metrics, ...)
+```mermaid
+flowchart LR
+    TG[Telegram\ngroup chat] -->|long polling\nPTB 21| BOT
+
+    subgraph BOT["Telegram Bot Process"]
+        H[Handlers] --> S[Services]
+        S --> DB[(MongoDB)]
+    end
+
+    S -->|chat / stream| CORE[MFKE GPT\nAgent Core]
+    CORE -->|completion| LLM[LLM Provider\nAnthropic / OpenAI]
+    CORE -->|tool calls| EXEC[Tool Executor]
+    EXEC --> TOOLS[Investigation Tools\nkubectl, logs, metrics, ...]
 ```
 
 The bot runs as a single long-lived process. There is no public HTTP surface for Telegram itself (polling, not webhooks); the only exposed endpoint is a local health-check server used for liveness/readiness probing.
