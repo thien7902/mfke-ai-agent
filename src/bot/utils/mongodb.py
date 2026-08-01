@@ -14,9 +14,19 @@ class MongoDB:
 
     @classmethod
     def get_client(cls) -> MongoClient:
-        """Get or create MongoDB client."""
+        """Get or create MongoDB client with connection pooling and timeout settings."""
         if cls._client is None:
-            cls._client = MongoClient(config.mongodb_uri)
+            cls._client = MongoClient(
+                config.mongodb_uri,
+                maxPoolSize=50,
+                minPoolSize=10,
+                maxIdleTimeMS=45000,  # Close idle connections after 45 seconds
+                serverSelectionTimeoutMS=5000,  # 5 second timeout for server selection
+                connectTimeoutMS=10000,  # 10 second connection timeout
+                socketTimeoutMS=45000,  # 45 second socket timeout
+                retryWrites=True,
+                retryReads=True,
+            )
         return cls._client
 
     @classmethod

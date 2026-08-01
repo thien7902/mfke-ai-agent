@@ -59,6 +59,7 @@ class TelegramBot:
         self.holmes_service: HolmesService = None
         self.conversation_service: ConversationService = None
         self.permission_service: PermissionService = None
+        self.last_update_time: float = 0  # Track last received update
 
     async def initialize(self):
         """Initialize all services and the Telegram application."""
@@ -117,6 +118,11 @@ class TelegramBot:
             TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler.handle_message)
         )
 
+        # Add update tracker to monitor connection health (runs before all other handlers)
+        self.application.add_handler(
+            TelegramMessageHandler(filters.ALL, self._update_tracker), group=-1
+        )
+
         # Forum topic created handler
         self.application.add_handler(
             TelegramMessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, msg_handler.handle_topic_created)
@@ -127,9 +133,26 @@ class TelegramBot:
 
         logger.info("Bot initialized successfully")
 
+    async def _update_tracker(self, update: object, context: "ContextTypes.DEFAULT_TYPE"):
+        """Track when we receive updates to detect silent connection failures."""
+        import time
+        self.last_update_time = time.time()
+
     async def _error_handler(self, update: object, context: "ContextTypes.DEFAULT_TYPE"):
-        """Global error handler."""
-        logger.error("Unhandled error", error=str(context.error), update=str(update)[:200])
+        """Global error handler with connection recovery."""
+        error_str = str(context.error)
+        logger.error("Unhandled error", error=error_str, update=str(update)[:200])
+
+        # Check for network/connection errors and attempt recovery
+        if any(keyword in error_str.lower() for keyword in ['connection', 'timeout', 'network', 'unreachable']):
+            logger.warning("Detected connection error, checking connections...")
+            try:
+                # Test MongoDB connection
+                MongoDB.get_database().command('ping')
+            except Exception as e:
+                logger.error("MongoDB connection failed, reconnecting", error=str(e))
+                MongoDB.close()
+                MongoDB.get_database()
 
     async def start(self):
         """Start the bot."""
@@ -141,7 +164,11 @@ class TelegramBot:
         await self.application.start()
         await self.application.updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True  # Clear any pending updates from other instances
+            drop_pending_updates=True,  # Clear any pending updates from other instances
+            pool_timeout=30,  # Connection timeout for long polling
+            connect_timeout=30,  # Initial connection timeout
+            read_timeout=30,  # Read timeout between updates
+            write_timeout=30,  # Write timeout for sending updates
         )
         health_checker.set_bot_alive(True)
         logger.info("Bot started successfully")
@@ -195,9 +222,59 @@ async def main():
         await bot.initialize()
         await bot.start()
 
-        # Keep running until stopped
+        # Keep running until stopped with periodic health checks
+        last_health_check = asyncio.get_event_loop().time()
+        import time
+        bot.last_update_time = time.time()  # Initialize
+
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(60)  # Check every minute
+
+            # Periodic connection health check
+            current_time = asyncio.get_event_loop().time()
+            if current_time - last_health_check >= 300:  # Every 5 minutes
+                try:
+                    # Ping MongoDB to ensure connection is alive
+                    MongoDB.get_database().command('ping')
+                    logger.debug("MongoDB connection healthy")
+                except Exception as e:
+                    logger.error("MongoDB connection lost, reconnecting", error=str(e))
+                    MongoDB.close()
+                    MongoDB.get_database()  # Reconnect
+
+                # Check if Telegram polling is stuck (no updates for 2+ hours during active hours)
+                # This detects silent connection failures
+                time_since_update = time.time() - bot.last_update_time
+                if time_since_update > 7200:  # 2 hours with no activity
+                    logger.warning(
+                        "No Telegram updates received for 2+ hours - possible silent connection failure",
+                        hours_idle=time_since_update / 3600
+                    )
+                    # Send a test message to ourselves to verify connection
+                    try:
+                        me = await bot.application.bot.get_me()
+                        logger.info("Telegram connection verified", bot_username=me.username)
+                        bot.last_update_time = time.time()  # Reset timer after check
+                    except Exception as e:
+                        logger.error("Telegram connection test failed - restarting polling", error=str(e))
+                        # Restart the polling connection
+                        try:
+                            await bot.application.updater.stop()
+                            await asyncio.sleep(2)
+                            await bot.application.updater.start_polling(
+                                allowed_updates=Update.ALL_TYPES,
+                                drop_pending_updates=True,
+                                pool_timeout=30,
+                                connect_timeout=30,
+                                read_timeout=30,
+                                write_timeout=30,
+                            )
+                            logger.info("Telegram polling restarted successfully")
+                            bot.last_update_time = time.time()
+                        except Exception as restart_error:
+                            logger.error("Failed to restart polling", error=str(restart_error))
+
+                last_health_check = current_time
 
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
