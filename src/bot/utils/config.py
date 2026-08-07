@@ -34,6 +34,11 @@ class Config:
     # Permission request expiry
     permission_request_expiry_minutes: int = 10
 
+    # Message batching (per forum topic)
+    message_batch_quiet_period_seconds: int = 10
+    message_batch_max_wait_seconds: int = 30
+    message_batch_max_messages: int = 20
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -52,6 +57,9 @@ def load_config() -> Config:
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "30")),
         permission_request_expiry_minutes=int(os.getenv("PERMISSION_REQUEST_EXPIRY_MINUTES", "10")),
+        message_batch_quiet_period_seconds=int(os.getenv("MESSAGE_BATCH_QUIET_PERIOD_SECONDS", "10")),
+        message_batch_max_wait_seconds=int(os.getenv("MESSAGE_BATCH_MAX_WAIT_SECONDS", "30")),
+        message_batch_max_messages=int(os.getenv("MESSAGE_BATCH_MAX_MESSAGES", "20")),
     )
 
 

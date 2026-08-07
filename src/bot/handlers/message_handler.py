@@ -1,12 +1,17 @@
 """Message Handler - Process regular messages through Holmes."""
+import asyncio
 import logging
 import random
 import structlog
+import threading
 import time
+from dataclasses import dataclass, field
+from typing import Optional
 from telegram import Update, ForumTopic
 from telegram.ext import ContextTypes
 
 from src.bot.services.holmes_service import HolmesService
+from holmes.core.tool_calling_llm import LLMInterruptedError as _LLMInterrupted
 from src.bot.services.conversation_service import ConversationService
 from src.bot.services.permission_service import PermissionService
 from src.bot.models.user import UserPermission
@@ -28,7 +33,6 @@ _MESSAGE_PROCESSING_TTL = 30  # seconds
 _progress_topic_cache: dict[tuple, int] = {}  # (chat_id, main_topic_id) -> progress_topic_id
 
 # Per-topic locks to serialize message processing
-import asyncio
 _topic_locks: dict[tuple, asyncio.Lock] = {}  # (chat_id, topic_id) -> Lock
 
 
@@ -38,6 +42,24 @@ def _get_topic_lock(chat_id: int, topic_id: int) -> asyncio.Lock:
     if key not in _topic_locks:
         _topic_locks[key] = asyncio.Lock()
     return _topic_locks[key]
+
+
+# Per-topic message batching. Rapid consecutive messages in a forum topic are
+# combined into a single Holmes request after a quiet period (debounce).
+@dataclass
+class _PendingBatch:
+    updates: list = field(default_factory=list)   # Telegram Update objects for reply threading
+    texts: list = field(default_factory=list)
+    user_ids: list = field(default_factory=list)
+    timer: Optional[asyncio.TimerHandle] = None
+    started_at: float = 0.0
+    cancel_event: Optional[threading.Event] = None  # set only while a dispatch is in flight
+
+
+# (chat_id, topic_id) -> _PendingBatch
+_topic_batches: dict[tuple, _PendingBatch] = {}
+
+_STOPPED_FOOTER = "\n\n🛑 Stopped by user."
 
 
 def _generate_topic_name(user_message: str, user_id: int) -> str:
@@ -149,56 +171,182 @@ class MessageHandler:
 
         logger.info("Received message", user_id=user_id, chat_id=chat_id, topic_id=topic_id, text=message_text[:50])
 
-        # Acquire per-topic lock to serialize messages in the same topic
+        # Batch per topic: rapid consecutive messages combine into one Holmes request.
+        await self._enqueue_for_batch(update, context, chat_id, topic_id, user, message_text)
+
+    async def _enqueue_for_batch(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        topic_id: int,
+        user,
+        message_text: str,
+    ):
+        """Accumulate messages per topic and flush after a quiet period (debounce)."""
+        key = (chat_id, topic_id)
+        now = time.time()
+        quiet = config.message_batch_quiet_period_seconds
+        max_wait = config.message_batch_max_wait_seconds
+        max_messages = config.message_batch_max_messages
+
+        batch = _topic_batches.get(key)
+        if batch is None or batch.cancel_event is not None:
+            # No pending batch, or the previous one is already dispatching — start fresh.
+            # A dispatching batch owns the topic lock, so a new batch will simply queue on it.
+            batch = _PendingBatch(updates=[], texts=[], user_ids=[], started_at=now)
+            _topic_batches[key] = batch
+
+        batch.updates.append(update)
+        batch.texts.append(message_text)
+        batch.user_ids.append(user.id)
+
+        # Cancel any previously armed timer (debounce: reset the quiet window).
+        if batch.timer is not None:
+            batch.timer.cancel()
+            batch.timer = None
+
+        force_flush = (
+            getattr(config, "test_mode", False)
+            or (now - batch.started_at) >= max_wait
+            or len(batch.texts) >= max_messages
+        )
+
+        if force_flush:
+            # Flush synchronously (tests) or when caps are hit — no timer.
+            await self._flush_batch(context, chat_id, topic_id)
+            return
+
+        # Arm a timer to flush after the quiet period. loop.call_later returns a TimerHandle.
+        loop = asyncio.get_event_loop()
+        batch.timer = loop.call_later(
+            quiet,
+            lambda: asyncio.ensure_future(self._flush_batch(context, chat_id, topic_id)),
+        )
+
+    async def _flush_batch(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, topic_id: int):
+        """Drain the pending batch for a topic and dispatch a single combined Holmes request."""
+        key = (chat_id, topic_id)
+        batch = _topic_batches.get(key)
+        if batch is None or not batch.texts:
+            return
+
+        # Snapshot and clear the pending state so new messages start a new batch
+        # while this one dispatches under the topic lock.
+        updates = list(batch.updates)
+        texts = list(batch.texts)
+        user_ids = list(batch.user_ids)
+        if batch.timer is not None:
+            batch.timer.cancel()
+        # Mark in-flight by setting cancel_event; /stop checks it.
+        cancel_event = batch.cancel_event = threading.Event()
+
+        combined_text = "\n\n".join(texts)
+        first_update = updates[0]
+        first_user_id = user_ids[0]
+        user = first_update.effective_user
+
+        # Acquire the per-topic lock to serialize dispatch across overlapping batches.
         lock = _get_topic_lock(chat_id, topic_id)
-        logger.debug("Acquiring topic lock", chat_id=chat_id, topic_id=topic_id)
+        logger.debug("Acquiring topic lock for batch flush", chat_id=chat_id, topic_id=topic_id)
         async with lock:
-            logger.debug("Topic lock acquired, processing message", chat_id=chat_id, topic_id=topic_id, user_id=user_id)
+            logger.debug("Topic lock acquired for batch flush", chat_id=chat_id, topic_id=topic_id, batch_size=len(texts))
             try:
-                # Get or create user
+                # Get or create the first user (the one whose update we reply to).
                 user_model = await self.permissions.get_or_create_user(
-                    telegram_id=user_id,
+                    telegram_id=first_user_id,
                     username=user.username,
                     first_name=user.first_name,
                     last_name=user.last_name,
                 )
 
-                # Get conversation (by topic for forums, by user for private)
                 conversation = await self.conversations.get_conversation(
-                    user_id, topic_id=topic_id, chat_id=chat_id
+                    first_user_id, topic_id=topic_id, chat_id=chat_id
                 )
 
-                # Get user permissions
                 user_permissions = user_model.permissions
 
-                # Send typing indicator
                 await context.bot.send_chat_action(
-                    chat_id=chat_id or update.effective_chat.id, action="typing", message_thread_id=topic_id or None
+                    chat_id=chat_id, action="typing", message_thread_id=topic_id or None
                 )
 
-                # Check if user has streaming permission
-                # Allow streaming with tool_approval to test streaming approval flow
                 use_streaming = UserPermission.STREAMING_RESPONSES in user_permissions
 
                 if use_streaming:
                     await self._handle_streaming_response(
-                        context, update, conversation, user_permissions, message_text, chat_id, topic_id
+                        context, first_update, conversation, user_permissions,
+                        combined_text, chat_id, topic_id, cancel_event=cancel_event,
                     )
                 else:
                     await self._handle_regular_response(
-                        context, update, conversation, user_permissions, message_text, chat_id, topic_id
+                        context, first_update, conversation, user_permissions,
+                        combined_text, chat_id, topic_id, cancel_event=cancel_event,
                     )
+
+                # If the user stopped mid-flight, surface it on the saved conversation.
+                if cancel_event.is_set():
+                    # Append a marker so future turns know this one was aborted.
+                    try:
+                        last = conversation.messages[-1] if conversation.messages else None
+                        if last and last.role == "assistant" and _STOPPED_FOOTER not in last.content:
+                            last.content = (last.content or "") + _STOPPED_FOOTER
+                    except Exception:
+                        pass
             except Exception as e:
-                # Safely convert error to string (handles non-serializable objects like ToolCallResult)
                 try:
                     error_str = str(e)
                 except Exception:
                     error_str = f"<unserializable error: {type(e).__name__}>"
-                logger.error("Error handling message", user_id=user_id, error=error_str)
-                await update.message.reply_text(
-                    "❌ An error occurred while processing your message. Please try again.",
-                    message_thread_id=topic_id or None
-                )
+                logger.error("Error handling batch", chat_id=chat_id, topic_id=topic_id, error=error_str)
+                try:
+                    await first_update.message.reply_text(
+                        "❌ An error occurred while processing your message. Please try again.",
+                        message_thread_id=topic_id or None
+                    )
+                except Exception:
+                    pass
+            finally:
+                # Clear the in-flight batch only if it's still the one we set.
+                if _topic_batches.get(key) is batch:
+                    _topic_batches.pop(key, None)
+
+    async def stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /stop — cancel a pending batch or an in-flight request for the topic."""
+        if not update.message:
+            return
+        chat = update.effective_chat
+        topic_id = update.message.message_thread_id or 0
+
+        # Only meaningful in a forum topic.
+        if not (chat and chat.type in ("group", "supergroup") and chat.is_forum and topic_id):
+            await update.message.reply_text(
+                "ℹ️ /stop only works inside a forum topic.",
+                message_thread_id=topic_id or None
+            )
+            return
+
+        key = (chat.id, topic_id)
+        batch = _topic_batches.get(key)
+
+        if batch is None:
+            await update.message.reply_text("ℹ️ Nothing to stop.", message_thread_id=topic_id)
+            return
+
+        if batch.cancel_event is not None:
+            # A dispatch is in flight — signal Holmes to abort between iterations.
+            batch.cancel_event.set()
+            await update.message.reply_text("🛑 Stopping current request…", message_thread_id=topic_id)
+            return
+
+        # Pending batch (timer armed, not yet dispatching) — discard it.
+        n = len(batch.texts)
+        if batch.timer is not None:
+            batch.timer.cancel()
+        _topic_batches.pop(key, None)
+        await update.message.reply_text(
+            f"🛑 Stopped — {n} pending message(s) discarded.",
+            message_thread_id=topic_id
+        )
 
     async def handle_topic_created(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle when a new forum topic is created."""
@@ -403,6 +551,7 @@ class MessageHandler:
         message_text: str,
         chat_id: int,
         topic_id: int,
+        cancel_event: Optional[threading.Event] = None,
     ):
         """Handle non-streaming response."""
         response = await self.holmes.chat(
@@ -414,18 +563,26 @@ class MessageHandler:
             telegram_context=context,
             chat_id=chat_id,
             topic_id=topic_id,
+            cancel_event=cancel_event,
         )
+
+        if cancel_event is not None and cancel_event.is_set():
+            response = (response or "") + _STOPPED_FOOTER
 
         # Save conversation
         await self.conversations.save_conversation(conversation)
 
         # Send response (split if too long)
-        await send_long_message(
-            context.bot,
-            chat_id,
-            response,
-            message_thread_id=topic_id or None
-        )
+        try:
+            await send_long_message(
+                context.bot,
+                chat_id,
+                response,
+                message_thread_id=topic_id or None
+            )
+        except Exception as e:
+            logger.warning("Failed to deliver response", user_id=update.effective_user.id, error=str(e))
+            await self._notify_delivery_failure(context.bot, chat_id, topic_id)
 
     async def _handle_streaming_response(
         self,
@@ -436,6 +593,7 @@ class MessageHandler:
         message_text: str,
         chat_id: int,
         topic_id: int,
+        cancel_event: Optional[threading.Event] = None,
     ):
         """Handle streaming response with clean task progress updates."""
         import asyncio
@@ -465,6 +623,7 @@ class MessageHandler:
                 telegram_context=context,
                 chat_id=chat_id,
                 topic_id=topic_id,
+                cancel_event=cancel_event,
             )
 
             # Add timeout to prevent hanging indefinitely
@@ -541,9 +700,16 @@ class MessageHandler:
                 logger.warning("Streaming response timed out after 240 seconds", user_id=update.effective_user.id)
                 await status_message.edit_text("📍 **Status**: ⏱️ Timed out", parse_mode="Markdown")
                 full_response += "\n\n⚠️ Response timed out. Please try again."
+            except _LLMInterrupted:
+                # User hit /stop mid-stream: Holmes aborted. Treat as graceful stop.
+                logger.info("Stream interrupted by user", user_id=update.effective_user.id)
+                if cancel_event is not None:
+                    cancel_event.set()
 
             # Final edit of main response
             if full_response:
+                if cancel_event is not None and cancel_event.is_set() and _STOPPED_FOOTER not in full_response:
+                    full_response += _STOPPED_FOOTER
                 try:
                     await message.edit_text(full_response)
                 except Exception as e:
@@ -556,13 +722,19 @@ class MessageHandler:
                             full_response,
                             message_thread_id=topic_id or None
                         )
-                    except Exception:
-                        pass
+                    except Exception as e2:
+                        logger.warning("Failed to deliver streamed response", user_id=update.effective_user.id, error=str(e2))
+                        await self._notify_delivery_failure(context.bot, chat_id, topic_id)
 
             # Final status
-            if stream_completed:
+            if stream_completed and not (cancel_event is not None and cancel_event.is_set()):
                 try:
                     await status_message.edit_text("📍 **Status**: ✅ Done", parse_mode="Markdown")
+                except Exception:
+                    pass
+            elif cancel_event is not None and cancel_event.is_set():
+                try:
+                    await status_message.edit_text("📍 **Status**: 🛑 Stopped", parse_mode="Markdown")
                 except Exception:
                     pass
 
@@ -575,6 +747,17 @@ class MessageHandler:
 
         # Save conversation
         await self.conversations.save_conversation(conversation)
+
+    async def _notify_delivery_failure(self, bot, chat_id: int, topic_id: int):
+        """Best-effort notice when a generated response could not be delivered to Telegram."""
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ The response was generated but couldn't be delivered. Please try again.",
+                message_thread_id=topic_id or None,
+            )
+        except Exception:
+            pass
 
     def _get_friendly_tool_name(self, tool_name: str) -> str:
         """Convert technical tool names to user-friendly names."""
@@ -658,12 +841,16 @@ class MessageHandler:
         await self.conversations.save_conversation(conversation)
 
         # Send response in the topic (split if too long)
-        await send_long_message(
-            context.bot,
-            chat_id,
-            response,
-            message_thread_id=topic_id
-        )
+        try:
+            await send_long_message(
+                context.bot,
+                chat_id,
+                response,
+                message_thread_id=topic_id
+            )
+        except Exception as e:
+            logger.warning("Failed to deliver response in topic", user_id=user_id, error=str(e))
+            await self._notify_delivery_failure(context.bot, chat_id, topic_id)
 
     async def _handle_streaming_response_in_topic(
         self,
@@ -800,8 +987,9 @@ class MessageHandler:
                             full_response,
                             message_thread_id=topic_id
                         )
-                    except Exception:
-                        pass
+                    except Exception as e2:
+                        logger.warning("Failed to deliver streamed response in topic", user_id=user_id, error=str(e2))
+                        await self._notify_delivery_failure(context.bot, chat_id, topic_id)
 
             # Final status
             if stream_completed:

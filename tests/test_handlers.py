@@ -1,4 +1,5 @@
 """Tests for Handlers."""
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -230,3 +231,143 @@ class TestMessageHandler:
 
         # Should not call Holmes for commands
         mock_permission_service.get_or_create_user.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_batch_combines_messages(
+        self, message_handler, mock_holmes_service, mock_conversation_service,
+        mock_permission_service, mock_update, mock_context, monkeypatch
+    ):
+        """Rapid consecutive messages in a topic flush as one combined Holmes call."""
+        import src.bot.handlers.message_handler as mh
+
+        # Real batching path (not test_mode immediate flush); tiny quiet period.
+        monkeypatch.setattr(mh.config, "test_mode", False)
+        monkeypatch.setattr(mh.config, "message_batch_quiet_period_seconds", 0.05)
+        monkeypatch.setattr(mh.config, "message_batch_max_wait_seconds", 30)
+        monkeypatch.setattr(mh.config, "message_batch_max_messages", 20)
+        mh._topic_batches.clear()
+
+        mock_user = User(telegram_id=123456789, permissions=[])
+        mock_permission_service.get_or_create_user.return_value = mock_user
+        mock_conversation = MagicMock()
+        mock_conversation.messages = []
+        mock_conversation_service.get_conversation.return_value = mock_conversation
+
+        # Two quick messages from the same user in the same topic.
+        mock_update.message.message_id = 101
+        mock_update.message.text = "hello"
+        await message_handler.handle_message(mock_update, mock_context)
+        mock_update.message.message_id = 102
+        mock_update.message.text = "world"
+        await message_handler.handle_message(mock_update, mock_context)
+
+        # Let the quiet-period timer fire.
+        await asyncio.sleep(0.2)
+
+        mock_holmes_service.chat.assert_called_once()
+        kwargs = mock_holmes_service.chat.call_args.kwargs
+        assert kwargs["user_message"] == "hello\n\nworld"
+        mh._topic_batches.clear()
+
+    @pytest.mark.asyncio
+    async def test_stop_discards_pending_batch(
+        self, message_handler, mock_holmes_service, mock_permission_service,
+        mock_update, mock_context, monkeypatch
+    ):
+        """/stop while a batch is pending discards it and skips Holmes."""
+        import src.bot.handlers.message_handler as mh
+
+        monkeypatch.setattr(mh.config, "test_mode", False)
+        monkeypatch.setattr(mh.config, "message_batch_quiet_period_seconds", 10)
+        monkeypatch.setattr(mh.config, "message_batch_max_wait_seconds", 30)
+        monkeypatch.setattr(mh.config, "message_batch_max_messages", 20)
+        mh._topic_batches.clear()
+
+        mock_update.message.text = "hello"
+        await message_handler.handle_message(mock_update, mock_context)
+
+        # /stop before the quiet period elapses -> discard.
+        await message_handler.stop_command(mock_update, mock_context)
+
+        mock_holmes_service.chat.assert_not_called()
+        reply_args = mock_update.message.reply_text.call_args
+        assert "Stopped" in reply_args[0][0]
+        mh._topic_batches.clear()
+
+    @pytest.mark.asyncio
+    async def test_stop_in_flight_signals_cancel_event(
+        self, message_handler, mock_holmes_service, mock_conversation_service,
+        mock_permission_service, mock_update, mock_context, monkeypatch
+    ):
+        """/stop during dispatch sets the batch's cancel_event so Holmes aborts."""
+        import src.bot.handlers.message_handler as mh
+
+        # Immediate flush (test_mode) so a batch is in flight right away.
+        monkeypatch.setattr(mh.config, "test_mode", True)
+        mh._topic_batches.clear()
+
+        captured = {}
+
+        async def fake_chat(*args, **kwargs):
+            ev = kwargs.get("cancel_event")
+            captured["event"] = ev
+            # Simulate /stop firing while Holmes is mid-call.
+            if ev is not None:
+                ev.set()
+            return "partial"
+
+        mock_holmes_service.chat = AsyncMock(side_effect=fake_chat)
+        mock_user = User(telegram_id=123456789, permissions=[])
+        mock_permission_service.get_or_create_user.return_value = mock_user
+        mock_conversation = MagicMock()
+        mock_conversation.messages = []
+        mock_conversation_service.get_conversation.return_value = mock_conversation
+
+        mock_update.message.text = "hello"
+        await message_handler.handle_message(mock_update, mock_context)
+
+        # cancel_event was threaded into holmes.chat and set by the stop path.
+        assert captured.get("event") is not None
+        assert captured["event"].is_set()
+        mh._topic_batches.clear()
+
+    @pytest.mark.asyncio
+    async def test_stop_during_stream_shows_stopped_footer(
+        self, message_handler, mock_holmes_service, mock_conversation_service,
+        mock_permission_service, mock_update, mock_context, monkeypatch
+    ):
+        """When Holmes raises LLMInterruptedError mid-stream, the fix-up uses a 'Stopped' footer + status, not 'Stream interrupted'."""
+        import src.bot.handlers.message_handler as mh
+        from holmes.core.tool_calling_llm import LLMInterruptedError
+
+        monkeypatch.setattr(mh.config, "test_mode", True)
+        mh._topic_batches.clear()
+
+        # Streaming: holmes.chat returns an async generator that raises LLMInterruptedError after one content chunk.
+        async def fake_stream(*args, **kwargs):
+            yield {"type": "content", "content": "partial answer"}
+            raise LLMInterruptedError()
+
+        mock_holmes_service.chat = AsyncMock(return_value=fake_stream())
+        mock_user = User(telegram_id=123456789, permissions=[UserPermission.STREAMING_RESPONSES])
+        mock_permission_service.get_or_create_user.return_value = mock_user
+        mock_conversation = MagicMock()
+        mock_conversation.messages = []
+        mock_conversation_service.get_conversation.return_value = mock_conversation
+
+        # Streaming needs real message objects whose edit_text we can inspect.
+        main_msg = MagicMock(edit_text=AsyncMock())
+        status_msg = MagicMock(edit_text=AsyncMock())
+        mock_update.message.reply_text = AsyncMock(side_effect=[main_msg, status_msg])
+
+        mock_update.message.text = "hello"
+        await message_handler.handle_message(mock_update, mock_context)
+        # Let the stream coroutine drain.
+        await asyncio.sleep(0.05)
+
+        # The main message's edit_text should contain the 'Stopped by user.' footer,
+        # not the 'Stream interrupted' error text.
+        edited_texts = [c.args[0] for c in main_msg.edit_text.call_args_list if c.args]
+        assert any("🛑 Stopped by user." in t for t in edited_texts), edited_texts
+        assert not any("Stream interrupted" in t for t in edited_texts), edited_texts
+        mh._topic_batches.clear()

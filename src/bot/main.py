@@ -79,10 +79,20 @@ class TelegramBot:
         self.permission_service = PermissionService()
 
         # Create Telegram application
+        # Defaults (PTB HTTPXRequest) are read/write=5s, pool=1s, pool_size=1 — too tight
+        # for concurrent send/edit_message_text under .concurrent_updates(True). The
+        # start_polling timeouts below only cover getUpdates, not bot API sends, so raise
+        # the general request's timeouts and pool size here to avoid telegram.error.TimedOut
+        # ("Timed out") on long/concurrent responses.
         self.application = (
             Application.builder()
             .token(config.telegram_bot_token)
             .concurrent_updates(True)  # Enable concurrent update processing
+            .connection_pool_size(8)  # Multiple concurrent bot API requests
+            .read_timeout(60)  # Large send_message payloads can exceed the 5s default
+            .write_timeout(60)
+            .connect_timeout(15)
+            .pool_timeout(15)  # Waiting for a free pooled connection shouldn't blow up in 1s
             .build()
         )
 
@@ -101,6 +111,7 @@ class TelegramBot:
         self.application.add_handler(TelegramCommandHandler("permissions", cmd_handler.permissions_command))
         self.application.add_handler(TelegramCommandHandler("clear", cmd_handler.clear_command))
         self.application.add_handler(TelegramCommandHandler("new", cmd_handler.new_command))
+        self.application.add_handler(TelegramCommandHandler("stop", msg_handler.stop_command))
 
         # Privilege commands
         self.application.add_handler(TelegramCommandHandler("grant", priv_handler.grant_command))

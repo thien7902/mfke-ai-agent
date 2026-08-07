@@ -51,7 +51,8 @@ class CommandHandler:
             "/help - Show help information\n"
             "/new - Create a new conversation thread\n"
             "/permissions - View your permissions\n"
-            "/clear - Clear conversation history\n\n"
+            "/clear - Clear conversation history\n"
+            "/stop - Stop a pending batch or in-flight request in this topic\n\n"
             "Just send me a message to start chatting!"
         )
 
@@ -102,6 +103,7 @@ class CommandHandler:
             "/new - Create a new conversation thread (forum only)\n"
             "/permissions - View your current permissions\n"
             "/clear - Clear your conversation history\n"
+            "/stop - Stop a pending batch or in-flight request in this topic\n"
         )
 
         if is_admin:

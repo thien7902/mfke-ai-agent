@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 
 import structlog
 from holmes.config import Config
-from holmes.core.tool_calling_llm import ToolCallingLLM, LLMResult
+from holmes.core.tool_calling_llm import ToolCallingLLM, LLMResult, LLMInterruptedError
 from holmes.core.tools_utils.tool_executor import ToolExecutor
 from holmes.core.tracing import TracingFactory
 from holmes.core.tools import ToolsetTag, PrerequisiteCacheMode
@@ -42,6 +43,11 @@ class ApprovalResult:
     """Result of a tool approval request."""
     approved: bool
     feedback: Optional[str] = None
+
+
+def _empty_llm_result() -> LLMResult:
+    """Minimal LLMResult for an interrupted (user-stopped) call."""
+    return LLMResult(result=None, metadata=None, finish_reason="interrupted")
 
 
 class HolmesService:
@@ -604,6 +610,7 @@ class HolmesService:
         telegram_context: Any = None,
         chat_id: int = 0,
         topic_id: int = 0,
+        cancel_event: Optional[threading.Event] = None,
     ) -> str | AsyncGenerator[str, None]:
         """
         Send a message to Holmes and get response.
@@ -617,6 +624,8 @@ class HolmesService:
             telegram_context: Telegram context for sending approval requests
             chat_id: Chat ID for approval messages
             topic_id: Topic ID for approval messages
+            cancel_event: Optional threading.Event; when set, Holmes aborts between
+                iterations and cancels running tools (see ToolCallingLLM cancel_event).
 
         Returns:
             Response text or async generator for streaming
@@ -638,11 +647,15 @@ class HolmesService:
 
         try:
             if stream and features.get("streaming", False):
-                return self._stream_chat(holmes_messages, features, user_id, conversation, telegram_context, chat_id, topic_id)
+                return self._stream_chat(
+                    holmes_messages, features, user_id, conversation,
+                    telegram_context, chat_id, topic_id, cancel_event=cancel_event,
+                )
             else:
                 # Pass telegram context for approval callback
                 response_text, llm_result = await self._non_stream_chat_with_memory(
-                    holmes_messages, features, user_id, telegram_context, chat_id, topic_id
+                    holmes_messages, features, user_id, telegram_context, chat_id, topic_id,
+                    cancel_event=cancel_event,
                 )
 
                 # Save Holmes response with tool calls and metadata to conversation
@@ -705,7 +718,8 @@ class HolmesService:
         user_id: int,
         telegram_context: Any = None,
         chat_id: int = 0,
-        topic_id: int = 0
+        topic_id: int = 0,
+        cancel_event: Optional[threading.Event] = None,
     ) -> tuple[str, LLMResult]:
         """Non-streaming chat with Holmes, returning full result for memory storage."""
         loop = asyncio.get_event_loop()
@@ -722,31 +736,42 @@ class HolmesService:
         if enable_approval:
             approval_callback = self._create_approval_callback(user_id, chat_id, topic_id, telegram_context)
             logger.warning("Created approval callback", user_id=user_id)
-            result: LLMResult = await loop.run_in_executor(
-                _holmes_executor,
-                lambda: self._tool_calling_llm.call(
-                    messages=messages,
-                    request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
-                    approval_callback=approval_callback,
-                ),
-            )
+            try:
+                result: LLMResult = await loop.run_in_executor(
+                    _holmes_executor,
+                    lambda: self._tool_calling_llm.call(
+                        messages=messages,
+                        request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
+                        approval_callback=approval_callback,
+                        cancel_event=cancel_event,
+                    ),
+                )
+            except LLMInterruptedError:
+                logger.info("Non-stream chat interrupted by user", user_id=user_id)
+                return "🛑 Stopped by user.", _empty_llm_result()
         else:
             # No interactive approval
             logger.warning("Skipping approval callback - reason: tool_approval=%s, telegram_context=%s",
                           features.get("tool_approval", False), telegram_context is not None)
-            result: LLMResult = await loop.run_in_executor(
-                _holmes_executor,
-                lambda: self._tool_calling_llm.call(
-                    messages=messages,
-                    request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
-                ),
-            )
+            try:
+                result: LLMResult = await loop.run_in_executor(
+                    _holmes_executor,
+                    lambda: self._tool_calling_llm.call(
+                        messages=messages,
+                        request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
+                        cancel_event=cancel_event,
+                    ),
+                )
+            except LLMInterruptedError:
+                logger.info("Non-stream chat interrupted by user", user_id=user_id)
+                return "🛑 Stopped by user.", _empty_llm_result()
 
         return result.result or "I apologize, but I couldn't generate a response.", result
 
     async def _stream_chat(
         self, messages: List[Dict[str, Any]], features: Dict[str, bool], user_id: int, conversation: Conversation = None,
-        telegram_context: Any = None, chat_id: int = 0, topic_id: int = 0
+        telegram_context: Any = None, chat_id: int = 0, topic_id: int = 0,
+        cancel_event: Optional[threading.Event] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Streaming chat with Holmes, yielding structured events including task updates and handling tool approval.
 
@@ -759,7 +784,8 @@ class HolmesService:
         tool_results_accumulated = []
 
         async for evt in self._run_holmes_stream(
-            messages, None, features, user_id, conversation, telegram_context, chat_id, topic_id, task_state
+            messages, None, features, user_id, conversation, telegram_context, chat_id, topic_id, task_state,
+            cancel_event=cancel_event,
         ):
             event_type = evt.get("type")
 
@@ -846,6 +872,7 @@ class HolmesService:
         chat_id: int,
         topic_id: int,
         task_state: Dict[str, Any],
+        cancel_event: Optional[threading.Event] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run (or resume) one Holmes stream call, recursing on APPROVAL_REQUIRED
         so any number of approval rounds are handled with the correctly
@@ -860,6 +887,7 @@ class HolmesService:
                 request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
                 enable_tool_approval=enable_approval,
                 tool_decisions=tool_decisions,
+                cancel_event=cancel_event,
             )
 
         stream = await loop.run_in_executor(_holmes_executor, stream_generator)
@@ -1029,7 +1057,8 @@ class HolmesService:
                 if decisions:
                     async for resumed_evt in self._run_holmes_stream(
                         updated_messages, decisions, features, user_id, conversation,
-                        telegram_context, chat_id, topic_id, task_state
+                        telegram_context, chat_id, topic_id, task_state,
+                        cancel_event=cancel_event,
                     ):
                         yield resumed_evt
                 return

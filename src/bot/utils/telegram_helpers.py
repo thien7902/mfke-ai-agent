@@ -1,8 +1,21 @@
 """Telegram Helper Utilities."""
+import asyncio
+import logging
 from typing import List
+
+from telegram.error import NetworkError, RetryAfter, TimedOut
+
+logger = logging.getLogger(__name__)
 
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+
+# Number of retry attempts for transient network errors (TimedOut/NetworkError/RetryAfter).
+# Telegram's own guidance: a timeout doesn't necessarily mean the request didn't reach the
+# server, so a short backoff retry is safe and avoids losing a long LLM response to a
+# single transient blip.
+_MAX_SEND_RETRIES = 2
+_RETRY_BACKOFF_BASE = 2.0  # seconds; doubled per attempt, plus any RetryAfter value
 
 
 def split_message(text: str, max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> List[str]:
@@ -54,6 +67,44 @@ def split_message(text: str, max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> L
     return chunks
 
 
+async def _retry_send_message(bot, **send_kwargs):
+    """Call bot.send_message with backoff retry on transient Telegram errors."""
+    last_exc = None
+    for attempt in range(_MAX_SEND_RETRIES + 1):
+        try:
+            return await bot.send_message(**send_kwargs)
+        except RetryAfter as e:
+            last_exc = e
+            if attempt >= _MAX_SEND_RETRIES:
+                break
+            await asyncio.sleep(float(e.retry_after))
+        except (TimedOut, NetworkError) as e:
+            last_exc = e
+            if attempt >= _MAX_SEND_RETRIES:
+                break
+            await asyncio.sleep(_RETRY_BACKOFF_BASE * (2 ** attempt))
+    raise last_exc if last_exc else RuntimeError("send_message failed without exception")
+
+
+async def _retry_edit_message_text(bot, **edit_kwargs):
+    """Call bot.edit_message_text with backoff retry on transient Telegram errors."""
+    last_exc = None
+    for attempt in range(_MAX_SEND_RETRIES + 1):
+        try:
+            return await bot.edit_message_text(**edit_kwargs)
+        except RetryAfter as e:
+            last_exc = e
+            if attempt >= _MAX_SEND_RETRIES:
+                break
+            await asyncio.sleep(float(e.retry_after))
+        except (TimedOut, NetworkError) as e:
+            last_exc = e
+            if attempt >= _MAX_SEND_RETRIES:
+                break
+            await asyncio.sleep(_RETRY_BACKOFF_BASE * (2 ** attempt))
+    raise last_exc if last_exc else RuntimeError("edit_message_text failed without exception")
+
+
 async def send_long_message(
     bot,
     chat_id: int,
@@ -82,7 +133,8 @@ async def send_long_message(
         # For subsequent chunks, just send as new messages
         if i == 0 and 'reply_to_message_id' in kwargs:
             # Only reply to the original message for the first chunk
-            message = await bot.send_message(
+            message = await _retry_send_message(
+                bot,
                 chat_id=chat_id,
                 text=chunk,
                 message_thread_id=message_thread_id,
@@ -91,7 +143,8 @@ async def send_long_message(
         else:
             # Remove reply_to_message_id for subsequent chunks
             send_kwargs = {k: v for k, v in kwargs.items() if k != 'reply_to_message_id'}
-            message = await bot.send_message(
+            message = await _retry_send_message(
+                bot,
                 chat_id=chat_id,
                 text=chunk,
                 message_thread_id=message_thread_id,
@@ -136,7 +189,8 @@ async def edit_or_send_long_message(
     if message_id:
         # Edit the first chunk
         try:
-            await bot.edit_message_text(
+            await _retry_edit_message_text(
+                bot,
                 chat_id=chat_id,
                 message_id=message_id,
                 text=chunks[0],
@@ -147,7 +201,8 @@ async def edit_or_send_long_message(
             sent_messages.append(None)  # Placeholder
         except Exception:
             # If edit fails, send as new message
-            message = await bot.send_message(
+            message = await _retry_send_message(
+                bot,
                 chat_id=chat_id,
                 text=chunks[0],
                 message_thread_id=message_thread_id,
@@ -157,7 +212,8 @@ async def edit_or_send_long_message(
 
         # Send remaining chunks as new messages
         for chunk in chunks[1:]:
-            message = await bot.send_message(
+            message = await _retry_send_message(
+                bot,
                 chat_id=chat_id,
                 text=chunk,
                 message_thread_id=message_thread_id,

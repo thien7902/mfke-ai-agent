@@ -104,7 +104,8 @@ def mock_callback_query():
 def mock_config():
     """Mock configuration for tests."""
     with patch("src.bot.utils.config.config") as mock, \
-         patch("src.bot.utils.decorators.config", mock):
+         patch("src.bot.utils.decorators.config", mock), \
+         patch("src.bot.handlers.message_handler.config", mock):
         mock.telegram_bot_token = "test_token"
         mock.mongodb_uri = "mongodb://localhost:27017"
         mock.mongodb_database = "test_db"
@@ -114,6 +115,9 @@ def mock_config():
         mock.rate_limit_per_minute = 100
         mock.permission_request_expiry_minutes = 10
         mock.test_mode = True  # Enable test mode to skip decorators
+        mock.message_batch_quiet_period_seconds = 10
+        mock.message_batch_max_wait_seconds = 30
+        mock.message_batch_max_messages = 20
         yield mock
 
 
