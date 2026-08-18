@@ -155,7 +155,10 @@ class TelegramBot:
         logger.error("Unhandled error", error=error_str, update=str(update)[:200])
 
         # Check for network/connection errors and attempt recovery
-        if any(keyword in error_str.lower() for keyword in ['connection', 'timeout', 'network', 'unreachable']):
+        if any(keyword in error_str.lower() for keyword in [
+            'connection', 'timeout', 'network', 'unreachable',
+            'ssl', 'certificate', 'verify_failed', 'handshake',
+        ]):
             logger.warning("Detected connection error, checking connections...")
             try:
                 # Test MongoDB connection
@@ -253,37 +256,35 @@ async def main():
                     MongoDB.close()
                     MongoDB.get_database()  # Reconnect
 
-                # Check if Telegram polling is stuck (no updates for 2+ hours during active hours)
-                # This detects silent connection failures
+                # Check if Telegram polling is stuck (no updates for 30+ minutes).
+                # This detects silent connection failures. A 30-minute gap is itself strong
+                # evidence that polling is broken — we restart unconditionally rather than
+                # probing with get_me(), which uses a different connection than the long-
+                # polling loop and can succeed while polling is stuck.
                 time_since_update = time.time() - bot.last_update_time
-                if time_since_update > 7200:  # 2 hours with no activity
+                if time_since_update > 1800:  # 30 minutes with no activity
                     logger.warning(
-                        "No Telegram updates received for 2+ hours - possible silent connection failure",
-                        hours_idle=time_since_update / 3600
+                        "No Telegram updates received for 30+ minutes - restarting polling",
+                        minutes_idle=time_since_update / 60
                     )
-                    # Send a test message to ourselves to verify connection
+                    # Restart the polling connection unconditionally.
+                    # updater.stop() closes the httpx client (dropping any stale TLS
+                    # connections); start_polling() re-creates it fresh.
                     try:
-                        me = await bot.application.bot.get_me()
-                        logger.info("Telegram connection verified", bot_username=me.username)
-                        bot.last_update_time = time.time()  # Reset timer after check
-                    except Exception as e:
-                        logger.error("Telegram connection test failed - restarting polling", error=str(e))
-                        # Restart the polling connection
-                        try:
-                            await bot.application.updater.stop()
-                            await asyncio.sleep(2)
-                            await bot.application.updater.start_polling(
-                                allowed_updates=Update.ALL_TYPES,
-                                drop_pending_updates=True,
-                                pool_timeout=30,
-                                connect_timeout=30,
-                                read_timeout=30,
-                                write_timeout=30,
-                            )
-                            logger.info("Telegram polling restarted successfully")
-                            bot.last_update_time = time.time()
-                        except Exception as restart_error:
-                            logger.error("Failed to restart polling", error=str(restart_error))
+                        await bot.application.updater.stop()
+                        await asyncio.sleep(2)
+                        await bot.application.updater.start_polling(
+                            allowed_updates=Update.ALL_TYPES,
+                            drop_pending_updates=False,  # Keep backlog — don't lose user messages
+                            pool_timeout=30,
+                            connect_timeout=30,
+                            read_timeout=30,
+                            write_timeout=30,
+                        )
+                        logger.info("Telegram polling restarted successfully")
+                        bot.last_update_time = time.time()
+                    except Exception as restart_error:
+                        logger.error("Failed to restart polling", error=str(restart_error))
 
                 last_health_check = current_time
 
