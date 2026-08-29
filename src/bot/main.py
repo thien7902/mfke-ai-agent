@@ -258,18 +258,16 @@ async def main():
 
                 # Check if Telegram polling is stuck (no updates for 30+ minutes).
                 # This detects silent connection failures. A 30-minute gap is itself strong
-                # evidence that polling is broken — we restart unconditionally rather than
-                # probing with get_me(), which uses a different connection than the long-
-                # polling loop and can succeed while polling is stuck.
+                # evidence that polling is broken — attempt in-place restart of the polling
+                # connection first; if that itself fails, exit the process so Docker's
+                # `restart: unless-stopped` policy starts a fresh container with fresh
+                # connections.
                 time_since_update = time.time() - bot.last_update_time
                 if time_since_update > 1800:  # 30 minutes with no activity
                     logger.warning(
                         "No Telegram updates received for 30+ minutes - restarting polling",
                         minutes_idle=time_since_update / 60
                     )
-                    # Restart the polling connection unconditionally.
-                    # updater.stop() closes the httpx client (dropping any stale TLS
-                    # connections); start_polling() re-creates it fresh.
                     try:
                         await bot.application.updater.stop()
                         await asyncio.sleep(2)
@@ -284,7 +282,14 @@ async def main():
                         logger.info("Telegram polling restarted successfully")
                         bot.last_update_time = time.time()
                     except Exception as restart_error:
-                        logger.error("Failed to restart polling", error=str(restart_error))
+                        # In-place restart failed — exit so Docker restarts the container.
+                        # `SystemExit` is `BaseException`, so it propagates through the
+                        # `except Exception` above; the `finally` block still runs.
+                        logger.error(
+                            "Failed to restart polling - exiting for container restart",
+                            error=str(restart_error)
+                        )
+                        raise SystemExit(1)
 
                 last_health_check = current_time
 

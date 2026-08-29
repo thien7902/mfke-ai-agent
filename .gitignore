@@ -22,7 +22,7 @@ ENV/
 .idea/
 *.swp
 *.swo
-
+kubeconfig/
 # Testing
 .pytest_cache/
 .coverage
