@@ -261,33 +261,32 @@ async def main():
                     MongoDB.close()
                     MongoDB.get_database()  # Reconnect
 
-                # Check if Telegram polling is stuck (no updates for 30+ minutes).
+                # Check if Telegram polling is stuck (no updates for N minutes).
                 # This detects silent connection failures.
                 #
-                # Recovery strategy: try an in-place `stop()/start_polling()` first. If that
-                # *actually* recovered, we'll see new updates arrive within the next 30-min
-                # window and `polling_restarts` resets to 0 in `_update_tracker`. If no
-                # updates arrive and the watchdog trips a *second* consecutive time, the
-                # in-place restart didn't help (the new polling task is wedged on the same
-                # stale httpx client) — exit the process so Docker starts a fresh container.
+                # Three-tier recovery (30 / 60 / 90 min):
+                #   30 min → in-place restart (attempt #1)
+                #   60 min → in-place restart (attempt #2; restart #1 didn't help)
+                #   90 min → exit process so Docker's `restart: unless-stopped` starts a
+                #            fresh container with fresh httpx/TCP connections
                 #
                 # We can't rely on exceptions from `stop()`/`start_polling()` to detect a
                 # failed restart: PTB suppresses the `PoolTimeout` from its internal
                 # `_get_updates_cleanup` during `stop()`, and `start_polling()` returns
                 # normally even when the resulting polling task can't reach Telegram.
                 # "No updates arrived since the last restart" is the only reliable signal.
+                # `polling_restarts` is reset to 0 in `_update_tracker` when a real update
+                # arrives, confirming the restart worked.
                 time_since_update = time.time() - bot.last_update_time
-                if time_since_update > 1800:  # 30 minutes with no activity
+                if time_since_update >= 5400:  # 90 minutes — two restarts already failed
+                    logger.error(
+                        "No Telegram updates for 90+ minutes - exiting for container restart",
+                        minutes_idle=time_since_update / 60,
+                        consecutive_restarts=bot.polling_restarts,
+                    )
+                    raise SystemExit(1)
+                elif time_since_update >= 1800:  # 30+ minutes — try in-place restart
                     bot.polling_restarts += 1
-                    if bot.polling_restarts >= 2:
-                        # Second consecutive trip — in-place restart didn't recover.
-                        logger.error(
-                            "Polling still stuck after in-place restart - exiting for container restart",
-                            minutes_idle=time_since_update / 60,
-                            consecutive_restarts=bot.polling_restarts,
-                        )
-                        raise SystemExit(1)
-
                     logger.warning(
                         "No Telegram updates received for 30+ minutes - restarting polling",
                         minutes_idle=time_since_update / 60,
@@ -309,7 +308,7 @@ async def main():
                         # _update_tracker will update it when the next real update arrives,
                         # and _update_tracker resets polling_restarts to 0 at the same time.
                         # If the restart failed, last_update_time stays stale and the next
-                        # watchdog trip (30 min later) exits the process.
+                        # watchdog trip will either restart again (at 60 min) or exit (at 90).
                     except Exception as restart_error:
                         logger.error(
                             "Failed to restart polling - exiting for container restart",
