@@ -26,6 +26,72 @@ from src.bot.models.user import UserPermission
 
 logger = structlog.get_logger(__name__)
 
+
+def _patch_bash_kill_process_group():
+    """Monkey-patch Holmes' execute_bash_command to kill the whole process group on timeout.
+
+    Stock Holmes does `subprocess.Popen(shell=True)` then `process.kill()` on timeout.
+    `process.kill()` only sends SIGKILL to the bash shell — kubectl/wget/curl it
+    spawned keep running and hold the stdout pipe open, so `communicate()` blocks
+    until they exit naturally (can be minutes). The worker thread is stuck in
+    `communicate()` that whole time, so the bot can't process new messages until
+    someone manually kills the PID.
+
+    Fix: run the shell in its own session (start_new_session=True) and on timeout
+    send SIGKILL to the entire process group with os.killpg. This kills bash plus
+    every descendant it spawned.
+    """
+    import os
+    import signal
+    import subprocess
+    from holmes.plugins.toolsets.bash.common import bash as holmes_bash
+    from holmes.utils.memory_limit import check_oom_and_append_hint, get_ulimit_prefix
+
+    if getattr(holmes_bash, "_mfke_patched", False):
+        return
+
+    def execute_bash_command_patched(cmd: str, timeout: int):
+        protected_cmd = get_ulimit_prefix() + cmd
+        process = subprocess.Popen(
+            protected_cmd,
+            shell=True,
+            executable="/bin/bash",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,  # child becomes session/group leader
+        )
+
+        try:
+            stdout, _ = process.communicate(timeout=timeout)
+            stdout = stdout.strip() if stdout else ""
+            stdout = check_oom_and_append_hint(stdout, process.returncode)
+            return holmes_bash.BashResult(
+                stdout=stdout,
+                return_code=process.returncode,
+                timed_out=False,
+            )
+        except subprocess.TimeoutExpired:
+            # Kill the entire process group (bash + all descendants: kubectl,
+            # wget, curl, etc.). Without this they keep the stdout pipe open
+            # and communicate() blocks for minutes.
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                # Process already exited or we don't have permission — fall back
+                process.kill()
+            stdout, _ = process.communicate()
+            stdout = stdout.strip() if stdout else ""
+            return holmes_bash.BashResult(
+                stdout=stdout,
+                return_code=None,
+                timed_out=True,
+            )
+
+    holmes_bash.execute_bash_command = execute_bash_command_patched
+    holmes_bash._mfke_patched = True
+    logger.info("Patched execute_bash_command to kill process group on timeout")
+
 # Request context for CLI-like usage
 _CLI_REQUEST_CONTEXT = {"user_id": DEFAULT_CLI_USER}
 
@@ -186,6 +252,9 @@ class HolmesService:
             )
 
             self._initialized = True
+            # Patch bash tool to kill the whole process group on timeout, so
+            # kubectl/wget/curl children don't keep the worker thread stuck.
+            _patch_bash_kill_process_group()
             logger.info("Holmes service initialized successfully",
                        model=self._config.model,
                        api_base=getattr(self._config, 'api_base', None))
