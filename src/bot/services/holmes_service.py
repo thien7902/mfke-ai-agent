@@ -50,6 +50,14 @@ def _patch_bash_kill_process_group():
     if getattr(holmes_bash, "_mfke_patched", False):
         return
 
+    # Import the caller module too — bash_toolset.py does
+    # `from ...common.bash import execute_bash_command`, which binds the
+    # function reference into bash_toolset's own namespace at import time.
+    # Patching only the source module leaves that bound reference pointing
+    # at the original function, so bash_toolset._invoke would keep calling
+    # stock Holmes. Patch both places.
+    from holmes.plugins.toolsets.bash import bash_toolset as holmes_bash_toolset
+
     def execute_bash_command_patched(cmd: str, timeout: int):
         protected_cmd = get_ulimit_prefix() + cmd
         process = subprocess.Popen(
@@ -89,6 +97,7 @@ def _patch_bash_kill_process_group():
             )
 
     holmes_bash.execute_bash_command = execute_bash_command_patched
+    holmes_bash_toolset.execute_bash_command = execute_bash_command_patched
     holmes_bash._mfke_patched = True
     logger.info("Patched execute_bash_command to kill process group on timeout")
 
