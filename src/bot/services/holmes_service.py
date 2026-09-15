@@ -29,6 +29,12 @@ logger = structlog.get_logger(__name__)
 # Request context for CLI-like usage
 _CLI_REQUEST_CONTEXT = {"user_id": DEFAULT_CLI_USER}
 
+# Hard cap on bash tool timeout. Holmes' bash tool documents 30s as the default
+# but honors any timeout the LLM passes in the tool call — so the model can and
+# does request 60s/120s/300s when it expects a long-running command. Clamp every
+# bash invocation to this value regardless of what the LLM asks for.
+BASH_TIMEOUT_MAX_SECONDS = 30
+
 # Dedicated thread pool for Holmes calls to avoid blocking the event loop
 # and to allow concurrent processing of multiple requests
 _holmes_executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="holmes-")
@@ -162,6 +168,9 @@ class HolmesService:
             # Wrap TodoWrite tool to capture investigation task updates
             self._wrap_todo_write_tool()
 
+            # Wrap bash tool to clamp LLM-requested timeout to 30s max
+            self._wrap_bash_tool_timeout()
+
             # Initialize tool calling LLM using Config's built-in method
             self._tool_calling_llm = self._config.create_toolcalling_llm(
                 toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
@@ -231,6 +240,41 @@ class HolmesService:
                     # Use object.__setattr__ for frozen Pydantic models
                     object.__setattr__(tool, 'invoke', make_wrapper(original_invoke))
                     logger.info("Wrapped TodoWrite tool for task tracking")
+                    break
+
+    def _wrap_bash_tool_timeout(self):
+        """Clamp the bash tool's timeout parameter to BASH_TIMEOUT_MAX_SECONDS.
+
+        The Holmes bash tool declares 30s as the default timeout but honors any
+        value the LLM passes in the tool call. When the model expects a
+        long-running command it requests 60s/120s/300s+, and Holmes waits that
+        long. This wrapper caps the value before the tool executes.
+        """
+        if not self._tool_executor:
+            return
+
+        for toolset in self._tool_executor.toolsets:
+            for tool in toolset.tools:
+                if tool.name == "bash":
+                    original_invoke = tool.invoke
+
+                    def make_bash_wrapper(original_func):
+                        def wrapped_invoke(params, context=None):
+                            try:
+                                requested = params.get("timeout") if isinstance(params, dict) else None
+                                if requested is not None and requested > BASH_TIMEOUT_MAX_SECONDS:
+                                    logger.warning(
+                                        "Clamping bash timeout to %ds (LLM requested %ds)",
+                                        BASH_TIMEOUT_MAX_SECONDS, requested,
+                                    )
+                                    params = {**params, "timeout": BASH_TIMEOUT_MAX_SECONDS}
+                            except (TypeError, ValueError):
+                                pass
+                            return original_func(params, context)
+                        return wrapped_invoke
+
+                    object.__setattr__(tool, 'invoke', make_bash_wrapper(original_invoke))
+                    logger.info("Wrapped bash tool to cap timeout at %ds", BASH_TIMEOUT_MAX_SECONDS)
                     break
 
     def get_latest_investigation_tasks(self) -> List[Dict[str, Any]]:
