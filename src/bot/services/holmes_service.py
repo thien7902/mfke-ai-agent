@@ -35,6 +35,10 @@ _CLI_REQUEST_CONTEXT = {"user_id": DEFAULT_CLI_USER}
 # bash invocation to this value regardless of what the LLM asks for.
 BASH_TIMEOUT_MAX_SECONDS = 30
 
+# nohup commands run detached and can legitimately need longer than 30s.
+# Allow up to 4 minutes for any command whose first segment is nohup.
+NOHUP_TIMEOUT_MAX_SECONDS = 240
+
 # Dedicated thread pool for Holmes calls to avoid blocking the event loop
 # and to allow concurrent processing of multiple requests
 _holmes_executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="holmes-")
@@ -262,12 +266,18 @@ class HolmesService:
                         def wrapped_invoke(params, context=None):
                             try:
                                 requested = params.get("timeout") if isinstance(params, dict) else None
-                                if requested is not None and requested > BASH_TIMEOUT_MAX_SECONDS:
+                                cmd = params.get("command") if isinstance(params, dict) else ""
+                                max_timeout = BASH_TIMEOUT_MAX_SECONDS
+                                if isinstance(cmd, str) and cmd.strip().startswith("nohup"):
+                                    max_timeout = NOHUP_TIMEOUT_MAX_SECONDS
+                                if requested is not None and requested > max_timeout:
                                     logger.warning(
                                         "Clamping bash timeout to %ds (LLM requested %ds)",
-                                        BASH_TIMEOUT_MAX_SECONDS, requested,
+                                        max_timeout, requested,
                                     )
-                                    params = {**params, "timeout": BASH_TIMEOUT_MAX_SECONDS}
+                                    params = {**params, "timeout": max_timeout}
+                                elif requested is None and max_timeout != BASH_TIMEOUT_MAX_SECONDS:
+                                    params = {**params, "timeout": max_timeout}
                             except (TypeError, ValueError):
                                 pass
                             return original_func(params, context)
