@@ -113,6 +113,7 @@ class TelegramBot:
         self.application.add_handler(TelegramCommandHandler("clear", cmd_handler.clear_command))
         self.application.add_handler(TelegramCommandHandler("new", cmd_handler.new_command))
         self.application.add_handler(TelegramCommandHandler("stop", msg_handler.stop_command))
+        self.application.add_handler(TelegramCommandHandler("ping", msg_handler.ping_command))
 
         # Privilege commands
         self.application.add_handler(TelegramCommandHandler("grant", priv_handler.grant_command))

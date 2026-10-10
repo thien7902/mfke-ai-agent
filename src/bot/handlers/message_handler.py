@@ -62,6 +62,54 @@ _topic_batches: dict[tuple, _PendingBatch] = {}
 _STOPPED_FOOTER = "\n\n🛑 Stopped by user."
 
 
+# Per-topic active investigation registry. Streaming/regular handlers update
+# status as they process events; /ping reads from here to report progress.
+@dataclass
+class _ActiveInvestigation:
+    status_text: str = "🔄 Working..."
+    started_at: float = 0.0
+    tasks: list = field(default_factory=list)
+    last_tool: Optional[str] = None
+
+
+# (chat_id, topic_id) -> _ActiveInvestigation
+_active_investigations: dict[tuple, _ActiveInvestigation] = {}
+
+
+def _set_investigation_status(
+    chat_id: int,
+    topic_id: int,
+    status_text: Optional[str] = None,
+    tasks: Optional[list] = None,
+    last_tool: Optional[str] = None,
+):
+    """Record latest status for the active investigation in this topic.
+
+    Only fields that are not None are updated, so callers can refresh just
+    the task list (or just the status text) without clobbering the other.
+    """
+    key = (chat_id, topic_id)
+    inv = _active_investigations.get(key)
+    if inv is None:
+        inv = _ActiveInvestigation(started_at=time.time())
+        _active_investigations[key] = inv
+    if status_text is not None:
+        inv.status_text = status_text
+    if tasks is not None:
+        inv.tasks = tasks
+    if last_tool is not None:
+        inv.last_tool = last_tool
+
+
+def _clear_investigation(chat_id: int, topic_id: int):
+    """Remove the investigation entry once the request completes."""
+    _active_investigations.pop((chat_id, topic_id), None)
+
+
+def _get_investigation(chat_id: int, topic_id: int) -> Optional[_ActiveInvestigation]:
+    return _active_investigations.get((chat_id, topic_id))
+
+
 def _generate_topic_name(user_message: str, user_id: int) -> str:
     """Generate a topic name from user message: 2-3 word summary + random ID."""
     # Simple keyword extraction - take first few meaningful words
@@ -252,6 +300,7 @@ class MessageHandler:
         async with lock:
             logger.debug("Topic lock acquired for batch flush", chat_id=chat_id, topic_id=topic_id, batch_size=len(texts))
             try:
+                _set_investigation_status(chat_id, topic_id, "🔄 Working...")
                 # Get or create the first user (the one whose update we reply to).
                 user_model = await self.permissions.get_or_create_user(
                     telegram_id=first_user_id,
@@ -309,6 +358,7 @@ class MessageHandler:
                 # Clear the in-flight batch only if it's still the one we set.
                 if _topic_batches.get(key) is batch:
                     _topic_batches.pop(key, None)
+                _clear_investigation(chat_id, topic_id)
 
     async def stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /stop — cancel a pending batch or an in-flight request for the topic."""
@@ -346,6 +396,61 @@ class MessageHandler:
         await update.message.reply_text(
             f"🛑 Stopped — {n} pending message(s) discarded.",
             message_thread_id=topic_id
+        )
+
+    async def ping_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /ping — report current agent status in this topic."""
+        if not update.message:
+            return
+        chat = update.effective_chat
+        topic_id = update.message.message_thread_id or 0
+
+        # /ping only meaningful inside a forum topic (matching /stop).
+        if not (chat and chat.type in ("group", "supergroup") and chat.is_forum and topic_id):
+            await update.message.reply_text(
+                "ℹ️ /ping chỉ hoạt động trong forum topic.",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        inv = _get_investigation(chat.id, topic_id)
+        if inv is None:
+            # Maybe a batch is queued but not yet dispatched.
+            batch = _topic_batches.get((chat.id, topic_id))
+            if batch is not None and batch.cancel_event is None:
+                n = len(batch.texts)
+                await update.message.reply_text(
+                    f"⏳ Queued — {n} message(s) chờ batch, chưa dispatch.",
+                    message_thread_id=topic_id,
+                )
+            else:
+                await update.message.reply_text(
+                    "💤 Không có investigation nào đang chạy trong topic này.",
+                    message_thread_id=topic_id,
+                )
+            return
+
+        elapsed = int(time.time() - inv.started_at)
+        lines = [
+            "📍 Agent Status",
+            "",
+            f"Trạng thái: {inv.status_text}",
+            f"Thời gian: ⏱ {elapsed}s",
+        ]
+        if inv.tasks:
+            lines.append("")
+            task_lines = self._format_task_list(inv.tasks)
+            # _format_task_list uses Markdown (bold/italic); strip those markers
+            # for the ping reply since status_text may contain underscores that
+            # would otherwise break Markdown parsing.
+            task_lines = (task_lines
+                           .replace("**", "")
+                           .replace("`", ""))
+            lines.append(task_lines)
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            message_thread_id=topic_id,
         )
 
     async def handle_topic_created(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -554,6 +659,7 @@ class MessageHandler:
         cancel_event: Optional[threading.Event] = None,
     ):
         """Handle non-streaming response."""
+        _set_investigation_status(chat_id, topic_id, "🔄 Working...")
         response = await self.holmes.chat(
             user_id=update.effective_user.id,
             user_message=message_text,
@@ -568,6 +674,8 @@ class MessageHandler:
 
         if cancel_event is not None and cancel_event.is_set():
             response = (response or "") + _STOPPED_FOOTER
+
+        _clear_investigation(chat_id, topic_id)
 
         # Save conversation
         await self.conversations.save_conversation(conversation)
@@ -612,6 +720,7 @@ class MessageHandler:
         task_message = None
         current_status = "🔄 Working..."
         last_tool = None
+        current_tasks: list = []
         stream_completed = False
         try:
             async_gen = await self.holmes.chat(
@@ -625,10 +734,11 @@ class MessageHandler:
                 topic_id=topic_id,
                 cancel_event=cancel_event,
             )
+            _set_investigation_status(chat_id, topic_id, current_status, tasks=current_tasks, last_tool=last_tool)
 
             # Add timeout to prevent hanging indefinitely
             async def process_stream():
-                nonlocal full_response, task_message, current_status, last_tool, stream_completed
+                nonlocal full_response, task_message, current_status, last_tool, current_tasks, stream_completed
                 async for event in async_gen:
                     event_type = event.get("type", "unknown")
 
@@ -644,6 +754,8 @@ class MessageHandler:
                     elif event_type == "task_update":
                         # Display investigation task list
                         tasks = event.get("tasks", [])
+                        current_tasks = tasks
+                        _set_investigation_status(chat_id, topic_id, None, tasks=tasks)
                         task_text = self._format_task_list(tasks)
                         if task_text:
                             if task_message is None:
@@ -659,6 +771,7 @@ class MessageHandler:
                                     pass
                             # Update status based on current task
                             current_status = self._get_status_from_tasks(tasks)
+                            _set_investigation_status(chat_id, topic_id, current_status)
                             try:
                                 await status_message.edit_text(f"📍 **Status**: {current_status}", parse_mode="Markdown")
                             except Exception:
@@ -670,6 +783,7 @@ class MessageHandler:
                         # Update status with current tool (clean, no params)
                         friendly_name = self._get_friendly_tool_name(tool_name)
                         current_status = f"🔧 Using {friendly_name}..."
+                        _set_investigation_status(chat_id, topic_id, current_status, last_tool=tool_name)
                         try:
                             await status_message.edit_text(
                                 f"📍 **Status**: {current_status}",
@@ -683,6 +797,7 @@ class MessageHandler:
                         if tool_name == last_tool:
                             friendly_name = self._get_friendly_tool_name(tool_name)
                             current_status = f"✅ Completed {friendly_name}"
+                            _set_investigation_status(chat_id, topic_id, current_status)
                             try:
                                 await status_message.edit_text(
                                     f"📍 **Status**: {current_status}",
@@ -744,6 +859,8 @@ class MessageHandler:
                 await message.edit_text(full_response + "\n\n⚠️ Stream interrupted")
             except Exception:
                 pass
+
+        _clear_investigation(chat_id, topic_id)
 
         # Save conversation
         await self.conversations.save_conversation(conversation)
@@ -826,6 +943,7 @@ class MessageHandler:
         user_id: int,
     ):
         """Handle non-streaming response in a specific topic (without update object)."""
+        _set_investigation_status(chat_id, topic_id, "🔄 Working...")
         response = await self.holmes.chat(
             user_id=user_id,
             user_message=message_text,
@@ -836,6 +954,8 @@ class MessageHandler:
             chat_id=chat_id,
             topic_id=topic_id,
         )
+
+        _clear_investigation(chat_id, topic_id)
 
         # Save conversation
         await self.conversations.save_conversation(conversation)
@@ -884,6 +1004,7 @@ class MessageHandler:
         task_message = None
         current_status = "🔄 Working..."
         last_tool = None
+        current_tasks: list = []
         stream_completed = False
         try:
             async_gen = await self.holmes.chat(
@@ -896,10 +1017,11 @@ class MessageHandler:
                 chat_id=chat_id,
                 topic_id=topic_id,
             )
+            _set_investigation_status(chat_id, topic_id, current_status, tasks=current_tasks, last_tool=last_tool)
 
             # Add timeout to prevent hanging indefinitely
             async def process_stream():
-                nonlocal full_response, task_message, current_status, last_tool, stream_completed
+                nonlocal full_response, task_message, current_status, last_tool, current_tasks, stream_completed
                 async for event in async_gen:
                     event_type = event.get("type", "unknown")
 
@@ -915,6 +1037,8 @@ class MessageHandler:
                     elif event_type == "task_update":
                         # Display investigation task list
                         tasks = event.get("tasks", [])
+                        current_tasks = tasks
+                        _set_investigation_status(chat_id, topic_id, None, tasks=tasks)
                         task_text = self._format_task_list(tasks)
                         if task_text:
                             if task_message is None:
@@ -931,6 +1055,7 @@ class MessageHandler:
                                     pass
                             # Update status based on current task
                             current_status = self._get_status_from_tasks(tasks)
+                            _set_investigation_status(chat_id, topic_id, current_status)
                             try:
                                 await status_message.edit_text(f"📍 **Status**: {current_status}", parse_mode="Markdown")
                             except Exception:
@@ -942,6 +1067,7 @@ class MessageHandler:
                         # Update status with current tool (clean, no params)
                         friendly_name = self._get_friendly_tool_name(tool_name)
                         current_status = f"🔧 Using {friendly_name}..."
+                        _set_investigation_status(chat_id, topic_id, current_status, last_tool=tool_name)
                         try:
                             await status_message.edit_text(
                                 f"📍 **Status**: {current_status}",
@@ -955,6 +1081,7 @@ class MessageHandler:
                         if tool_name == last_tool:
                             friendly_name = self._get_friendly_tool_name(tool_name)
                             current_status = f"✅ Completed {friendly_name}"
+                            _set_investigation_status(chat_id, topic_id, current_status)
                             try:
                                 await status_message.edit_text(
                                     f"📍 **Status**: {current_status}",
@@ -1004,6 +1131,9 @@ class MessageHandler:
                 await message.edit_text(full_response + "\n\n⚠️ Stream interrupted")
             except Exception:
                 pass
+
+        # Mark investigation complete so /ping stops reporting it.
+        _clear_investigation(chat_id, topic_id)
 
         # Save conversation
         await self.conversations.save_conversation(conversation)
