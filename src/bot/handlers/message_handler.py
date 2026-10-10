@@ -449,13 +449,15 @@ class MessageHandler:
         ]
         if inv.last_activity:
             lines.append(f"Hoạt động cuối: {inv.last_activity}")
+        lines.append("")
+        lines.append("📝 Latest LLM response:")
         if inv.response_preview:
             preview = inv.response_preview.strip()
             if len(preview) > 400:
                 preview = preview[-400:]
-            lines.append("")
-            lines.append("📝 Latest LLM response:")
             lines.append(preview)
+        else:
+            lines.append("(chưa có — agent đang gọi tools, LLM chưa emit text)")
         if inv.tasks:
             lines.append("")
             task_lines = self._format_task_list(inv.tasks)
