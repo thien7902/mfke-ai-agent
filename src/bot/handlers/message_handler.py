@@ -465,9 +465,14 @@ class MessageHandler:
             preview = inv.response_preview.strip()
             if len(preview) > 800:
                 preview = preview[-800:]
-            # Split into sentences so each shows on its own line — easier to
-            # read in a Telegram message than one wrapped paragraph.
+            # When preview is the tail of a longer response, it usually starts
+            # mid-sentence (the head was truncated). Drop everything up to the
+            # first sentence terminator so the first bullet is a full sentence,
+            # then split the rest.
             import re as _re
+            first_term = _re.search(r'[.?!]\s+', preview)
+            if first_term and first_term.start() < 200:
+                preview = preview[first_term.end():]
             sentences = _re.split(r'(?<=[.?!])\s+', preview)
             for s in sentences:
                 s = s.strip()
