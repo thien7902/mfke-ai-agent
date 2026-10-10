@@ -70,6 +70,7 @@ class _ActiveInvestigation:
     started_at: float = 0.0
     tasks: list = field(default_factory=list)
     last_tool: Optional[str] = None
+    response_preview: str = ""
 
 
 # (chat_id, topic_id) -> _ActiveInvestigation
@@ -82,6 +83,7 @@ def _set_investigation_status(
     status_text: Optional[str] = None,
     tasks: Optional[list] = None,
     last_tool: Optional[str] = None,
+    response_preview: Optional[str] = None,
 ):
     """Record latest status for the active investigation in this topic.
 
@@ -99,6 +101,8 @@ def _set_investigation_status(
         inv.tasks = tasks
     if last_tool is not None:
         inv.last_tool = last_tool
+    if response_preview is not None:
+        inv.response_preview = response_preview
 
 
 def _clear_investigation(chat_id: int, topic_id: int):
@@ -437,6 +441,13 @@ class MessageHandler:
             f"Trạng thái: {inv.status_text}",
             f"Thời gian: ⏱ {elapsed}s",
         ]
+        if inv.response_preview:
+            preview = inv.response_preview.strip()
+            if len(preview) > 400:
+                preview = preview[-400:]
+            lines.append("")
+            lines.append("📝 Latest LLM response:")
+            lines.append(preview)
         if inv.tasks:
             lines.append("")
             task_lines = self._format_task_list(inv.tasks)
@@ -744,6 +755,10 @@ class MessageHandler:
 
                     if event_type == "content":
                         full_response += event.get("content", "")
+                        _set_investigation_status(
+                            chat_id, topic_id,
+                            response_preview=full_response[-300:],
+                        )
                         # Edit message every few chunks to avoid rate limits
                         if len(full_response) % 100 == 0:
                             try:
@@ -1027,6 +1042,10 @@ class MessageHandler:
 
                     if event_type == "content":
                         full_response += event.get("content", "")
+                        _set_investigation_status(
+                            chat_id, topic_id,
+                            response_preview=full_response[-300:],
+                        )
                         # Edit message every few chunks to avoid rate limits
                         if len(full_response) % 100 == 0:
                             try:
