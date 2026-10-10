@@ -72,7 +72,6 @@ class _ActiveInvestigation:
     last_tool: Optional[str] = None
     response_preview: str = ""
     last_activity: str = ""
-    steps: list = field(default_factory=list)  # full agent step list
 
 
 # (chat_id, topic_id) -> _ActiveInvestigation
@@ -87,7 +86,6 @@ def _set_investigation_status(
     last_tool: Optional[str] = None,
     response_preview: Optional[str] = None,
     last_activity: Optional[str] = None,
-    append_step: Optional[str] = None,
 ):
     """Record latest status for the active investigation in this topic.
 
@@ -95,9 +93,6 @@ def _set_investigation_status(
     the task list (or just the status text) without clobbering the other.
     last_activity overwrites the previous value — /ping shows only the
     most recent tool step, not a list.
-    append_step appends a new entry to the step list — /ping renders the
-    full list as an activity log so the user can see every step the agent
-    has taken, not just the last one.
     """
     key = (chat_id, topic_id)
     inv = _active_investigations.get(key)
@@ -114,8 +109,6 @@ def _set_investigation_status(
         inv.response_preview = response_preview
     if last_activity is not None:
         inv.last_activity = last_activity
-    if append_step is not None:
-        inv.steps.append(append_step)
 
 
 def _clear_investigation(chat_id: int, topic_id: int):
@@ -456,11 +449,16 @@ class MessageHandler:
         ]
         if inv.last_activity:
             lines.append(f"Hoạt động cuối: {inv.last_activity}")
-        if inv.steps:
+        if inv.tasks:
             lines.append("")
-            lines.append(f"📋 Các bước đã làm ({len(inv.steps)}):")
-            for i, step in enumerate(inv.steps, 1):
-                lines.append(f"  {i}. {step}")
+            task_lines = self._format_task_list(inv.tasks)
+            # _format_task_list uses Markdown (bold/italic); strip those markers
+            # for the ping reply since status_text may contain underscores that
+            # would otherwise break Markdown parsing.
+            task_lines = (task_lines
+                           .replace("**", "")
+                           .replace("`", ""))
+            lines.append(task_lines)
         lines.append("")
         lines.append("📝 Latest LLM response:")
         if inv.response_preview:
@@ -477,16 +475,6 @@ class MessageHandler:
                     lines.append(f"• {s}")
         else:
             lines.append("(chưa có — agent đang gọi tools, LLM chưa emit text)")
-        if inv.tasks:
-            lines.append("")
-            task_lines = self._format_task_list(inv.tasks)
-            # _format_task_list uses Markdown (bold/italic); strip those markers
-            # for the ping reply since status_text may contain underscores that
-            # would otherwise break Markdown parsing.
-            task_lines = (task_lines
-                           .replace("**", "")
-                           .replace("`", ""))
-            lines.append(task_lines)
 
         await update.message.reply_text(
             "\n".join(lines),
@@ -740,7 +728,6 @@ class MessageHandler:
                         status_text=f"🔧 Using {friendly}...",
                         last_tool=tool_name,
                         last_activity=self._format_activity(tool_name, friendly, event, done=False),
-                        append_step=self._format_activity(tool_name, friendly, event, done=False),
                     )
                 elif event_type == "tool_result":
                     tool_name = event.get("tool_name", "unknown")
@@ -749,7 +736,6 @@ class MessageHandler:
                         chat_id, topic_id,
                         status_text=f"✅ Completed {friendly}",
                         last_activity=self._format_activity(tool_name, friendly, event, done=True),
-                        append_step=self._format_activity(tool_name, friendly, event, done=True),
                     )
         except _LLMInterrupted:
             # User stopped mid-call — keep what we have so far.
@@ -875,7 +861,6 @@ class MessageHandler:
                         _set_investigation_status(
                             chat_id, topic_id, current_status, last_tool=tool_name,
                             last_activity=self._format_activity(tool_name, friendly_name, event, done=False),
-                        append_step=self._format_activity(tool_name, friendly_name, event, done=False),
                         )
                         try:
                             await status_message.edit_text(
@@ -893,7 +878,6 @@ class MessageHandler:
                             _set_investigation_status(
                                 chat_id, topic_id, current_status,
                                 last_activity=self._format_activity(tool_name, friendly_name, event, done=True),
-                        append_step=self._format_activity(tool_name, friendly_name, event, done=True),
                             )
                             try:
                                 await status_message.edit_text(
@@ -1126,7 +1110,6 @@ class MessageHandler:
                         status_text=f"🔧 Using {friendly}...",
                         last_tool=tool_name,
                         last_activity=self._format_activity(tool_name, friendly, event, done=False),
-                        append_step=self._format_activity(tool_name, friendly, event, done=False),
                     )
                 elif event_type == "tool_result":
                     tool_name = event.get("tool_name", "unknown")
@@ -1135,7 +1118,6 @@ class MessageHandler:
                         chat_id, topic_id,
                         status_text=f"✅ Completed {friendly}",
                         last_activity=self._format_activity(tool_name, friendly, event, done=True),
-                        append_step=self._format_activity(tool_name, friendly, event, done=True),
                     )
         except _LLMInterrupted:
             # No cancel_event in this path (general-chat topic creation)
@@ -1262,7 +1244,6 @@ class MessageHandler:
                         _set_investigation_status(
                             chat_id, topic_id, current_status, last_tool=tool_name,
                             last_activity=self._format_activity(tool_name, friendly_name, event, done=False),
-                        append_step=self._format_activity(tool_name, friendly_name, event, done=False),
                         )
                         try:
                             await status_message.edit_text(
@@ -1280,7 +1261,6 @@ class MessageHandler:
                             _set_investigation_status(
                                 chat_id, topic_id, current_status,
                                 last_activity=self._format_activity(tool_name, friendly_name, event, done=True),
-                        append_step=self._format_activity(tool_name, friendly_name, event, done=True),
                             )
                             try:
                                 await status_message.edit_text(
