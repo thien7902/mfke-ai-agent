@@ -1127,14 +1127,18 @@ class HolmesService:
                         }
             elif event_name == "TOOL_RESULT":
                 # Tool completed. event_data is ToolCallResult.to_client_dict(),
-                # which carries the real tool_call_id.
+                # which carries the real tool_call_id and a `description` one-liner
+                # (e.g. "kubectl get shoot -A -o json") that we surface to /ping
+                # via `last_activity`.
                 tool_name = event_data.get("tool_name", "unknown")
                 tool_call_id = event_data.get("tool_call_id", "")
+                description = event_data.get("description", "")
                 result = event_data.get("result", "")
                 yield {
                     "type": "tool_result",
                     "tool_name": tool_name,
                     "tool_call_id": tool_call_id,
+                    "description": description,
                     "result": result
                 }
             elif event_name == "TASK_UPDATE":

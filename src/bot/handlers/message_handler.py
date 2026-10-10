@@ -718,7 +718,7 @@ class MessageHandler:
                         chat_id, topic_id,
                         status_text=f"🔧 Using {friendly}...",
                         last_tool=tool_name,
-                        last_activity=f"🔧 {friendly}",
+                        last_activity=self._format_activity(tool_name, friendly, event, done=False),
                     )
                 elif event_type == "tool_result":
                     tool_name = event.get("tool_name", "unknown")
@@ -726,6 +726,7 @@ class MessageHandler:
                     _set_investigation_status(
                         chat_id, topic_id,
                         status_text=f"✅ Completed {friendly}",
+                        last_activity=self._format_activity(tool_name, friendly, event, done=True),
                     )
         except _LLMInterrupted:
             # User stopped mid-call — keep what we have so far.
@@ -850,7 +851,7 @@ class MessageHandler:
                         current_status = f"🔧 Using {friendly_name}..."
                         _set_investigation_status(
                             chat_id, topic_id, current_status, last_tool=tool_name,
-                            last_activity=f"🔧 {friendly_name}",
+                            last_activity=self._format_activity(tool_name, friendly_name, event, done=False),
                         )
                         try:
                             await status_message.edit_text(
@@ -867,7 +868,7 @@ class MessageHandler:
                             current_status = f"✅ Completed {friendly_name}"
                             _set_investigation_status(
                                 chat_id, topic_id, current_status,
-                                last_activity=f"✅ {friendly_name}",
+                                last_activity=self._format_activity(tool_name, friendly_name, event, done=True),
                             )
                             try:
                                 await status_message.edit_text(
@@ -963,6 +964,54 @@ class MessageHandler:
         }
         return friendly_names.get(tool_name, tool_name.replace('_', ' ').title())
 
+    def _extract_tool_command(self, event: dict) -> str:
+        """Extract a short human-readable command string from a tool event.
+
+        Holmes START_TOOL emits only `{tool_name, id}` — no params. The real
+        params arrive on the TOOL_RESULT event via ToolCallResult.to_client_dict(),
+        which includes a top-level `description` (the tool's rendered one-liner,
+        e.g. "kubectl get shoot -A -o json"), plus `result.invocation` (the
+        actual executed command for bash/kubectl tools) and `result.params`.
+        Returns "" if nothing useful is available.
+        """
+        # Top-level `description` from ToolCallResult.to_client_dict() — Holmes
+        # sets this to tool.get_parameterized_one_liner(tool_params), which for
+        # bash/kubectl is the full command string.
+        description = event.get("description")
+        if isinstance(description, str) and description.strip():
+            return description.strip()
+
+        result = event.get("result")
+        if isinstance(result, dict):
+            invocation = result.get("invocation")
+            if isinstance(invocation, str) and invocation.strip():
+                return invocation.strip()
+            params = result.get("params")
+            if isinstance(params, dict):
+                for key in ("command", "query", "url", "path", "name", "expression"):
+                    val = params.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+                import json as _json
+                try:
+                    return _json.dumps(params, ensure_ascii=False)[:200]
+                except Exception:
+                    return ""
+        return ""
+
+    def _format_activity(self, tool_name: str, friendly: str, event: dict, done: bool) -> str:
+        """Format a single-line `Hoạt động cuối` entry.
+
+        `done=False` → tool_call (🔧 prefix); `done=True` → tool_result (✅ prefix).
+        Appends the actual command extracted from the event when available.
+        """
+        icon = "✅" if done else "🔧"
+        cmd = self._extract_tool_command(event)
+        if cmd:
+            display = cmd if len(cmd) <= 200 else cmd[:200] + "…"
+            return f"{icon} {friendly}: {display}"
+        return f"{icon} {friendly}"
+
     def _get_status_from_tasks(self, tasks: list) -> str:
         """Generate status text from task list."""
         if not tasks:
@@ -1051,7 +1100,7 @@ class MessageHandler:
                         chat_id, topic_id,
                         status_text=f"🔧 Using {friendly}...",
                         last_tool=tool_name,
-                        last_activity=f"🔧 {friendly}",
+                        last_activity=self._format_activity(tool_name, friendly, event, done=False),
                     )
                 elif event_type == "tool_result":
                     tool_name = event.get("tool_name", "unknown")
@@ -1059,6 +1108,7 @@ class MessageHandler:
                     _set_investigation_status(
                         chat_id, topic_id,
                         status_text=f"✅ Completed {friendly}",
+                        last_activity=self._format_activity(tool_name, friendly, event, done=True),
                     )
         except _LLMInterrupted:
             # No cancel_event in this path (general-chat topic creation)
@@ -1184,7 +1234,7 @@ class MessageHandler:
                         current_status = f"🔧 Using {friendly_name}..."
                         _set_investigation_status(
                             chat_id, topic_id, current_status, last_tool=tool_name,
-                            last_activity=f"🔧 {friendly_name}",
+                            last_activity=self._format_activity(tool_name, friendly_name, event, done=False),
                         )
                         try:
                             await status_message.edit_text(
@@ -1201,7 +1251,7 @@ class MessageHandler:
                             current_status = f"✅ Completed {friendly_name}"
                             _set_investigation_status(
                                 chat_id, topic_id, current_status,
-                                last_activity=f"✅ {friendly_name}",
+                                last_activity=self._format_activity(tool_name, friendly_name, event, done=True),
                             )
                             try:
                                 await status_message.edit_text(
