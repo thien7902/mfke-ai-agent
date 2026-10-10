@@ -778,7 +778,11 @@ class HolmesService:
         features = self._get_user_permissions(user_permissions)
 
         try:
-            if stream and features.get("streaming", False):
+            if stream:
+                # Always stream when caller asks for it — the streaming
+                # *permission* only toggles visible typing-indicator UX in
+                # message_handler, not whether Holmes streams internally.
+                # Non-streaming users still get /ping progress this way.
                 return self._stream_chat(
                     holmes_messages, features, user_id, conversation,
                     telegram_context, chat_id, topic_id, cancel_event=cancel_event,
