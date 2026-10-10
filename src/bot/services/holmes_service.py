@@ -260,6 +260,15 @@ class HolmesService:
                 tool_results_dir=None,
             )
 
+            # create_toolcalling_llm builds its own tool_executor internally
+            # (config.py:626), so the wrap we did on self._tool_executor above
+            # does NOT affect the LLM. Re-wrap on the executor the LLM actually
+            # uses, otherwise TodoWrite calls never reach _capture_todo_tasks
+            # and /ping never sees the todo list.
+            self._tool_executor = self._tool_calling_llm.tool_executor
+            self._wrap_todo_write_tool()
+            self._wrap_bash_tool_timeout()
+
             self._initialized = True
             # Patch bash tool to kill the whole process group on timeout, so
             # kubectl/wget/curl children don't keep the worker thread stuck.
@@ -282,47 +291,70 @@ class HolmesService:
                     original_invoke = tool.invoke
 
                     def make_wrapper(original_func):
-                        async def wrapped_invoke(params, context=None):
-                            # Call original tool
-                            result = await original_func(params, context)
+                        # Holmes' Tool.invoke is sync (returns StructuredToolResult).
+                        # Some toolsets may override with async — handle both.
+                        import inspect as _inspect
+                        is_coro = _inspect.iscoroutinefunction(original_func)
 
-                            # Capture tasks from params or result
-                            logger.info("TodoWrite called", params=params, result_type=type(result).__name__)
-
-                            tasks = None
-                            if isinstance(params, dict):
-                                if "tasks" in params:
-                                    tasks = params["tasks"]
-                                elif "todos" in params:
-                                    tasks = params["todos"]
-
-                            # Also check result
-                            if tasks is None and result:
-                                if hasattr(result, 'data') and isinstance(result.data, dict):
-                                    if "tasks" in result.data:
-                                        tasks = result.data["tasks"]
-                                    elif "todos" in result.data:
-                                        tasks = result.data["todos"]
-                                elif isinstance(result, dict):
-                                    if "tasks" in result:
-                                        tasks = result["tasks"]
-                                    elif "todos" in result:
-                                        tasks = result["todos"]
-
-                            if tasks:
-                                self._last_investigation_tasks = tasks
-                                logger.info("Captured investigation tasks", num_tasks=len(tasks))
-                                # Print task details
-                                for t in tasks:
-                                    logger.info("Task", id=t.get('id'), content=t.get('content'), status=t.get('status'))
-
+                        def wrapped_invoke(params, context=None):
+                            result = original_func(params, context)
+                            self._capture_todo_tasks(params, result)
                             return result
-                        return wrapped_invoke
+
+                        async def wrapped_invoke_async(params, context=None):
+                            result = await original_func(params, context)
+                            self._capture_todo_tasks(params, result)
+                            return result
+
+                        return wrapped_invoke_async if is_coro else wrapped_invoke
 
                     # Use object.__setattr__ for frozen Pydantic models
                     object.__setattr__(tool, 'invoke', make_wrapper(original_invoke))
                     logger.info("Wrapped TodoWrite tool for task tracking")
                     break
+
+    def _capture_todo_tasks(self, params, result):
+        """Pull the latest task list out of a TodoWrite call.
+
+        TodoWrite's params use the `todos` key (cf. core_investigation.py:42).
+        The tool also returns a StructuredToolResult whose `params` echo the
+        same list, so we fall back to that when `params` itself is empty.
+        """
+        tasks = None
+        if isinstance(params, dict):
+            if "todos" in params:
+                tasks = params["todos"]
+            elif "tasks" in params:
+                tasks = params["tasks"]
+
+        if tasks is None and result:
+            # StructuredToolResult stores the original params under .params
+            try:
+                rp = getattr(result, "params", None)
+                if isinstance(rp, dict):
+                    if "todos" in rp:
+                        tasks = rp["todos"]
+                    elif "tasks" in rp:
+                        tasks = rp["tasks"]
+            except Exception:
+                pass
+
+        if tasks:
+            # Normalize field names so _format_task_list can read either
+            # capitalized (Content/Status) or lowercase (content/status) keys.
+            normalized = []
+            for t in tasks:
+                if not isinstance(t, dict):
+                    continue
+                normalized.append({
+                    "id": t.get("id") or t.get("ID"),
+                    "content": t.get("content") or t.get("Content", ""),
+                    "status": t.get("status") or t.get("Status", "pending"),
+                })
+            self._last_investigation_tasks = normalized
+            logger.info("Captured investigation tasks", num_tasks=len(normalized))
+            for t in normalized:
+                logger.info("Task", id=t.get("id"), content=t.get("content"), status=t.get("status"))
 
     def _wrap_bash_tool_timeout(self):
         """Clamp the bash tool's timeout parameter to BASH_TIMEOUT_MAX_SECONDS.
