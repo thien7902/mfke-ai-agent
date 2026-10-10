@@ -453,9 +453,16 @@ class MessageHandler:
         lines.append("📝 Latest LLM response:")
         if inv.response_preview:
             preview = inv.response_preview.strip()
-            if len(preview) > 400:
-                preview = preview[-400:]
-            lines.append(preview)
+            if len(preview) > 800:
+                preview = preview[-800:]
+            # Split into sentences so each shows on its own line — easier to
+            # read in a Telegram message than one wrapped paragraph.
+            import re as _re
+            sentences = _re.split(r'(?<=[.?!])\s+', preview)
+            for s in sentences:
+                s = s.strip()
+                if s:
+                    lines.append(f"• {s}")
         else:
             lines.append("(chưa có — agent đang gọi tools, LLM chưa emit text)")
         if inv.tasks:
