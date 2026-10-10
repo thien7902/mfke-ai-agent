@@ -71,6 +71,7 @@ class _ActiveInvestigation:
     tasks: list = field(default_factory=list)
     last_tool: Optional[str] = None
     response_preview: str = ""
+    last_activity: str = ""
 
 
 # (chat_id, topic_id) -> _ActiveInvestigation
@@ -84,11 +85,14 @@ def _set_investigation_status(
     tasks: Optional[list] = None,
     last_tool: Optional[str] = None,
     response_preview: Optional[str] = None,
+    last_activity: Optional[str] = None,
 ):
     """Record latest status for the active investigation in this topic.
 
     Only fields that are not None are updated, so callers can refresh just
     the task list (or just the status text) without clobbering the other.
+    last_activity overwrites the previous value — /ping shows only the
+    most recent tool step, not a list.
     """
     key = (chat_id, topic_id)
     inv = _active_investigations.get(key)
@@ -103,6 +107,8 @@ def _set_investigation_status(
         inv.last_tool = last_tool
     if response_preview is not None:
         inv.response_preview = response_preview
+    if last_activity is not None:
+        inv.last_activity = last_activity
 
 
 def _clear_investigation(chat_id: int, topic_id: int):
@@ -441,6 +447,8 @@ class MessageHandler:
             f"Trạng thái: {inv.status_text}",
             f"Thời gian: ⏱ {elapsed}s",
         ]
+        if inv.last_activity:
+            lines.append(f"Hoạt động cuối: {inv.last_activity}")
         if inv.response_preview:
             preview = inv.response_preview.strip()
             if len(preview) > 400:
@@ -710,6 +718,7 @@ class MessageHandler:
                         chat_id, topic_id,
                         status_text=f"🔧 Using {friendly}...",
                         last_tool=tool_name,
+                        last_activity=f"🔧 {friendly}",
                     )
                 elif event_type == "tool_result":
                     tool_name = event.get("tool_name", "unknown")
@@ -794,7 +803,8 @@ class MessageHandler:
                     event_type = event.get("type", "unknown")
 
                     if event_type == "content":
-                        full_response += event.get("content", "")
+                        chunk = event.get("content", "")
+                        full_response += chunk
                         _set_investigation_status(
                             chat_id, topic_id,
                             response_preview=full_response[-300:],
@@ -838,7 +848,10 @@ class MessageHandler:
                         # Update status with current tool (clean, no params)
                         friendly_name = self._get_friendly_tool_name(tool_name)
                         current_status = f"🔧 Using {friendly_name}..."
-                        _set_investigation_status(chat_id, topic_id, current_status, last_tool=tool_name)
+                        _set_investigation_status(
+                            chat_id, topic_id, current_status, last_tool=tool_name,
+                            last_activity=f"🔧 {friendly_name}",
+                        )
                         try:
                             await status_message.edit_text(
                                 f"📍 **Status**: {current_status}",
@@ -852,7 +865,10 @@ class MessageHandler:
                         if tool_name == last_tool:
                             friendly_name = self._get_friendly_tool_name(tool_name)
                             current_status = f"✅ Completed {friendly_name}"
-                            _set_investigation_status(chat_id, topic_id, current_status)
+                            _set_investigation_status(
+                                chat_id, topic_id, current_status,
+                                last_activity=f"✅ {friendly_name}",
+                            )
                             try:
                                 await status_message.edit_text(
                                     f"📍 **Status**: {current_status}",
@@ -1035,6 +1051,7 @@ class MessageHandler:
                         chat_id, topic_id,
                         status_text=f"🔧 Using {friendly}...",
                         last_tool=tool_name,
+                        last_activity=f"🔧 {friendly}",
                     )
                 elif event_type == "tool_result":
                     tool_name = event.get("tool_name", "unknown")
@@ -1119,7 +1136,8 @@ class MessageHandler:
                     event_type = event.get("type", "unknown")
 
                     if event_type == "content":
-                        full_response += event.get("content", "")
+                        chunk = event.get("content", "")
+                        full_response += chunk
                         _set_investigation_status(
                             chat_id, topic_id,
                             response_preview=full_response[-300:],
@@ -1164,7 +1182,10 @@ class MessageHandler:
                         # Update status with current tool (clean, no params)
                         friendly_name = self._get_friendly_tool_name(tool_name)
                         current_status = f"🔧 Using {friendly_name}..."
-                        _set_investigation_status(chat_id, topic_id, current_status, last_tool=tool_name)
+                        _set_investigation_status(
+                            chat_id, topic_id, current_status, last_tool=tool_name,
+                            last_activity=f"🔧 {friendly_name}",
+                        )
                         try:
                             await status_message.edit_text(
                                 f"📍 **Status**: {current_status}",
@@ -1178,7 +1199,10 @@ class MessageHandler:
                         if tool_name == last_tool:
                             friendly_name = self._get_friendly_tool_name(tool_name)
                             current_status = f"✅ Completed {friendly_name}"
-                            _set_investigation_status(chat_id, topic_id, current_status)
+                            _set_investigation_status(
+                                chat_id, topic_id, current_status,
+                                last_activity=f"✅ {friendly_name}",
+                            )
                             try:
                                 await status_message.edit_text(
                                     f"📍 **Status**: {current_status}",
