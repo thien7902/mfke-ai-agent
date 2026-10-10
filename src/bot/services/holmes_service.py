@@ -1049,7 +1049,23 @@ class HolmesService:
 
         last_task_check = 0
 
-        for event in stream:
+        # Holmes' call_stream returns a sync generator. Iterating it with a
+        # plain `for event in stream:` blocks the event loop on each next()
+        # — when the LLM is slow (waiting on tool output or model response)
+        # nothing else can run, including /ping. Pull each event on the
+        # thread pool instead so the event loop stays free between events.
+        stream_iter = iter(stream) if not hasattr(stream, "__next__") else stream
+
+        def _next_event():
+            try:
+                return next(stream_iter)
+            except StopIteration:
+                return None
+
+        while True:
+            event = await loop.run_in_executor(_holmes_executor, _next_event)
+            if event is None:
+                break
             event_name = event.event.name
             event_data = event.data
 
