@@ -940,11 +940,21 @@ class HolmesService:
         # After stream ends, persist assistant message and tool results to conversation
         if conversation:
             try:
-                # Build assistant message with tool_calls array (OpenAI format)
+                # Build assistant message with tool_calls array (OpenAI format).
+                # tool_call_id must come from the real Holmes-assigned id (emitted
+                # in START_TOOL events); fabricating ids produces
+                # "missing field tool_call_id" / mismatched-id errors from the
+                # LLM API on the next turn when history is replayed.
                 assistant_tool_calls = []
-                for i, tc_evt in enumerate(tool_calls_accumulated):
+                for tc_evt in tool_calls_accumulated:
+                    tool_call_id = tc_evt.get("tool_call_id") or tc_evt.get("id") or ""
+                    if not tool_call_id:
+                        # No real id available (older Holmes or unexpected event
+                        # shape) — skip persisting this tool_call rather than
+                        # fabricate one so the next turn doesn't break.
+                        continue
                     assistant_tool_calls.append({
-                        "id": f"call_{i}_{tc_evt.get('tool_name', 'unknown')}",
+                        "id": tool_call_id,
                         "type": "function",
                         "function": {
                             "name": tc_evt.get("tool_name", "unknown"),
@@ -959,10 +969,12 @@ class HolmesService:
                 )
                 conversation.add_message(assistant_msg)
 
-                # Add tool result messages
+                # Add tool result messages. tool_call_id comes from
+                # ToolCallResult.to_client_dict() (real Holmes id).
                 for tr_evt in tool_results_accumulated:
                     result_data = tr_evt.get("result", "")
                     tool_name = tr_evt.get("tool_name", "unknown")
+                    tool_call_id = tr_evt.get("tool_call_id") or tr_evt.get("id") or ""
 
                     # Extract content from result structure
                     content = "(no output)"
@@ -976,12 +988,19 @@ class HolmesService:
                     elif result_data:
                         content = str(result_data)
 
-                    # Match tool_call_id to the accumulated tool call
-                    tool_call_id = None
-                    for i, tc in enumerate(tool_calls_accumulated):
-                        if tc.get("tool_name") == tool_name:
-                            tool_call_id = f"call_{i}_{tool_name}"
-                            break
+                    if not tool_call_id:
+                        # Try matching by tool_name to a START_TOOL id we saw.
+                        for tc in tool_calls_accumulated:
+                            if tc.get("tool_name") == tool_name:
+                                tool_call_id = tc.get("tool_call_id") or tc.get("id") or ""
+                                if tool_call_id:
+                                    break
+
+                    if not tool_call_id:
+                        # Skip persisting orphan tool results — sending a
+                        # tool-role message without tool_call_id causes LLM API
+                        # "missing field tool_call_id" errors on the next turn.
+                        continue
 
                     tool_msg = Message(
                         role="tool",
@@ -1067,14 +1086,16 @@ class HolmesService:
                         "type": "thinking",
                         "content": reasoning
                     }
-            elif event_name == "TOOL_CALL":
-                # Tool call started
+            elif event_name == "START_TOOL":
+                # Tool call started. Holmes emits the real tool_call_id here.
                 tool_name = event_data.get("tool_name", "unknown")
                 tool_params = event_data.get("params", {})
+                tool_call_id = event_data.get("id", "")
                 yield {
                     "type": "tool_call",
                     "tool_name": tool_name,
-                    "params": tool_params
+                    "params": tool_params,
+                    "tool_call_id": tool_call_id,
                 }
                 # If it's a TodoWrite call, also yield task update immediately
                 if tool_name == "TodoWrite" and isinstance(tool_params, dict):
@@ -1089,12 +1110,15 @@ class HolmesService:
                             "tasks": tool_params["todos"]
                         }
             elif event_name == "TOOL_RESULT":
-                # Tool completed
+                # Tool completed. event_data is ToolCallResult.to_client_dict(),
+                # which carries the real tool_call_id.
                 tool_name = event_data.get("tool_name", "unknown")
+                tool_call_id = event_data.get("tool_call_id", "")
                 result = event_data.get("result", "")
                 yield {
                     "type": "tool_result",
                     "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
                     "result": result
                 }
             elif event_name == "TASK_UPDATE":
