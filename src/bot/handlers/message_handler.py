@@ -669,19 +669,59 @@ class MessageHandler:
         topic_id: int,
         cancel_event: Optional[threading.Event] = None,
     ):
-        """Handle non-streaming response."""
+        """Handle non-streaming response.
+
+        Internally runs Holmes in stream mode so we can update the /ping
+        registry with the latest LLM content as it arrives, but delivers only
+        the final assembled text to the user — no typing indicator or
+        status-message editing like the visible streaming path.
+        """
         _set_investigation_status(chat_id, topic_id, "🔄 Working...")
-        response = await self.holmes.chat(
-            user_id=update.effective_user.id,
-            user_message=message_text,
-            conversation=conversation,
-            user_permissions=user_permissions,
-            stream=False,
-            telegram_context=context,
-            chat_id=chat_id,
-            topic_id=topic_id,
-            cancel_event=cancel_event,
-        )
+        response = ""
+        try:
+            async_gen = await self.holmes.chat(
+                user_id=update.effective_user.id,
+                user_message=message_text,
+                conversation=conversation,
+                user_permissions=user_permissions,
+                stream=True,
+                telegram_context=context,
+                chat_id=chat_id,
+                topic_id=topic_id,
+                cancel_event=cancel_event,
+            )
+            async for event in async_gen:
+                event_type = event.get("type", "unknown")
+                if event_type == "content":
+                    chunk = event.get("content", "")
+                    response += chunk
+                    _set_investigation_status(
+                        chat_id, topic_id,
+                        response_preview=response[-300:],
+                    )
+                elif event_type == "task_update":
+                    _set_investigation_status(
+                        chat_id, topic_id, None, tasks=event.get("tasks", []),
+                    )
+                elif event_type == "tool_call":
+                    tool_name = event.get("tool_name", "unknown")
+                    friendly = self._get_friendly_tool_name(tool_name)
+                    _set_investigation_status(
+                        chat_id, topic_id,
+                        status_text=f"🔧 Using {friendly}...",
+                        last_tool=tool_name,
+                    )
+                elif event_type == "tool_result":
+                    tool_name = event.get("tool_name", "unknown")
+                    friendly = self._get_friendly_tool_name(tool_name)
+                    _set_investigation_status(
+                        chat_id, topic_id,
+                        status_text=f"✅ Completed {friendly}",
+                    )
+        except _LLMInterrupted:
+            # User stopped mid-call — keep what we have so far.
+            if cancel_event is not None:
+                cancel_event.set()
 
         if cancel_event is not None and cancel_event.is_set():
             response = (response or "") + _STOPPED_FOOTER
@@ -957,18 +997,56 @@ class MessageHandler:
         topic_id: int,
         user_id: int,
     ):
-        """Handle non-streaming response in a specific topic (without update object)."""
+        """Handle non-streaming response in a specific topic (without update object).
+
+        Streamed internally so /ping can report progress; only the final
+        assembled message is delivered to the user.
+        """
         _set_investigation_status(chat_id, topic_id, "🔄 Working...")
-        response = await self.holmes.chat(
-            user_id=user_id,
-            user_message=message_text,
-            conversation=conversation,
-            user_permissions=user_permissions,
-            stream=False,
-            telegram_context=context,
-            chat_id=chat_id,
-            topic_id=topic_id,
-        )
+        response = ""
+        try:
+            async_gen = await self.holmes.chat(
+                user_id=user_id,
+                user_message=message_text,
+                conversation=conversation,
+                user_permissions=user_permissions,
+                stream=True,
+                telegram_context=context,
+                chat_id=chat_id,
+                topic_id=topic_id,
+            )
+            async for event in async_gen:
+                event_type = event.get("type", "unknown")
+                if event_type == "content":
+                    chunk = event.get("content", "")
+                    response += chunk
+                    _set_investigation_status(
+                        chat_id, topic_id,
+                        response_preview=response[-300:],
+                    )
+                elif event_type == "task_update":
+                    _set_investigation_status(
+                        chat_id, topic_id, None, tasks=event.get("tasks", []),
+                    )
+                elif event_type == "tool_call":
+                    tool_name = event.get("tool_name", "unknown")
+                    friendly = self._get_friendly_tool_name(tool_name)
+                    _set_investigation_status(
+                        chat_id, topic_id,
+                        status_text=f"🔧 Using {friendly}...",
+                        last_tool=tool_name,
+                    )
+                elif event_type == "tool_result":
+                    tool_name = event.get("tool_name", "unknown")
+                    friendly = self._get_friendly_tool_name(tool_name)
+                    _set_investigation_status(
+                        chat_id, topic_id,
+                        status_text=f"✅ Completed {friendly}",
+                    )
+        except _LLMInterrupted:
+            # No cancel_event in this path (general-chat topic creation)
+            # but keep partial content if it happens.
+            pass
 
         _clear_investigation(chat_id, topic_id)
 

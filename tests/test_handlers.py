@@ -175,9 +175,15 @@ class TestMessageHandler:
 
     @pytest.fixture
     def mock_holmes_service(self):
-        """Create mock Holmes service."""
+        """Create mock Holmes service.
+
+        Default chat returns an async generator yielding a single content
+        event, matching the streaming contract every handler now uses.
+        """
+        async def _stream():
+            yield {"type": "content", "content": "Test response"}
         service = MagicMock()
-        service.chat = AsyncMock(return_value="Test response")
+        service.chat = AsyncMock(return_value=_stream())
         return service
 
     @pytest.fixture
@@ -314,7 +320,10 @@ class TestMessageHandler:
             # Simulate /stop firing while Holmes is mid-call.
             if ev is not None:
                 ev.set()
-            return "partial"
+
+            async def _gen():
+                yield {"type": "content", "content": "partial"}
+            return _gen()
 
         mock_holmes_service.chat = AsyncMock(side_effect=fake_chat)
         mock_user = User(telegram_id=123456789, permissions=[])
