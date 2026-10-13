@@ -290,8 +290,10 @@ class CommandHandler:
             return
 
         # Send immediate acknowledgement so the handler returns right away.
+        COMMAND_PREVIEW = 200
+        cmd_preview = command if len(command) <= COMMAND_PREVIEW else "…" + command[-(COMMAND_PREVIEW - 1):]
         ack = await update.message.reply_text(
-            f"⏳ Running...\n\n$ {command}",
+            f"⏳ Running...\n\n🔧 Command:\n{cmd_preview}",
             message_thread_id=topic_id or None,
         )
 
@@ -345,15 +347,28 @@ class CommandHandler:
             output = stdout.decode("utf-8", errors="replace") if stdout else ""
             output = output.strip()
 
-            header = f"$ {command}\n\n"
-            if proc.returncode != 0:
-                header = f"$ {command}\n\n[exit code: {proc.returncode}]\n\n"
+            # Format the header so output stands out:
+            #   🔧 Command:
+            #   <command — truncated if huge>
+            #
+            #   📤 Output:
+            # When the command line is very long (openstack env exports are
+            # 300+ chars), truncate it to keep the visible header readable;
+            # we keep the tail since the meaningful part is usually at the end
+            # (the actual subcommand like `openstack server show <id>`).
+            COMMAND_PREVIEW = 200
+            if len(command) > COMMAND_PREVIEW:
+                cmd_preview = "…" + command[-(COMMAND_PREVIEW - 1):]
+            else:
+                cmd_preview = command
 
-            # Telegram message limit is 4096 chars. The ack already contains
-            # the full command line which can itself be a few hundred chars
-            # (esp. with openstack env exports). Compute the budget AFTER the
-            # header so we never produce a reply > 4096 — otherwise edit_text
-            # silently fails and the ack stays stuck on "Running..." forever.
+            header = f"🔧 Command:\n{cmd_preview}\n\n📤 Output:\n"
+            if proc.returncode != 0:
+                header = f"🔧 Command:\n{cmd_preview}\n\n[exit code: {proc.returncode}]\n\n📤 Output:\n"
+
+            # Telegram message limit is 4096 chars. Compute the output budget
+            # AFTER the header so the full reply always fits — otherwise
+            # edit_text silently fails and the ack stays on "Running..." forever.
             TELEGRAM_LIMIT = 4096
             FOOTER_TEMPLATE = "\n\n… (output truncated, full length was {n} chars)"
             footer_reserve = len(FOOTER_TEMPLATE.format(n=10 ** 12))  # worst-case width
