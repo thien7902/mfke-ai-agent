@@ -305,28 +305,40 @@ class CommandHandler:
         """Run the shell command and edit the ack message with the result.
 
         Runs in a background task spawned by shell_command. Captures stdout+
-        stderr via /bin/bash -c, enforces a 30s timeout, and edits the ack
-        message with the output (truncated to fit a single Telegram message).
+        stderr via /bin/bash -c, enforces a 120s timeout (OpenStack / kubectl
+        calls can be slow), and edits the ack message with the output (truncated
+        to fit a single Telegram message).
         """
+        import os
+        import signal
+
         MAX_OUTPUT = 3800
+        TIMEOUT_SECONDS = 120
 
         try:
+            # start_new_session=True lets us kill the whole process group on
+            # timeout — otherwise SIGKILL only hits bash, leaving openstack/
+            # kubectl children alive and holding the stdout pipe open.
             proc = await asyncio.create_subprocess_shell(
                 command,
                 executable="/bin/bash",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
             )
             try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
                 try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
                 await self._edit_shell_reply(
                     ack_message, command,
-                    f"⏱️ Command timed out after 30s.",
+                    f"⏱️ Command timed out after {TIMEOUT_SECONDS}s.",
                 )
                 return
 
