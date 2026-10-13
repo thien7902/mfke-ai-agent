@@ -7,7 +7,25 @@ from telegram.ext import ContextTypes, CallbackContext
 
 from src.bot.utils.config import config
 from src.bot.services.permission_service import PermissionService
-from src.bot.models.user import UserPermission
+from src.bot.models.user import UserPermission, User
+
+
+async def _is_admin(telegram_id: int) -> bool:
+    """Check admin status: in config.admin_user_ids OR has ADMIN_ACCESS permission.
+
+    Mirrors PermissionService.is_admin but works at import time without
+    instantiating PermissionService (the decorator may run before the
+    service is wired up). Looks up the user via PermissionService only
+    when the id is not in the static admin list.
+    """
+    if telegram_id in config.admin_user_ids:
+        return True
+    try:
+        svc = PermissionService()
+        user = await svc.get_user(telegram_id)
+        return user is not None and user.has_permission(UserPermission.ADMIN_ACCESS)
+    except Exception:
+        return False
 
 
 def _get_update_from_args(args) -> Update:
@@ -22,7 +40,13 @@ def _get_update_from_args(args) -> Update:
 
 
 def admin_only(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
-    """Decorator to restrict command to admin users only."""
+    """Decorator to restrict command to admin users only.
+
+    Admin status is checked by _is_admin, which accepts users either in
+    config.admin_user_ids OR with the UserPermission.ADMIN_ACCESS permission
+    (typically granted via /grant). This mirrors PermissionService.is_admin
+    so /shell and other @admin_only commands accept both kinds of admin.
+    """
 
     @wraps(func)
     async def wrapper(*args, **kwargs) -> Any:
@@ -35,7 +59,7 @@ def admin_only(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[A
             return await func(*args, **kwargs)
 
         user_id = update.effective_user.id
-        if user_id not in config.admin_user_ids:
+        if not await _is_admin(user_id):
             await update.message.reply_text(
                 "❌ This command is restricted to administrators only."
             )
