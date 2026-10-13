@@ -256,9 +256,11 @@ class CommandHandler:
     async def shell_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /shell <command> — execute a shell command in the bot container.
 
-        Admin-only. Runs the command via /bin/bash -c, captures stdout+stderr,
-        and replies with the output truncated to fit a single Telegram message
-        (4096 chars, with a small margin for the wrapper).
+        Admin-only. Replies immediately with an acknowledgement (like /ping),
+        then runs the command in the background and edits the ack message with
+        the captured output once it completes. This keeps the handler
+        non-blocking — the user can /ping or send other messages while the
+        shell command runs.
         """
         if not update.message:
             return
@@ -275,14 +277,11 @@ class CommandHandler:
             )
             return
 
-        # If the user quoted the whole command as a single arg, use it as-is.
-        # Otherwise join with spaces — closest we can get to the original text.
         if len(context.args) == 1:
             command = context.args[0]
         else:
             command = " ".join(context.args)
 
-        # Sanity check — refuse empty commands.
         if not command.strip():
             await update.message.reply_text(
                 "❌ Empty command.",
@@ -290,8 +289,25 @@ class CommandHandler:
             )
             return
 
-        # Telegram message limit is 4096 chars. Reserve room for the wrapper
-        # (header + truncation footer) so output is truncated to a single msg.
+        # Send immediate acknowledgement so the handler returns right away.
+        ack = await update.message.reply_text(
+            f"⏳ Running...\n\n$ {command}",
+            message_thread_id=topic_id or None,
+        )
+
+        # Run the command in the background and edit the ack with the result.
+        # Don't await — fire-and-forget so the handler returns immediately.
+        asyncio.create_task(
+            self._run_shell_and_edit(ack, command, topic_id)
+        )
+
+    async def _run_shell_and_edit(self, ack_message, command: str, topic_id: int):
+        """Run the shell command and edit the ack message with the result.
+
+        Runs in a background task spawned by shell_command. Captures stdout+
+        stderr via /bin/bash -c, enforces a 30s timeout, and edits the ack
+        message with the output (truncated to fit a single Telegram message).
+        """
         MAX_OUTPUT = 3800
 
         try:
@@ -308,36 +324,43 @@ class CommandHandler:
                     proc.kill()
                 except ProcessLookupError:
                     pass
-                await update.message.reply_text(
-                    f"⏱️ Command timed out after 30s.\n\n$ {command}",
-                    message_thread_id=topic_id or None,
+                await self._edit_shell_reply(
+                    ack_message, command,
+                    f"⏱️ Command timed out after 30s.",
                 )
                 return
 
             output = stdout.decode("utf-8", errors="replace") if stdout else ""
             output = output.strip()
 
-            # Build the reply. Always include the command line so the admin
-            # knows which command produced this output.
             header = f"$ {command}\n\n"
             if proc.returncode != 0:
                 header = f"$ {command}\n\n[exit code: {proc.returncode}]\n\n"
 
             if len(output) > MAX_OUTPUT:
-                # Keep the tail — usually where errors/stack traces land.
                 truncated = output[-MAX_OUTPUT:]
                 footer = "\n\n… (output truncated, full length was {} chars)".format(len(output))
                 reply = header + truncated + footer
             else:
                 reply = header + (output if output else "(no output)")
 
-            await update.message.reply_text(
-                reply,
-                message_thread_id=topic_id or None,
-            )
+            await self._edit_shell_reply(ack_message, command, reply)
         except Exception as e:
             logger.error("/shell failed", command=command, error=str(e))
-            await update.message.reply_text(
-                f"❌ Failed to execute: {e}",
-                message_thread_id=topic_id or None,
+            await self._edit_shell_reply(
+                ack_message, command, f"❌ Failed to execute: {e}"
             )
+
+    async def _edit_shell_reply(self, ack_message, command: str, body: str):
+        """Edit the ack message with the result; fall back to a new reply on failure."""
+        try:
+            await ack_message.edit_text(body)
+        except Exception:
+            # Edit may fail if the message was deleted or content is too long.
+            try:
+                await ack_message.reply_text(
+                    body,
+                    message_thread_id=ack_message.message_thread_id or None,
+                )
+            except Exception:
+                pass
