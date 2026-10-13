@@ -349,12 +349,27 @@ class CommandHandler:
             if proc.returncode != 0:
                 header = f"$ {command}\n\n[exit code: {proc.returncode}]\n\n"
 
-            if len(output) > MAX_OUTPUT:
-                truncated = output[-MAX_OUTPUT:]
+            # Telegram message limit is 4096 chars. The ack already contains
+            # the full command line which can itself be a few hundred chars
+            # (esp. with openstack env exports). Compute the budget AFTER the
+            # header so we never produce a reply > 4096 — otherwise edit_text
+            # silently fails and the ack stays stuck on "Running..." forever.
+            TELEGRAM_LIMIT = 4096
+            FOOTER_TEMPLATE = "\n\n… (output truncated, full length was {n} chars)"
+            footer_reserve = len(FOOTER_TEMPLATE.format(n=10 ** 12))  # worst-case width
+            output_budget = max(0, TELEGRAM_LIMIT - len(header) - footer_reserve - 1)
+
+            if len(output) > output_budget:
+                truncated = output[-output_budget:]
                 footer = "\n\n… (output truncated, full length was {} chars)".format(len(output))
                 reply = header + truncated + footer
             else:
                 reply = header + (output if output else "(no output)")
+
+            # Guard against Telegram limit one more time — if the header is so
+            # long it eats the whole budget, just truncate header side too.
+            if len(reply) > TELEGRAM_LIMIT:
+                reply = reply[-(TELEGRAM_LIMIT - 1):]
 
             await self._edit_shell_reply(ack_message, command, reply)
         except Exception as e:
