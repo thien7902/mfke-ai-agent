@@ -293,8 +293,9 @@ class CommandHandler:
         COMMAND_PREVIEW = 200
         cmd_preview = command if len(command) <= COMMAND_PREVIEW else "…" + command[-(COMMAND_PREVIEW - 1):]
         ack = await update.message.reply_text(
-            f"⏳ Running...\n\n🔧 Command:\n{cmd_preview}",
+            f"⏳ Running...\n\n🔧 Command:\n`{cmd_preview}`",
             message_thread_id=topic_id or None,
+            parse_mode="Markdown",
         )
 
         # Run the command in the background and edit the ack with the result.
@@ -362,47 +363,78 @@ class CommandHandler:
             else:
                 cmd_preview = command
 
-            header = f"🔧 Command:\n{cmd_preview}\n\n📤 Output:\n"
+            header = f"🔧 Command:\n`{cmd_preview}`\n\n📤 Output:\n```\n"
             if proc.returncode != 0:
-                header = f"🔧 Command:\n{cmd_preview}\n\n[exit code: {proc.returncode}]\n\n📤 Output:\n"
+                header = f"🔧 Command:\n`{cmd_preview}`\n\n[exit code: {proc.returncode}]\n\n📤 Output:\n```\n"
 
+            # Output is wrapped in a Markdown code block so Telegram renders it
+            # monospace — important for ASCII tables (openstack server list,
+            # kubectl get pods, etc.) which look garbled in proportional font.
+            # The closing fence adds 4 chars (newline + ```).
+            CODE_FENCE_CLOSE = "\n```"
             # Telegram message limit is 4096 chars. Compute the output budget
             # AFTER the header so the full reply always fits — otherwise
             # edit_text silently fails and the ack stays on "Running..." forever.
             TELEGRAM_LIMIT = 4096
             FOOTER_TEMPLATE = "\n\n… (output truncated, full length was {n} chars)"
             footer_reserve = len(FOOTER_TEMPLATE.format(n=10 ** 12))  # worst-case width
-            output_budget = max(0, TELEGRAM_LIMIT - len(header) - footer_reserve - 1)
+            output_budget = max(0, TELEGRAM_LIMIT - len(header) - len(CODE_FENCE_CLOSE) - footer_reserve - 1)
 
-            if len(output) > output_budget:
-                truncated = output[-output_budget:]
+            # Escape any backticks in the output so they don't break the
+            # Markdown code block when rendered.
+            safe_output = output.replace("```", "\\`\\`\\`")
+
+            if len(safe_output) > output_budget:
+                truncated = safe_output[-output_budget:]
                 footer = "\n\n… (output truncated, full length was {} chars)".format(len(output))
-                reply = header + truncated + footer
+                reply = header + truncated + CODE_FENCE_CLOSE + footer
+            elif safe_output:
+                reply = header + safe_output + CODE_FENCE_CLOSE
             else:
-                reply = header + (output if output else "(no output)")
+                # Empty output: drop the opening fence so we don't leave
+                # a stray "```" hanging.
+                header_no_fence = header.rstrip("\n`")
+                reply = header_no_fence + "(no output)"
 
             # Guard against Telegram limit one more time — if the header is so
             # long it eats the whole budget, just truncate header side too.
             if len(reply) > TELEGRAM_LIMIT:
                 reply = reply[-(TELEGRAM_LIMIT - 1):]
 
-            await self._edit_shell_reply(ack_message, command, reply)
+            await self._edit_shell_reply(ack_message, command, reply, parse_mode="Markdown")
         except Exception as e:
             logger.error("/shell failed", command=command, error=str(e))
             await self._edit_shell_reply(
                 ack_message, command, f"❌ Failed to execute: {e}"
             )
 
-    async def _edit_shell_reply(self, ack_message, command: str, body: str):
-        """Edit the ack message with the result; fall back to a new reply on failure."""
-        try:
-            await ack_message.edit_text(body)
-        except Exception:
-            # Edit may fail if the message was deleted or content is too long.
+    async def _edit_shell_reply(self, ack_message, command: str, body: str, parse_mode: str = None):
+        """Edit the ack message with the result; fall back to a new reply on failure.
+
+        If parse_mode is set (e.g. "Markdown"), try with it first. On any
+        failure, retry as plain text so the user always sees something — a
+        garbled unformatted message is better than a stuck "Running...".
+        """
+        # First attempt: with requested parse_mode (e.g. Markdown for code
+        # fences around command output).
+        if parse_mode:
             try:
-                await ack_message.reply_text(
-                    body,
-                    message_thread_id=ack_message.message_thread_id or None,
-                )
+                await ack_message.edit_text(body, parse_mode=parse_mode)
+                return
             except Exception:
                 pass
+        # Second attempt: plain text.
+        try:
+            await ack_message.edit_text(body)
+            return
+        except Exception:
+            pass
+        # Final fallback: reply as a new message (in case edit failed because
+        # the ack was deleted or is unrecoverable).
+        try:
+            await ack_message.reply_text(
+                body,
+                message_thread_id=ack_message.message_thread_id or None,
+            )
+        except Exception:
+            pass
