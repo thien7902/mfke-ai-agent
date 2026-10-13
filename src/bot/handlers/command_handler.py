@@ -1,4 +1,6 @@
 """Command Handler - Handle basic bot commands."""
+import asyncio
+import shlex
 import structlog
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -6,7 +8,7 @@ from telegram.ext import ContextTypes
 from src.bot.services.permission_service import PermissionService
 from src.bot.services.conversation_service import ConversationService
 from src.bot.models.user import UserPermission
-from src.bot.utils.decorators import rate_limit
+from src.bot.utils.decorators import admin_only, rate_limit
 
 logger = structlog.get_logger(__name__)
 
@@ -67,6 +69,7 @@ class CommandHandler:
         if await self.permissions.is_admin(user.id):
             welcome_text += (
                 "\n\n🔧 **Admin commands:**\n"
+                "/shell <command> - Execute a shell command in the bot container\n"
                 "/grant <user_id> <permission> - Request permission for user\n"
                 "/revoke <user_id> <permission> - Revoke user permission\n"
                 "/user_permissions <user_id> - View user's permissions\n"
@@ -111,6 +114,7 @@ class CommandHandler:
         if is_admin:
             help_text += (
                 "\n**Admin Commands:**\n"
+                "/shell <command> - Execute a shell command in the bot container\n"
                 "/grant <user_id> <permission> - Request a permission for a user\n"
                 "/revoke <user_id> <permission> - Revoke a user's permission\n"
                 "/user_permissions <user_id> - View another user's permissions\n"
@@ -246,4 +250,94 @@ class CommandHandler:
             await update.message.reply_text(
                 "🚫 This command only works in forum-enabled groups.",
                 message_thread_id=None
+            )
+
+    @admin_only
+    async def shell_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /shell <command> — execute a shell command in the bot container.
+
+        Admin-only. Runs the command via /bin/bash -c, captures stdout+stderr,
+        and replies with the output truncated to fit a single Telegram message
+        (4096 chars, with a small margin for the wrapper).
+        """
+        if not update.message:
+            return
+
+        topic_id = update.message.message_thread_id or 0
+
+        # Reconstruct the command string from context.args. PTB strips the
+        # /shell prefix and splits the rest on whitespace; join back so users
+        # can use either /shell kubectl get pods or /shell "kubectl get pods".
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /shell <command>\nExample: /shell kubectl get pods -A",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        # If the user quoted the whole command as a single arg, use it as-is.
+        # Otherwise join with spaces — closest we can get to the original text.
+        if len(context.args) == 1:
+            command = context.args[0]
+        else:
+            command = " ".join(context.args)
+
+        # Sanity check — refuse empty commands.
+        if not command.strip():
+            await update.message.reply_text(
+                "❌ Empty command.",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        # Telegram message limit is 4096 chars. Reserve room for the wrapper
+        # (header + truncation footer) so output is truncated to a single msg.
+        MAX_OUTPUT = 3800
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                executable="/bin/bash",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await update.message.reply_text(
+                    f"⏱️ Command timed out after 30s.\n\n$ {command}",
+                    message_thread_id=topic_id or None,
+                )
+                return
+
+            output = stdout.decode("utf-8", errors="replace") if stdout else ""
+            output = output.strip()
+
+            # Build the reply. Always include the command line so the admin
+            # knows which command produced this output.
+            header = f"$ {command}\n\n"
+            if proc.returncode != 0:
+                header = f"$ {command}\n\n[exit code: {proc.returncode}]\n\n"
+
+            if len(output) > MAX_OUTPUT:
+                # Keep the tail — usually where errors/stack traces land.
+                truncated = output[-MAX_OUTPUT:]
+                footer = "\n\n… (output truncated, full length was {} chars)".format(len(output))
+                reply = header + truncated + footer
+            else:
+                reply = header + (output if output else "(no output)")
+
+            await update.message.reply_text(
+                reply,
+                message_thread_id=topic_id or None,
+            )
+        except Exception as e:
+            logger.error("/shell failed", command=command, error=str(e))
+            await update.message.reply_text(
+                f"❌ Failed to execute: {e}",
+                message_thread_id=topic_id or None,
             )
