@@ -510,6 +510,80 @@ class CommandHandler:
         results: list[str] = []   # collected ✅/❌ lines
         any_lookup_attempt: bool = False  # did we try at least one kubeconfig?
 
+        async def process_kubeconfig(kc: str) -> tuple[bool, list[str]]:
+            """Lookup + annotate one kubeconfig. Returns (did_attempt, result_lines).
+
+            Runs get-contexts → for each context, `kubectl get shoot -A` to find
+            the namespace, then `kubectl annotate shoot ... operation=reconcile`.
+            `did_attempt` is True if at least one lookup was issued (even if the
+            shoot wasn't found here) — used to distinguish "no match anywhere"
+            from "no kubeconfigs at all".
+            """
+            kc_name = os.path.basename(kc)
+            kc_q = shlex.quote(kc)
+            lines: list[str] = []
+            did_attempt = False
+
+            # Get contexts — if empty, fall back to no --context so kubectl
+            # uses the default context (typically `garden` for Gardener kubeconfigs).
+            rc, ctx_out = await run_subprocess(
+                f"KUBECONFIG={kc_q} kubectl config get-contexts -o name"
+            )
+            contexts = [c.strip() for c in ctx_out.splitlines() if c.strip()] if rc == 0 else []
+            if not contexts:
+                contexts = [None]
+
+            for ctx in contexts:
+                ctx_arg = f"--context {shlex.quote(ctx)}" if ctx else ""
+
+                # Look up the shoot's namespace via `kubectl get shoot -A`.
+                # The namespace isn't derivable from the context (context is
+                # just `garden` for Gardener seed kubeconfigs) — we have to
+                # ask the API. jsonpath gives us one namespace per line,
+                # cleanly parseable.
+                did_attempt = True
+                lookup_cmd = (
+                    f"KUBECONFIG={kc_q} kubectl {ctx_arg} "
+                    f"get shoot {shlex.quote(shoot_name)} -A "
+                    f"-o jsonpath='{{range .items[*]}}{{.metadata.namespace}}{{\"\\n\"}}{{end}}'"
+                )
+                rc, ns_out = await run_subprocess(lookup_cmd)
+                namespaces = [n.strip() for n in ns_out.splitlines() if n.strip()] if rc == 0 else []
+
+                if not namespaces:
+                    # Shoot not found in this kubeconfig's garden — skip silently.
+                    continue
+
+                for ns in namespaces:
+                    annotate_cmd = (
+                        f"KUBECONFIG={kc_q} kubectl {ctx_arg} -n {shlex.quote(ns)} "
+                        f"annotate shoot {shlex.quote(shoot_name)} "
+                        f"gardenercloud.com/operation=reconcile --overwrite"
+                    )
+                    rc, out = await run_subprocess(annotate_cmd)
+                    out = out.strip()
+
+                    header = f"✅ {kc_name}"
+                    if ctx:
+                        header += f" (context: `{ctx}`)"
+                    header += f" — namespace `{ns}`"
+
+                    # Gardener annotate success prints
+                    # "shoot.core.gardener.cloud/<name> annotated" or "patched".
+                    # Treat rc==0 with a not-found message as a failure too.
+                    if rc == 0 and ("annotated" in out or "patched" in out or not out):
+                        line = header
+                        if out:
+                            line += f"\n```\n{truncate(out, MAX_OUTPUT)}\n```"
+                        lines.append(line)
+                    else:
+                        err_line = header.replace("✅", "❌", 1)
+                        if out:
+                            err_line += f"\n```\n{truncate(out, MAX_OUTPUT)}\n```"
+                        lines.append(err_line)
+
+            return did_attempt, lines
+
         try:
             # Step 1: chmod 777 so we can read the kubeconfigs
             await run_subprocess(f"chmod -R 777 {KCONFIG_DIR}")
@@ -519,67 +593,24 @@ class CommandHandler:
                 if os.path.isfile(p)
             )
 
-            for kc in kconfigs:
-                kc_name = os.path.basename(kc)
-                kc_q = shlex.quote(kc)
+            # Run all kubeconfigs in parallel — each is independent (own KUBECONFIG,
+            # own kubectl process). This turns an O(N×120s) sequential wait into
+            # O(120s) when kubectl calls are the bottleneck.
+            per_kc = await asyncio.gather(
+                *(process_kubeconfig(kc) for kc in kconfigs),
+                return_exceptions=True,
+            )
 
-                # Get contexts — if empty, fall back to no --context so kubectl
-                # uses the default context (typically `garden` for Gardener kubeconfigs).
-                rc, ctx_out = await run_subprocess(
-                    f"KUBECONFIG={kc_q} kubectl config get-contexts -o name"
-                )
-                contexts = [c.strip() for c in ctx_out.splitlines() if c.strip()] if rc == 0 else []
-                if not contexts:
-                    contexts = [None]
-
-                for ctx in contexts:
-                    ctx_arg = f"--context {shlex.quote(ctx)}" if ctx else ""
-
-                    # Look up the shoot's namespace via `kubectl get shoot -A`.
-                    # The namespace isn't derivable from the context (context is
-                    # just `garden` for Gardener seed kubeconfigs) — we have to
-                    # ask the API. jsonpath gives us one namespace per line,
-                    # cleanly parseable.
+            for outcome in per_kc:
+                if isinstance(outcome, Exception):
+                    # One kubeconfig's processing blew up — record as a failure
+                    # line rather than killing the whole reconcile.
+                    results.append(f"❌ (exception) `{outcome}`")
+                    continue
+                did_attempt, lines = outcome
+                if did_attempt:
                     any_lookup_attempt = True
-                    lookup_cmd = (
-                        f"KUBECONFIG={kc_q} kubectl {ctx_arg} "
-                        f"get shoot {shlex.quote(shoot_name)} -A "
-                        f"-o jsonpath='{{range .items[*]}}{{.metadata.namespace}}{{\"\\n\"}}{{end}}'"
-                    )
-                    rc, ns_out = await run_subprocess(lookup_cmd)
-                    namespaces = [n.strip() for n in ns_out.splitlines() if n.strip()] if rc == 0 else []
-
-                    if not namespaces:
-                        # Shoot not found in this kubeconfig's garden — skip silently.
-                        continue
-
-                    for ns in namespaces:
-                        annotate_cmd = (
-                            f"KUBECONFIG={kc_q} kubectl {ctx_arg} -n {shlex.quote(ns)} "
-                            f"annotate shoot {shlex.quote(shoot_name)} "
-                            f"gardenercloud.com/operation=reconcile --overwrite"
-                        )
-                        rc, out = await run_subprocess(annotate_cmd)
-                        out = out.strip()
-
-                        header = f"✅ {kc_name}"
-                        if ctx:
-                            header += f" (context: `{ctx}`)"
-                        header += f" — namespace `{ns}`"
-
-                        # Gardener annotate success prints
-                        # "shoot.core.gardener.cloud/<name> annotated" or "patched".
-                        # Treat rc==0 with a not-found message as a failure too.
-                        if rc == 0 and ("annotated" in out or "patched" in out or not out):
-                            line = header
-                            if out:
-                                line += f"\n```\n{truncate(out, MAX_OUTPUT)}\n```"
-                            results.append(line)
-                        else:
-                            err_line = header.replace("✅", "❌", 1)
-                            if out:
-                                err_line += f"\n```\n{truncate(out, MAX_OUTPUT)}\n```"
-                            results.append(err_line)
+                results.extend(lines)
 
         finally:
             # Always lock down again
