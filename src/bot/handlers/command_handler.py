@@ -554,26 +554,35 @@ class CommandHandler:
             for ctx in contexts:
                 ctx_arg = f"--context {shlex.quote(ctx)}" if ctx else ""
 
-                # Look up the shoot's namespace via `kubectl get shoot -A`.
-                # The namespace isn't derivable from the context (context is
-                # just `garden` for Gardener seed kubeconfigs) — we have to
-                # ask the API. jsonpath gives us one namespace per line,
-                # cleanly parseable.
+                # Look up the shoot's namespace. `kubectl get shoot <name> -A`
+                # is invalid (a named resource can't be retrieved across all
+                # namespaces), so fetch all shoots with `-A` and filter client-
+                # side by name. jsonpath emits `namespace name` per line so we
+                # can both match by name and read the namespace.
                 did_attempt = True
                 lookup_cmd = (
                     f"KUBECONFIG={kc_q} kubectl {ctx_arg} "
-                    f"get shoot {shlex.quote(shoot_name)} -A "
-                    f"-o jsonpath='{{range .items[*]}}{{.metadata.namespace}}{{\"\\n\"}}{{end}}'"
+                    f"get shoot -A "
+                    f"-o jsonpath='{{range .items[*]}}{{.metadata.namespace}}{{\" \"}}{{.metadata.name}}{{\"\\n\"}}{{end}}'"
                 )
                 rc, ns_out = await run_subprocess(lookup_cmd)
-                namespaces = [n.strip() for n in ns_out.splitlines() if n.strip()] if rc == 0 else []
+
+                namespaces: list[str] = []
+                if rc == 0:
+                    for line in ns_out.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        parts = line.split(" ", 1)
+                        if len(parts) == 2 and parts[1] == shoot_name:
+                            namespaces.append(parts[0])
 
                 if not namespaces:
                     # Shoot not found in this kubeconfig's garden. If rc != 0,
                     # the lookup itself failed (not just "no match") — record
                     # the error output so we can surface it later. If rc==0
-                    # and namespaces empty, the shoot genuinely doesn't exist
-                    # here — skip silently.
+                    # and no matches, the shoot genuinely doesn't exist here —
+                    # skip silently.
                     if rc != 0 and ns_out.strip():
                         err_ctx = f" (context: `{ctx}`)" if ctx else ""
                         lookup_errors.append(
