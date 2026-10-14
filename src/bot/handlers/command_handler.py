@@ -70,6 +70,7 @@ class CommandHandler:
             welcome_text += (
                 "\n\n🔧 **Admin commands:**\n"
                 "/shell <command> - Execute a shell command in the bot container\n"
+                "/reconcile <shoot_name> - Trigger Gardener reconcile for a shoot\n"
                 "/grant <user_id> <permission> - Request permission for user\n"
                 "/revoke <user_id> <permission> - Revoke user permission\n"
                 "/user_permissions <user_id> - View user's permissions\n"
@@ -115,6 +116,7 @@ class CommandHandler:
             help_text += (
                 "\n**Admin Commands:**\n"
                 "/shell <command> - Execute a shell command in the bot container\n"
+                "/reconcile <shoot_name> - Trigger Gardener reconcile for a shoot\n"
                 "/grant <user_id> <permission> - Request a permission for a user\n"
                 "/revoke <user_id> <permission> - Revoke a user's permission\n"
                 "/user_permissions <user_id> - View another user's permissions\n"
@@ -407,6 +409,205 @@ class CommandHandler:
             await self._edit_shell_reply(
                 ack_message, command, f"❌ Failed to execute: {e}"
             )
+
+    @admin_only
+    async def reconcile_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /reconcile <shoot_name> — annotate the Gardener shoot for reconcile.
+
+        Admin-only. Works like /shell: replies immediately with an ack, then runs
+        in the background and edits the ack with the result.
+
+        Flow:
+          1. chmod -R 777 /root/.holmes/kubeconfig-only-admin-can-run
+          2. Traverse every kubeconfig in that dir; for each, run
+             `kubectl --context <ctx> annotate shoot <name> -n <ns>
+              gardener.cloud/operation=reconcile --overwrite`
+          3. Show which shoots succeeded (with kubeconfig + namespace)
+          4. If none matched, reply that no shoot matched <name>
+          5. chmod -R 000 /root/.holmes/kubeconfig-only-admin-can-run
+        """
+        if not update.message:
+            return
+
+        topic_id = update.message.message_thread_id or 0
+
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /reconcile <shoot_name>",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        shoot_name = context.args[0].strip()
+        if not shoot_name:
+            await update.message.reply_text(
+                "❌ Empty shoot name.",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        ack = await update.message.reply_text(
+            f"⏳ Reconciling shoot `{shoot_name}`...",
+            message_thread_id=topic_id or None,
+            parse_mode="Markdown",
+        )
+
+        asyncio.create_task(
+            self._run_reconcile_and_edit(ack, shoot_name, topic_id)
+        )
+
+    async def _run_reconcile_and_edit(self, ack_message, shoot_name: str, topic_id: int):
+        """Run the reconcile flow and edit the ack with the result.
+
+        For each kubeconfig in /root/.holmes/kubeconfig-only-admin-can-run/:
+          1. Use its context (typically `garden`) to look up the shoot's
+             namespace via `kubectl get shoot <name> -A -o jsonpath=...`.
+          2. If found, annotate the shoot in that namespace with
+             `gardenercloud.com/operation=reconcile --overwrite`.
+
+        The namespace isn't derivable from the context (Gardener seed
+        kubeconfigs have a single `garden` context), so the lookup step is
+        required. Returns a summary: ✅ list (kubeconfig + context + namespace
+        + annotate output), or "no shoot matched <name>" if no kubeconfig
+        found the shoot.
+        """
+        import glob
+        import os
+        import signal
+
+        KCONFIG_DIR = "/root/.holmes/kubeconfig-only-admin-can-run"
+        TIMEOUT_SECONDS = 120
+        MAX_OUTPUT = 2000
+
+        async def run_subprocess(cmd: str) -> tuple[int, str]:
+            """Run cmd via bash, return (returncode, combined stdout+stderr)."""
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    executable="/bin/bash",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                try:
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT_SECONDS)
+                except asyncio.TimeoutError:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    return -1, f"⏱️ Timed out after {TIMEOUT_SECONDS}s."
+                out = stdout.decode("utf-8", errors="replace") if stdout else ""
+                return proc.returncode, out
+            except Exception as e:
+                return -2, str(e)
+
+        def truncate(text: str, limit: int) -> str:
+            if len(text) <= limit:
+                return text
+            return text[-limit:] + f"\n\n… (output truncated, full length was {len(text)} chars)"
+
+        results: list[str] = []   # collected ✅/❌ lines
+        any_lookup_attempt: bool = False  # did we try at least one kubeconfig?
+
+        try:
+            # Step 1: chmod 777 so we can read the kubeconfigs
+            await run_subprocess(f"chmod -R 777 {KCONFIG_DIR}")
+
+            kconfigs = sorted(
+                p for p in glob.glob(os.path.join(KCONFIG_DIR, "**"), recursive=False)
+                if os.path.isfile(p)
+            )
+
+            for kc in kconfigs:
+                kc_name = os.path.basename(kc)
+                kc_q = shlex.quote(kc)
+
+                # Get contexts — if empty, fall back to no --context so kubectl
+                # uses the default context (typically `garden` for Gardener kubeconfigs).
+                rc, ctx_out = await run_subprocess(
+                    f"KUBECONFIG={kc_q} kubectl config get-contexts -o name"
+                )
+                contexts = [c.strip() for c in ctx_out.splitlines() if c.strip()] if rc == 0 else []
+                if not contexts:
+                    contexts = [None]
+
+                for ctx in contexts:
+                    ctx_arg = f"--context {shlex.quote(ctx)}" if ctx else ""
+
+                    # Look up the shoot's namespace via `kubectl get shoot -A`.
+                    # The namespace isn't derivable from the context (context is
+                    # just `garden` for Gardener seed kubeconfigs) — we have to
+                    # ask the API. jsonpath gives us one namespace per line,
+                    # cleanly parseable.
+                    any_lookup_attempt = True
+                    lookup_cmd = (
+                        f"KUBECONFIG={kc_q} kubectl {ctx_arg} "
+                        f"get shoot {shlex.quote(shoot_name)} -A "
+                        f"-o jsonpath='{{range .items[*]}}{{.metadata.namespace}}{{\"\\n\"}}{{end}}'"
+                    )
+                    rc, ns_out = await run_subprocess(lookup_cmd)
+                    namespaces = [n.strip() for n in ns_out.splitlines() if n.strip()] if rc == 0 else []
+
+                    if not namespaces:
+                        # Shoot not found in this kubeconfig's garden — skip silently.
+                        continue
+
+                    for ns in namespaces:
+                        annotate_cmd = (
+                            f"KUBECONFIG={kc_q} kubectl {ctx_arg} -n {shlex.quote(ns)} "
+                            f"annotate shoot {shlex.quote(shoot_name)} "
+                            f"gardenercloud.com/operation=reconcile --overwrite"
+                        )
+                        rc, out = await run_subprocess(annotate_cmd)
+                        out = out.strip()
+
+                        header = f"✅ {kc_name}"
+                        if ctx:
+                            header += f" (context: `{ctx}`)"
+                        header += f" — namespace `{ns}`"
+
+                        # Gardener annotate success prints
+                        # "shoot.core.gardener.cloud/<name> annotated" or "patched".
+                        # Treat rc==0 with a not-found message as a failure too.
+                        if rc == 0 and ("annotated" in out or "patched" in out or not out):
+                            line = header
+                            if out:
+                                line += f"\n```\n{truncate(out, MAX_OUTPUT)}\n```"
+                            results.append(line)
+                        else:
+                            err_line = header.replace("✅", "❌", 1)
+                            if out:
+                                err_line += f"\n```\n{truncate(out, MAX_OUTPUT)}\n```"
+                            results.append(err_line)
+
+        finally:
+            # Always lock down again
+            await run_subprocess(f"chmod -R 000 {KCONFIG_DIR}")
+
+        # Build the summary
+        successes = [r for r in results if r.startswith("✅")]
+        failures = [r for r in results if r.startswith("❌")]
+
+        if successes:
+            reply_parts = [f"🎯 Reconciled shoot `{shoot_name}`:\n\n"]
+            reply_parts.extend(successes)
+            if failures:
+                reply_parts.append("\n\n⚠️ Failures:")
+                reply_parts.extend(failures)
+            reply = "\n".join(reply_parts)
+        elif any_lookup_attempt:
+            reply = f"❌ No shoot matched `{shoot_name}` in any kubeconfig."
+        else:
+            reply = f"❌ No kubeconfigs found under `{KCONFIG_DIR}`."
+
+        # Keep within Telegram limit
+        TELEGRAM_LIMIT = 4096
+        if len(reply) > TELEGRAM_LIMIT:
+            reply = reply[-(TELEGRAM_LIMIT - 1):]
+
+        # Reuse the shell reply editor (Markdown so the code blocks render)
+        await self._edit_shell_reply(ack_message, f"reconcile {shoot_name}", reply, parse_mode="Markdown")
 
     async def _edit_shell_reply(self, ack_message, command: str, body: str, parse_mode: str = None):
         """Edit the ack message with the result; fall back to a new reply on failure.
