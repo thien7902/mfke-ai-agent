@@ -440,6 +440,7 @@ class CommandHandler:
             return
 
         import glob
+        import os
         topic_id = update.message.message_thread_id or 0
         KCONFIG_DIR = "/root/.holmes/kubeconfig-only-admin-can-run"
 
