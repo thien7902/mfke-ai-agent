@@ -105,6 +105,11 @@ run_bot() {
     # Initialize Holmes
     init_holmes
 
+    # Clean up any leftover decrypted kubeconfig tempfiles from a previous
+    # crash/SIGKILL before starting — these are 0600 mode so they're root-only,
+    # but still shouldn't accumulate across restarts.
+    rm -f /tmp/kc-* 2>/dev/null || true
+
     # Run the bot
     cd /app
     exec python3 -m src.bot.main
