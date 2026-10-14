@@ -117,7 +117,7 @@ python -m src.bot.main
 
 #### `/reconcile <shoot_name>` details
 
-Traverses every kubeconfig in `/root/.holmes/kubeconfig-only-admin-can-run/`, looks up the shoot's namespace via `kubectl get shoot <name> -A`, then annotates it with `gardenercloud.com/operation=reconcile --overwrite`. Reports per-kubeconfig results, or `No shoot matched <name>` if none found. `chmod 777` / `chmod 000` bracket the kubeconfig dir around each run.
+Traverses every kubeconfig in `/root/.holmes/kubeconfig-only-admin-can-run/`, looks up the shoot's namespace via `kubectl get shoot <name> -A`, then annotates it with `gardenercloud.com/operation=reconcile --overwrite`. Reports per-kubeconfig results, or `No shoot matched <name>` if none found.
 
 ### Available Permissions
 
