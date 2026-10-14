@@ -19,6 +19,8 @@ RUN apt-get update && \
         fzf \
         gcc \
         gpg \
+        gnupg \
+        pinentry-curses \
         jq \
         less \
         libssl-dev \
