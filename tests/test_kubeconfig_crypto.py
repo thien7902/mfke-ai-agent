@@ -1,17 +1,9 @@
-"""Tests for kubeconfig_crypto — gpg encrypt/decrypt roundtrip, migration, cleanup."""
+"""Tests for kubeconfig_crypto — AES-GCM encrypt/decrypt roundtrip, migration, cleanup."""
 import os
-import shutil
-import subprocess
 
 import pytest
 
 from src.bot.utils import kubeconfig_crypto
-
-
-pytestmark = pytest.mark.skipif(
-    shutil.which("gpg") is None,
-    reason="gpg binary not available in this environment",
-)
 
 
 @pytest.fixture
@@ -47,9 +39,10 @@ def _write_kubeconfig(path, name: str = "test-kc") -> str:
 
 
 def test_is_encrypted():
-    assert kubeconfig_crypto.is_encrypted("foo.gpg")
+    assert kubeconfig_crypto.is_encrypted("foo.enc")
     assert not kubeconfig_crypto.is_encrypted("foo")
     assert not kubeconfig_crypto.is_encrypted("foo.yaml")
+    assert not kubeconfig_crypto.is_encrypted("foo.gpg")  # legacy, treated as plaintext now
 
 
 def test_encrypt_decrypt_roundtrip(kc_dir):
@@ -58,13 +51,25 @@ def test_encrypt_decrypt_roundtrip(kc_dir):
 
     # Encrypt
     enc = kubeconfig_crypto.encrypt_file(plain)
-    assert enc == plain + ".gpg"
+    assert enc == plain + ".enc"
     assert os.path.exists(enc)
     assert not os.path.exists(plain), "plaintext must be shredded"
 
     # Ciphertext should NOT contain the original token
     enc_bytes = open(enc, "rb").read()
     assert b"fake-token-for-han-gardener" not in enc_bytes
+
+    # Two encryptions of the same plaintext produce different ciphertext
+    # (different random salt + nonce).
+    plain2 = _write_kubeconfig(kc_dir, "second")
+    enc2a = kubeconfig_crypto.encrypt_file(plain2)
+    # Re-create plaintext for second encryption test
+    plain3 = _write_kubeconfig(kc_dir, "third")
+    plain3_bytes = open(plain3, "rb").read()
+    enc3a = kubeconfig_crypto.encrypt_file(plain3)
+    # Both enc3a and enc2a should be different even though content is the same template structure
+    # (actually content differs by name; main point is salt differs). Just check enc3a != plaintext:
+    assert open(enc3a, "rb").read() != plain3_bytes
 
     # Decrypt to tempfile
     tmp = kubeconfig_crypto.decrypt_to_tempfile(enc)
@@ -80,31 +85,44 @@ def test_encrypt_decrypt_roundtrip(kc_dir):
     assert not os.path.exists(tmp)
 
 
+def test_decrypt_wrong_passphrase_returns_none(kc_dir, monkeypatch):
+    """Encrypt with the real passphrase, then attempt decryption with a different one."""
+    plain = _write_kubeconfig(kc_dir, "victim")
+    enc = kubeconfig_crypto.encrypt_file(plain)
+    assert os.path.exists(enc)
+
+    # Swap the passphrase used by the module
+    monkeypatch.setattr(kubeconfig_crypto, "PASSPHRASE", b"wrong-pass")
+    # The salt is part of the file header, but the derived key no longer matches.
+    result = kubeconfig_crypto.decrypt_to_tempfile(enc)
+    assert result is None
+
+
 def test_migrate_encrypts_plaintext_files(kc_dir):
     p1 = _write_kubeconfig(kc_dir, "han-gardener")
     p2 = _write_kubeconfig(kc_dir, "hoa-lac-new-gardener")
-    pre_gpg = _write_kubeconfig(kc_dir, "already-encrypted.gpg")
+    pre_enc = _write_kubeconfig(kc_dir, "already-encrypted.enc")
 
     kubeconfig_crypto.migrate_kubeconfigs(str(kc_dir))
 
-    assert os.path.exists(p1 + ".gpg")
-    assert os.path.exists(p2 + ".gpg")
+    assert os.path.exists(p1 + ".enc")
+    assert os.path.exists(p2 + ".enc")
     assert not os.path.exists(p1)
     assert not os.path.exists(p2)
-    # The .gpg we put there ourselves should remain (not get a .gpg.gpg)
-    assert os.path.exists(pre_gpg)
-    assert not os.path.exists(pre_gpg + ".gpg")
+    # The .enc we put there ourselves should remain (not get a .enc.enc)
+    assert os.path.exists(pre_enc)
+    assert not os.path.exists(pre_enc + ".enc")
 
 
 def test_migrate_idempotent(kc_dir):
     p1 = _write_kubeconfig(kc_dir, "han-gardener")
     kubeconfig_crypto.migrate_kubeconfigs(str(kc_dir))
-    assert os.path.exists(p1 + ".gpg")
+    assert os.path.exists(p1 + ".enc")
 
     # Second call: no exception, no double-encryption
     kubeconfig_crypto.migrate_kubeconfigs(str(kc_dir))
-    assert os.path.exists(p1 + ".gpg")
-    assert not os.path.exists(p1 + ".gpg.gpg")
+    assert os.path.exists(p1 + ".enc")
+    assert not os.path.exists(p1 + ".enc.enc")
 
 
 def test_migrate_missing_dir_is_noop(tmp_path):

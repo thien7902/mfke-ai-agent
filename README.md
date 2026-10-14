@@ -111,7 +111,7 @@ python -m src.bot.main
 |---------|-------------|
 | `/shell <command>` | Execute a shell command in the bot container (120s timeout, output in monospace code block) |
 | `/kshell` | List available encrypted kubeconfigs |
-| `/kshell <kc_name> <command>` | Decrypt `<kc_name>.gpg` to a 0600 tempfile, run `bash -c <command>` with `KUBECONFIG` set, shred the tempfile afterwards |
+| `/kshell <kc_name> <command>` | Decrypt `<kc_name>.enc` to a 0600 tempfile, run `bash -c <command>` with `KUBECONFIG` set, shred the tempfile afterwards |
 | `/grant <user_id> <permission>` | Request permission for a user |
 | `/revoke <user_id> <permission>` | Revoke a user's permission |
 | `/user_permissions <user_id>` | View another user's permissions |

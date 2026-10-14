@@ -423,8 +423,8 @@ class CommandHandler:
 
         Two modes:
           /kshell                         — list available kubeconfigs (shows the
-                                            .gpg filenames without the extension).
-          /kshell <kc_name> <command...>   — decrypt <kc_name>.gpg to a 0600 tempfile,
+                                            .enc filenames without the extension).
+          /kshell <kc_name> <command...>   — decrypt <kc_name>.enc to a 0600 tempfile,
                                             run `bash -c <command>` with KUBECONFIG
                                             set to the tempfile, then shred the
                                             tempfile. Returned like /shell: immediate
@@ -434,7 +434,7 @@ class CommandHandler:
         Admin-only. The kubeconfigs live encrypted in
         /root/.holmes/kubeconfig-only-admin-can-run/ — this is the only command
         (besides /reconcile) that decrypts them, so /shell cannot casually exfil
-        via `cat` or `kubectl --kubeconfig <file>.gpg`.
+        via `cat` or `kubectl --kubeconfig <file>.enc`.
         """
         if not update.message:
             return
@@ -452,7 +452,7 @@ class CommandHandler:
         if os.path.isdir(KCONFIG_DIR):
             kconfigs = sorted(
                 os.path.basename(p)[:-4]
-                for p in glob.glob(os.path.join(KCONFIG_DIR, "*.gpg"))
+                for p in glob.glob(os.path.join(KCONFIG_DIR, "*.enc"))
                 if os.path.isfile(p)
             )
         else:
@@ -496,9 +496,9 @@ class CommandHandler:
             return
 
         # Resolve the encrypted kubeconfig path. Accept either bare
-        # "han-gardener" or "han-gardener.gpg".
-        kc_stem = kc_name[:-4] if kc_name.endswith(".gpg") else kc_name
-        enc_path = os.path.join(KCONFIG_DIR, kc_stem + ".gpg")
+        # "han-gardener" or "han-gardener.enc".
+        kc_stem = kc_name[:-4] if kc_name.endswith(".enc") else kc_name
+        enc_path = os.path.join(KCONFIG_DIR, kc_stem + ".enc")
         if not os.path.exists(enc_path):
             await update.message.reply_text(
                 f"❌ Kubeconfig `{kc_stem}` not found.\n\n"
@@ -682,7 +682,7 @@ class CommandHandler:
           2. If found, annotate the shoot in that namespace with
              `gardener.cloud/operation=reconcile --overwrite`.
 
-        Kubeconfigs are stored as `.gpg` files (encrypted at rest with the
+        Kubeconfigs are stored as `.enc` files (encrypted at rest with the
         hardcoded passphrase in kubeconfig_crypto); each one is decrypted to
         a fresh /tmp tempfile for the duration of the kubectl calls and
         shredded in finally.
@@ -739,7 +739,7 @@ class CommandHandler:
         async def process_kubeconfig(kc: str) -> tuple[bool, list[str]]:
             """Lookup + annotate one kubeconfig. Returns (did_attempt, result_lines).
 
-            Decrypts `kc` (a `.gpg` file) to a 0600 tempfile, runs kubectl
+            Decrypts `kc` (a `.enc` file) to a 0600 tempfile, runs kubectl
             against the tempfile, then shreds the tempfile in finally. This
             is the on-demand decrypt path that keeps kubeconfigs encrypted
             at rest between invocations.
@@ -756,7 +756,7 @@ class CommandHandler:
             real problem is chmod failure, permission denied, or unreachable API.
             """
             kc_name = os.path.basename(kc)
-            if kc_name.endswith(".gpg"):
+            if kc_name.endswith(".enc"):
                 kc_name = kc_name[:-4]
             tmp_kc = decrypt_to_tempfile(kc)
             if tmp_kc is None:
@@ -872,9 +872,9 @@ class CommandHandler:
                 return
 
             # Step 2: encrypt any plaintext kubeconfigs at rest. Idempotent —
-            # a no-op on subsequent runs because the glob only picks up .gpg
-            # files. If this fails (gpg error, bad permissions), we proceed
-            # anyway: existing .gpg files are picked up below, plaintext ones
+            # a no-op on subsequent runs because the glob only picks up .enc
+            # files. If this fails (crypto error, bad permissions), we proceed
+            # anyway: existing .enc files are picked up below, plaintext ones
             # are silently dropped (operator notices via "No shoot matched").
             try:
                 migrate_kubeconfigs(KCONFIG_DIR)
@@ -882,7 +882,7 @@ class CommandHandler:
                 logger.warning("kubeconfig migration failed", error=str(migrate_err))
 
             kconfigs = sorted(
-                p for p in glob.glob(os.path.join(KCONFIG_DIR, "*.gpg"), recursive=False)
+                p for p in glob.glob(os.path.join(KCONFIG_DIR, "*.enc"), recursive=False)
                 if os.path.isfile(p)
             )
 
