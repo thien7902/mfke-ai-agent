@@ -96,8 +96,11 @@ python -m src.bot.main
 |---------|-------------|
 | `/start` | Welcome message and bot introduction |
 | `/help` | Show help information |
+| `/new` | Create a new forum topic (forum-enabled groups only) |
 | `/permissions` | View your current permissions |
-| `/clear` | Clear conversation history |
+| `/clear` | Clear conversation history in this topic |
+| `/stop` | Stop a pending batch or in-flight request in this topic |
+| `/ping` | Show the current agent status in this topic |
 | `/approve <request_id>` | Approve a permission request |
 | `/deny <request_id>` | Deny a permission request |
 
@@ -105,10 +108,16 @@ python -m src.bot.main
 
 | Command | Description |
 |---------|-------------|
+| `/shell <command>` | Execute a shell command in the bot container (120s timeout, output in monospace code block) |
+| `/reconcile <shoot_name>` | Trigger Gardener reconcile for a shoot across all kubeconfigs in `/root/.holmes/kubeconfig-only-admin-can-run` |
 | `/grant <user_id> <permission>` | Request permission for a user |
 | `/revoke <user_id> <permission>` | Revoke a user's permission |
 | `/user_permissions <user_id>` | View another user's permissions |
 | `/pending` | View pending permission requests |
+
+#### `/reconcile <shoot_name>` details
+
+Traverses every kubeconfig in `/root/.holmes/kubeconfig-only-admin-can-run/`, looks up the shoot's namespace via `kubectl get shoot <name> -A`, then annotates it with `gardenercloud.com/operation=reconcile --overwrite`. Reports per-kubeconfig results, or `No shoot matched <name>` if none found. `chmod 777` / `chmod 000` bracket the kubeconfig dir around each run.
 
 ### Available Permissions
 
