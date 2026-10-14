@@ -110,6 +110,13 @@ run_bot() {
     # but still shouldn't accumulate across restarts.
     rm -f /tmp/kc-* 2>/dev/null || true
 
+    # Encrypt any plaintext kubeconfigs at rest before the bot starts serving
+    # requests. Idempotent: a no-op if the files are already .enc. Doing this
+    # here (rather than lazily on first /reconcile) means Holmes tools can't
+    # exfiltrate plaintext kubeconfigs in the brief window before any user
+    # triggers /reconcile.
+    python3 -c 'from src.bot.utils.kubeconfig_crypto import migrate_kubeconfigs; migrate_kubeconfigs("/root/.holmes/kubeconfig-only-admin-can-run")' 2>&1 || true
+
     # Run the bot
     cd /app
     exec python3 -m src.bot.main
