@@ -59,9 +59,8 @@ def encrypt_file(plain_path: str) -> str:
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         logger.error(
-            "kubeconfig encryption failed",
-            path=plain_path,
-            stderr=stderr,
+            "kubeconfig encryption failed: path=%s stderr=%s",
+            plain_path, stderr,
         )
         return plain_path
 
@@ -111,9 +110,8 @@ def decrypt_to_tempfile(enc_path: str) -> str | None:
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         logger.error(
-            "kubeconfig decryption failed",
-            path=enc_path,
-            stderr=stderr,
+            "kubeconfig decryption failed: path=%s stderr=%s",
+            enc_path, stderr,
         )
         cleanup_tempfile(tmp_path)
         return None
@@ -134,7 +132,7 @@ def cleanup_tempfile(path: str) -> None:
         if os.path.exists(path):
             os.unlink(path)
     except Exception as e:
-        logger.warning("tempfile cleanup failed", path=path, error=str(e))
+        logger.warning("tempfile cleanup failed: path=%s error=%s", path, e)
 
 
 def migrate_kubeconfigs(kconfig_dir: str) -> None:
