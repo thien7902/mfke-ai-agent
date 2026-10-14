@@ -509,6 +509,10 @@ class CommandHandler:
 
         results: list[str] = []   # collected ✅/❌ lines
         any_lookup_attempt: bool = False  # did we try at least one kubeconfig?
+        lookup_errors: list[str] = []  # kubeconfig-level lookup errors, surfaced
+                                        # when nothing matched so the user can diagnose
+                                        # (e.g. chmod 777 didn't take, cert expired,
+                                        # cluster unreachable).
 
         async def process_kubeconfig(kc: str) -> tuple[bool, list[str]]:
             """Lookup + annotate one kubeconfig. Returns (did_attempt, result_lines).
@@ -518,6 +522,11 @@ class CommandHandler:
             `did_attempt` is True if at least one lookup was issued (even if the
             shoot wasn't found here) — used to distinguish "no match anywhere"
             from "no kubeconfigs at all".
+
+            If lookup fails (non-zero rc AND empty namespaces), records the error
+            output in lookup_errors so we can surface it in the "no match" reply
+            — otherwise the user gets a misleading "No shoot matched" when the
+            real problem is chmod failure, permission denied, or unreachable API.
             """
             kc_name = os.path.basename(kc)
             kc_q = shlex.quote(kc)
@@ -526,9 +535,18 @@ class CommandHandler:
 
             # Get contexts — if empty, fall back to no --context so kubectl
             # uses the default context (typically `garden` for Gardener kubeconfigs).
+            # get-contexts also implicitly reads the file, so a permission error
+            # on the kubeconfig (mode 000 after chmod failed) surfaces here.
             rc, ctx_out = await run_subprocess(
                 f"KUBECONFIG={kc_q} kubectl config get-contexts -o name"
             )
+            if rc != 0 and ctx_out.strip():
+                # get-contexts failed with an error message — record and skip
+                # this kubeconfig. Don't fall through to the empty-contexts
+                # branch below; that would try to reach an unreachable API
+                # with a kubeconfig we already know is broken.
+                lookup_errors.append(f"{kc_name}: {truncate(ctx_out.strip(), 400)}")
+                return did_attempt, lines
             contexts = [c.strip() for c in ctx_out.splitlines() if c.strip()] if rc == 0 else []
             if not contexts:
                 contexts = [None]
@@ -551,7 +569,16 @@ class CommandHandler:
                 namespaces = [n.strip() for n in ns_out.splitlines() if n.strip()] if rc == 0 else []
 
                 if not namespaces:
-                    # Shoot not found in this kubeconfig's garden — skip silently.
+                    # Shoot not found in this kubeconfig's garden. If rc != 0,
+                    # the lookup itself failed (not just "no match") — record
+                    # the error output so we can surface it later. If rc==0
+                    # and namespaces empty, the shoot genuinely doesn't exist
+                    # here — skip silently.
+                    if rc != 0 and ns_out.strip():
+                        err_ctx = f" (context: `{ctx}`)" if ctx else ""
+                        lookup_errors.append(
+                            f"{kc_name}{err_ctx}: {truncate(ns_out.strip(), 400)}"
+                        )
                     continue
 
                 for ns in namespaces:
@@ -585,8 +612,20 @@ class CommandHandler:
             return did_attempt, lines
 
         try:
-            # Step 1: chmod 777 so we can read the kubeconfigs
-            await run_subprocess(f"chmod -R 777 {KCONFIG_DIR}")
+            # Step 1: chmod 777 so we can read the kubeconfigs. The dir starts
+            # at mode 000 by design (locked down between invocations) — if chmod
+            # fails, every kubectl call below will fail with permission denied
+            # and the user only sees "No shoot matched", which is misleading.
+            # Surface the chmod failure explicitly instead.
+            rc, chmod_out = await run_subprocess(f"chmod -R 777 {KCONFIG_DIR}")
+            if rc != 0:
+                await self._edit_shell_reply(
+                    ack_message, f"reconcile {shoot_name}",
+                    f"❌ `chmod -R 777 {KCONFIG_DIR}` failed (exit {rc}):\n"
+                    f"```\n{truncate(chmod_out.strip(), 1000)}\n```",
+                    parse_mode="Markdown",
+                )
+                return
 
             kconfigs = sorted(
                 p for p in glob.glob(os.path.join(KCONFIG_DIR, "**"), recursive=False)
@@ -628,7 +667,22 @@ class CommandHandler:
                 reply_parts.extend(failures)
             reply = "\n".join(reply_parts)
         elif any_lookup_attempt:
-            reply = f"❌ No shoot matched `{shoot_name}` in any kubeconfig."
+            # No matches AND there were lookup errors — surface the errors so
+            # the user can diagnose (chmod didn't take, certs expired, cluster
+            # unreachable, etc.) instead of the opaque "No shoot matched" line.
+            if lookup_errors:
+                # Limit to first 5 kubeconfig errors to stay within Telegram's
+                # 4096-char cap; each line is truncated to ~400 chars above anyway.
+                sample = lookup_errors[:5]
+                extra = f"\n\n…and {len(lookup_errors) - 5} more" if len(lookup_errors) > 5 else ""
+                reply = (
+                    f"❌ No shoot matched `{shoot_name}` in any kubeconfig.\n\n"
+                    f"🔍 Lookup errors (showing {len(sample)} of {len(lookup_errors)}):"
+                    f"{extra}\n\n"
+                    + "\n\n".join(f"• {e}" for e in sample)
+                )
+            else:
+                reply = f"❌ No shoot matched `{shoot_name}` in any kubeconfig."
         else:
             reply = f"❌ No kubeconfigs found under `{KCONFIG_DIR}`."
 
