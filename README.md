@@ -101,6 +101,7 @@ python -m src.bot.main
 | `/clear` | Clear conversation history in this topic |
 | `/stop` | Stop a pending batch or in-flight request in this topic |
 | `/ping` | Show the current agent status in this topic |
+| `/reconcile <shoot_name>` | Trigger Gardener reconcile for a shoot across all kubeconfigs in `/root/.holmes/kubeconfig-only-admin-can-run` |
 | `/approve <request_id>` | Approve a permission request |
 | `/deny <request_id>` | Deny a permission request |
 
@@ -111,7 +112,6 @@ python -m src.bot.main
 | `/shell <command>` | Execute a shell command in the bot container (120s timeout, output in monospace code block) |
 | `/kshell` | List available encrypted kubeconfigs |
 | `/kshell <kc_name> <command>` | Decrypt `<kc_name>.gpg` to a 0600 tempfile, run `bash -c <command>` with `KUBECONFIG` set, shred the tempfile afterwards |
-| `/reconcile <shoot_name>` | Trigger Gardener reconcile for a shoot across all kubeconfigs in `/root/.holmes/kubeconfig-only-admin-can-run` |
 | `/grant <user_id> <permission>` | Request permission for a user |
 | `/revoke <user_id> <permission>` | Revoke a user's permission |
 | `/user_permissions <user_id>` | View another user's permissions |

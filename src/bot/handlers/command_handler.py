@@ -60,7 +60,8 @@ class CommandHandler:
             "/permissions - View your permissions\n"
             "/clear - Clear conversation history\n"
             "/stop - Stop a pending batch or in-flight request in this topic\n"
-            "/ping - Show the current agent status in this topic\n\n"
+            "/ping - Show the current agent status in this topic\n"
+            "/reconcile <shoot_name> - Trigger Gardener reconcile for a shoot\n\n"
             "Just send me a message to start chatting!"
         )
 
@@ -76,7 +77,6 @@ class CommandHandler:
                 "\n\n🔧 **Admin commands:**\n"
                 "/shell <command> - Execute a shell command in the bot container\n"
                 "/kshell [kc_name] <command> - Run command with a decrypted kubeconfig (/kshell alone to list)\n"
-                "/reconcile <shoot_name> - Trigger Gardener reconcile for a shoot\n"
                 "/grant <user_id> <permission> - Request permission for user\n"
                 "/revoke <user_id> <permission> - Revoke user permission\n"
                 "/user_permissions <user_id> - View user's permissions\n"
@@ -116,6 +116,7 @@ class CommandHandler:
             "/clear - Clear your conversation history\n"
             "/stop - Stop a pending batch or in-flight request in this topic\n"
             "/ping - Show the current agent status in this topic\n"
+            "/reconcile <shoot_name> - Trigger Gardener reconcile for a shoot\n"
         )
 
         if is_admin:
@@ -123,7 +124,6 @@ class CommandHandler:
                 "\n**Admin Commands:**\n"
                 "/shell <command> - Execute a shell command in the bot container\n"
                 "/kshell [kc_name] <command> - Run command with a decrypted kubeconfig (/kshell alone to list)\n"
-                "/reconcile <shoot_name> - Trigger Gardener reconcile for a shoot\n"
                 "/grant <user_id> <permission> - Request a permission for a user\n"
                 "/revoke <user_id> <permission> - Revoke a user's permission\n"
                 "/user_permissions <user_id> - View another user's permissions\n"
@@ -627,11 +627,11 @@ class CommandHandler:
         finally:
             cleanup_tempfile(tmp_kc)
 
-    @admin_only
+    @rate_limit
     async def reconcile_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /reconcile <shoot_name> — annotate the Gardener shoot for reconcile.
 
-        Admin-only. Works like /shell: replies immediately with an ack, then runs
+        Works like /shell: replies immediately with an ack, then runs
         in the background and edits the ack with the result.
 
         Flow:
