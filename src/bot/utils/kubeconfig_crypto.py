@@ -27,8 +27,21 @@ TMP_DIR = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
 
 
 def _run_gpg(args: list[str]) -> subprocess.CompletedProcess:
-    """Run gpg with the standard batch flags, return the CompletedProcess."""
-    cmd = [GPG_BINARY, "--batch", "--yes", "--passphrase", GPG_PASSPHRASE, *args]
+    """Run gpg with the standard batch flags, return the CompletedProcess.
+
+    --pinentry-mode loopback is required on a server without gpg-agent
+    installed — otherwise gpg tries to start the agent to prompt for the
+    passphrase and fails ("failed to start agent"). Loopback makes gpg
+    read the passphrase from the command-line flag directly.
+    """
+    cmd = [
+        GPG_BINARY,
+        "--batch",
+        "--yes",
+        "--pinentry-mode", "loopback",
+        "--passphrase", GPG_PASSPHRASE,
+        *args,
+    ]
     return subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -101,6 +114,7 @@ def decrypt_to_tempfile(enc_path: str) -> str | None:
         result = subprocess.run(
             [
                 GPG_BINARY, "--batch", "--yes",
+                "--pinentry-mode", "loopback",
                 "--passphrase", GPG_PASSPHRASE,
                 "--decrypt", enc_path,
             ],
