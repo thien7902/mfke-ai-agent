@@ -168,6 +168,12 @@ class TelegramBot:
             TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler.handle_message)
         )
 
+        # Document/photo uploads: download, extract text, and run through the
+        # same batch/streaming pipeline as text messages. See MessageHandler.handle_file.
+        self.application.add_handler(
+            TelegramMessageHandler(filters.Document.ALL | filters.PHOTO, msg_handler.handle_file)
+        )
+
         # Add update tracker to monitor connection health (runs before all other handlers)
         self.application.add_handler(
             TelegramMessageHandler(filters.ALL, self._update_tracker), group=-1

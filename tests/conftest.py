@@ -105,7 +105,9 @@ def mock_config():
     """Mock configuration for tests."""
     with patch("src.bot.utils.config.config") as mock, \
          patch("src.bot.utils.decorators.config", mock), \
-         patch("src.bot.handlers.message_handler.config", mock):
+         patch("src.bot.handlers.message_handler.config", mock), \
+         patch("src.bot.utils.file_extractor.config", mock), \
+         patch("src.bot.services.vision_service.config", mock):
         mock.telegram_bot_token = "test_token"
         mock.mongodb_uri = "mongodb://localhost:27017"
         mock.mongodb_database = "test_db"
@@ -118,6 +120,9 @@ def mock_config():
         mock.message_batch_quiet_period_seconds = 10
         mock.message_batch_max_wait_seconds = 30
         mock.message_batch_max_messages = 20
+        mock.file_upload_max_text_bytes = 10 * 1024 * 1024
+        mock.file_upload_tmp_dir = "/tmp/bot_uploads_test"
+        mock.vision_model = None
         yield mock
 
 

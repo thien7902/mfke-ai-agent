@@ -18,6 +18,12 @@ from src.bot.models.user import UserPermission
 from src.bot.models.conversation import Conversation
 from src.bot.utils.config import config
 from src.bot.utils.telegram_helpers import send_long_message, edit_or_send_long_message
+from src.bot.utils.file_extractor import (
+    extract_text_from_file,
+    extract_text_from_image,
+    IMAGE_SENTINEL,
+)
+from src.bot.services import vision_service
 
 logger = structlog.get_logger(__name__)
 
@@ -204,6 +210,17 @@ class MessageHandler:
         for k in keys_to_remove:
             del _processed_messages[k]
 
+        await self._enqueue_text(update, context, message_text)
+
+    async def _enqueue_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str):
+        """Validate chat context and enqueue a text turn into the per-topic batch.
+
+        Shared by `handle_message` (plain text/sticker/etc.) and `handle_file`
+        (file uploads whose contents have been extracted to text).
+        """
+        user = update.effective_user
+        user_id = user.id
+
         # Get chat and topic info
         chat = update.effective_chat
         chat_id = chat.id
@@ -231,6 +248,118 @@ class MessageHandler:
 
         # Batch per topic: rapid consecutive messages combine into one Holmes request.
         await self._enqueue_for_batch(update, context, chat_id, topic_id, user, message_text)
+
+    async def handle_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle a document or photo upload: download, extract text, enqueue as a text turn.
+
+        Images go through a vision-model pre-step (if VISION_MODEL is set) before
+        falling back to OCR. All other supported types are parsed directly.
+        The extracted text is combined with the user's caption and handed to
+        `_enqueue_text`, which reuses the normal batching/streaming/approval flow.
+        """
+        if not update.message:
+            return
+
+        # Deduplication: same logic as handle_message — /stop and /ping may
+        # otherwise double-process the same upload.
+        message_id = update.message.message_id
+        current_time = time.time()
+        if message_id in _processed_messages:
+            elapsed = current_time - _processed_messages[message_id]
+            if elapsed < _MESSAGE_PROCESSING_TTL:
+                logger.warning("Duplicate file message ignored", message_id=message_id, elapsed=elapsed)
+                return
+        _processed_messages[message_id] = current_time
+        cutoff = current_time - _MESSAGE_PROCESSING_TTL
+        for k in [k for k, v in _processed_messages.items() if v < cutoff]:
+            del _processed_messages[k]
+
+        # Resolve attachment + caption. Document takes precedence; fall back to
+        # the largest photo size. Photos arrive as a list of decreasing resolutions.
+        doc = update.message.document
+        if doc:
+            file_id = doc.file_id
+            filename = doc.file_name or "upload"
+            file_size = doc.file_size or 0
+            mime = doc.mime_type
+        elif update.message.photo:
+            # Largest size is last in the array
+            photo = update.message.photo[-1]
+            file_id = photo.file_id
+            filename = f"photo_{photo.file_unique_id}.jpg"
+            file_size = photo.file_size or 0
+            mime = "image/jpeg"
+        else:
+            return
+
+        caption = update.message.caption or ""
+
+        # Reject very large raw uploads (Telegram bot limit is 20 MB) — extracting
+        # text from >20 MB files would likely blow the LLM context anyway.
+        if file_size and file_size > 20 * 1024 * 1024:
+            await update.message.reply_text(
+                "❌ File too large. Please keep uploads under 20 MB.",
+                message_thread_id=update.message.message_thread_id or None,
+            )
+            return
+
+        # Ensure tmp dir exists
+        import os as _os
+        import uuid as _uuid
+        _os.makedirs(config.file_upload_tmp_dir, exist_ok=True)
+        ext = _os.path.splitext(filename)[1]
+        tmp_path = _os.path.join(config.file_upload_tmp_dir, f"{_uuid.uuid4().hex}{ext}")
+
+        try:
+            tg_file = await context.bot.get_file(file_id)
+            await tg_file.download_to_drive(tmp_path)
+
+            # Run extraction in a thread so PDF/DOCX/XLSX/OCR work doesn't block
+            # the event loop. `extract_text_from_file` returns IMAGE_SENTINEL for
+            # images; the handler then routes to vision_model → OCR fallback.
+            from pathlib import Path as _Path
+            extracted = await asyncio.to_thread(extract_text_from_file, _Path(tmp_path), mime)
+
+            if extracted == IMAGE_SENTINEL:
+                # Vision pre-step if configured, else OCR directly.
+                if config.vision_model:
+                    try:
+                        vision_text = await asyncio.to_thread(vision_service.describe_image, _Path(tmp_path))
+                    except Exception as e:
+                        logger.warning("Vision pre-step raised; falling back to OCR", error=str(e))
+                        vision_text = ""
+                    if vision_text:
+                        extracted = vision_text
+                    else:
+                        extracted = await asyncio.to_thread(extract_text_from_image, _Path(tmp_path))
+                else:
+                    extracted = await asyncio.to_thread(extract_text_from_image, _Path(tmp_path))
+
+            if not extracted or not extracted.strip():
+                await update.message.reply_text(
+                    f"❌ Couldn't extract text from `{filename}`. supported: txt/code, pdf, docx, xlsx, png/jpg/webp (image OCR or vision).",
+                    message_thread_id=update.message.message_thread_id or None,
+                    parse_mode="Markdown",
+                )
+                return
+
+            combined = f"{caption}\n\n--- File: {filename} ---\n{extracted}".strip() if caption else f"--- File: {filename} ---\n{extracted}"
+            await self._enqueue_text(update, context, combined)
+        except Exception as e:
+            logger.error("File upload handling failed", message_id=message_id, filename=filename, error=str(e))
+            try:
+                await update.message.reply_text(
+                    "❌ Failed to process the uploaded file. Please try again.",
+                    message_thread_id=update.message.message_thread_id or None,
+                )
+            except Exception:
+                pass
+        finally:
+            try:
+                if _os.path.exists(tmp_path):
+                    _os.remove(tmp_path)
+            except Exception:
+                pass
 
     async def _enqueue_for_batch(
         self,

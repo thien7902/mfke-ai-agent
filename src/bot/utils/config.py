@@ -39,6 +39,15 @@ class Config:
     message_batch_max_wait_seconds: int = 30
     message_batch_max_messages: int = 20
 
+    # File uploads: max extracted text fed to Holmes, tmp dir for downloads,
+    # and an optional vision model name (same provider as main LLM) used as
+    # a pre-step for image uploads. When unset, images fall back to OCR only.
+    # Default is Qwen3.8-27B; override via VISION_MODEL env var if your
+    # OpenAI-compatible endpoint expects a different model ID.
+    file_upload_max_text_bytes: int = 10 * 1024 * 1024
+    file_upload_tmp_dir: str = "/tmp/bot_uploads"
+    vision_model: Optional[str] = "Qwen3.8-27B"
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -60,6 +69,9 @@ def load_config() -> Config:
         message_batch_quiet_period_seconds=int(os.getenv("MESSAGE_BATCH_QUIET_PERIOD_SECONDS", "10")),
         message_batch_max_wait_seconds=int(os.getenv("MESSAGE_BATCH_MAX_WAIT_SECONDS", "30")),
         message_batch_max_messages=int(os.getenv("MESSAGE_BATCH_MAX_MESSAGES", "20")),
+        file_upload_max_text_bytes=int(os.getenv("FILE_UPLOAD_MAX_TEXT_BYTES", str(10 * 1024 * 1024))),
+        file_upload_tmp_dir=os.getenv("FILE_UPLOAD_TMP_DIR", "/tmp/bot_uploads"),
+        vision_model=os.getenv("VISION_MODEL") or "Qwen3.8-27B",
     )
 
 

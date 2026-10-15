@@ -27,6 +27,8 @@ RUN apt-get update && \
         procps \
         ttyd \
         tzdata \
+        tesseract-ocr \
+        tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade pip and install pipx
