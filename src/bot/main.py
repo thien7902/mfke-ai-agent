@@ -1,6 +1,7 @@
 """Main bot entry point."""
 import asyncio
 import logging
+import os
 import signal
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -49,6 +50,39 @@ logging.basicConfig(
 )
 
 logger = structlog.get_logger(__name__)
+
+# Fatal polling errors: PTB logs these via the `telegram.ext.Updater` logger
+# and never routes them through application.add_error_handler. So we attach
+# a logging handler on that logger to detect them and exit — Docker/K8s
+# restarts the container with a fresh network/TLS environment. Same restart
+# semantics as the 90-min idle watchdog at main.py:285.
+FATAL_POLLING_ERRORS = (
+    'certificate_verify_failed',
+    'unable to get local issuer certificate',
+    'ssl: handshake failed',
+    'tls handshake',
+)
+
+
+class FatalPollingDetector(logging.Handler):
+    """Exit the process when PTB logs a fatal TLS/certificate error.
+
+    A missing CA cert or broken TLS handshake is not transient — a fresh
+    container is the only useful recovery.
+    """
+
+    def emit(self, record):
+        try:
+            msg = record.getMessage().lower()
+        except Exception:
+            return
+        if any(sig in msg for sig in FATAL_POLLING_ERRORS):
+            logger.error(
+                "Fatal TLS/certificate error in PTB Updater - exiting for container restart",
+                error=record.getMessage(),
+            )
+            health_checker.set_bot_alive(False)
+            os._exit(1)
 
 
 class TelegramBot:
@@ -158,18 +192,6 @@ class TelegramBot:
         # starts fresh if polling sticks again later.
         self.polling_restarts = 0
 
-    # Fatal polling errors: container restart is the only useful recovery.
-    # These are not transient — a missing CA cert or broken TLS handshake
-    # persists across in-place polling restarts, so mark the bot not alive
-    # and exit. Docker's `restart: unless-stopped` / K8s liveness probe
-    # starts a fresh container with a fresh network/TLS environment.
-    FATAL_POLLING_ERRORS = (
-        'certificate_verify_failed',
-        'unable to get local issuer certificate',
-        'ssl: handshake failed',
-        'tls handshake',
-    )
-
     async def _error_handler(self, update: object, context: "ContextTypes.DEFAULT_TYPE"):
         """Global error handler with connection recovery."""
         error_str = str(context.error)
@@ -177,19 +199,9 @@ class TelegramBot:
 
         error_lower = error_str.lower()
 
-        # Fatal TLS/SSL/certificate errors — exit so the container restarts.
-        # Runs inside PTB's polling task, where SystemExit/raise gets swallowed
-        # by asyncio as a discarded task exception. os._exit bypasses that.
-        if any(sig in error_lower for sig in self.FATAL_POLLING_ERRORS):
-            logger.error(
-                "Fatal TLS/certificate error during polling - exiting for container restart",
-                error=error_str,
-            )
-            health_checker.set_bot_alive(False)
-            import os
-            os._exit(1)
-
         # Recoverable network errors — try to restore MongoDB and keep going.
+        # Fatal TLS/cert errors during polling are caught by FatalPollingDetector
+        # (PTB routes polling errors to its own logger, not this handler).
         if any(keyword in error_lower for keyword in [
             'connection', 'timeout', 'network', 'unreachable',
         ]):
@@ -246,6 +258,11 @@ class TelegramBot:
 
 async def main():
     """Main entry point."""
+    # Attach the fatal-polling detector to PTB's Updater logger. Polling errors
+    # (SSL/cert/TLS handshake failures during getUpdates) are logged here and
+    # never reach application.add_error_handler, so we hook the logger stream.
+    logging.getLogger("telegram.ext.Updater").addHandler(FatalPollingDetector())
+
     # Start health check server first
     await health_checker.start()
 
