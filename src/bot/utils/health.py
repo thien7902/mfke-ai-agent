@@ -62,12 +62,14 @@ class HealthChecker:
 
     async def liveness_handler(self, request: web.Request) -> web.Response:
         """Liveness probe - only checks if the bot process is alive."""
-        # This endpoint should always return 200 if the process is running
-        # Kubernetes will restart the container if this fails
+        # Return 503 when the bot is not alive so K8s/Docker restarts the
+        # container. Previously this always returned 200, making the probe
+        # useless as a restart trigger.
+        status_code = 200 if self.status.bot_alive else 503
         return web.json_response({
-            "status": "alive",
+            "status": "alive" if self.status.bot_alive else "not_alive",
             "bot": self.status.bot_alive,
-        })
+        }, status=status_code)
 
     async def readiness_handler(self, request: web.Request) -> web.Response:
         """Readiness probe - checks if bot can handle requests."""

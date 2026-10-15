@@ -158,15 +158,40 @@ class TelegramBot:
         # starts fresh if polling sticks again later.
         self.polling_restarts = 0
 
+    # Fatal polling errors: container restart is the only useful recovery.
+    # These are not transient — a missing CA cert or broken TLS handshake
+    # persists across in-place polling restarts, so mark the bot not alive
+    # and exit. Docker's `restart: unless-stopped` / K8s liveness probe
+    # starts a fresh container with a fresh network/TLS environment.
+    FATAL_POLLING_ERRORS = (
+        'certificate_verify_failed',
+        'unable to get local issuer certificate',
+        'ssl: handshake failed',
+        'tls handshake',
+    )
+
     async def _error_handler(self, update: object, context: "ContextTypes.DEFAULT_TYPE"):
         """Global error handler with connection recovery."""
         error_str = str(context.error)
         logger.error("Unhandled error", error=error_str, update=str(update)[:200])
 
-        # Check for network/connection errors and attempt recovery
-        if any(keyword in error_str.lower() for keyword in [
+        error_lower = error_str.lower()
+
+        # Fatal TLS/SSL/certificate errors — exit so the container restarts.
+        # Runs inside PTB's polling task, where SystemExit/raise gets swallowed
+        # by asyncio as a discarded task exception. os._exit bypasses that.
+        if any(sig in error_lower for sig in self.FATAL_POLLING_ERRORS):
+            logger.error(
+                "Fatal TLS/certificate error during polling - exiting for container restart",
+                error=error_str,
+            )
+            health_checker.set_bot_alive(False)
+            import os
+            os._exit(1)
+
+        # Recoverable network errors — try to restore MongoDB and keep going.
+        if any(keyword in error_lower for keyword in [
             'connection', 'timeout', 'network', 'unreachable',
-            'ssl', 'certificate', 'verify_failed', 'handshake',
         ]):
             logger.warning("Detected connection error, checking connections...")
             try:
