@@ -212,11 +212,13 @@ class MessageHandler:
 
         await self._enqueue_text(update, context, message_text)
 
-    async def _enqueue_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str):
+    async def _enqueue_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str, force_flush: bool = False):
         """Validate chat context and enqueue a text turn into the per-topic batch.
 
         Shared by `handle_message` (plain text/sticker/etc.) and `handle_file`
-        (file uploads whose contents have been extracted to text).
+        (file uploads whose contents have been extracted to text). Set
+        `force_flush=True` to skip the debounce quiet window and dispatch
+        immediately (used for file/image uploads).
         """
         user = update.effective_user
         user_id = user.id
@@ -247,7 +249,7 @@ class MessageHandler:
         logger.info("Received message", user_id=user_id, chat_id=chat_id, topic_id=topic_id, text=message_text[:50])
 
         # Batch per topic: rapid consecutive messages combine into one Holmes request.
-        await self._enqueue_for_batch(update, context, chat_id, topic_id, user, message_text)
+        await self._enqueue_for_batch(update, context, chat_id, topic_id, user, message_text, force_flush=force_flush)
 
     async def handle_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle a document or photo upload: download, extract text, enqueue as a text turn.
@@ -344,7 +346,10 @@ class MessageHandler:
                 return
 
             combined = f"{caption}\n\n--- File: {filename} ---\n{extracted}".strip() if caption else f"--- File: {filename} ---\n{extracted}"
-            await self._enqueue_text(update, context, combined)
+            # File uploads skip the debounce quiet window — extracted text is
+            # already a complete turn; no benefit to waiting for more messages
+            # to batch together.
+            await self._enqueue_text(update, context, combined, force_flush=True)
         except Exception as e:
             logger.error("File upload handling failed", message_id=message_id, filename=filename, error=str(e))
             try:
@@ -369,6 +374,7 @@ class MessageHandler:
         topic_id: int,
         user,
         message_text: str,
+        force_flush: bool = False,
     ):
         """Accumulate messages per topic and flush after a quiet period (debounce)."""
         key = (chat_id, topic_id)
@@ -392,6 +398,12 @@ class MessageHandler:
         if batch.timer is not None:
             batch.timer.cancel()
             batch.timer = None
+
+        # File/image uploads skip the debounce quiet window — extracted text
+        # is already a complete turn; no benefit to waiting for more messages.
+        if force_flush:
+            await self._flush_batch(context, chat_id, topic_id)
+            return
 
         force_flush = (
             getattr(config, "test_mode", False)

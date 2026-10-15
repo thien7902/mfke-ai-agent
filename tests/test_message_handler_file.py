@@ -100,17 +100,19 @@ async def test_handle_file_text_upload_enqueues_text(msg_handler, tmp_path, monk
     context = _mock_context(tmp_path)
 
     enqueue_calls = []
-    async def fake_enqueue_text(upd, ctx, text):
-        enqueue_calls.append(text)
+    async def fake_enqueue_text(upd, ctx, text, **kwargs):
+        enqueue_calls.append((text, kwargs))
     msg_handler._enqueue_text = fake_enqueue_text
 
     await msg_handler.handle_file(update, context)
 
     assert len(enqueue_calls) == 1
-    combined = enqueue_calls[0]
+    combined, kwargs = enqueue_calls[0]
     assert "summarize this" in combined
     assert "--- File: note.txt ---" in combined
     assert "hello world, this is extracted text" in combined
+    # File uploads must skip the debounce quiet window.
+    assert kwargs.get("force_flush") is True
     # Tmp file cleaned up
     leftover = list(pathlib.Path(str(tmp_path)).glob("*"))
     assert leftover == []
@@ -135,7 +137,7 @@ async def test_handle_file_unsupported_type_replies_error(msg_handler, tmp_path,
     context.bot.get_file = AsyncMock(side_effect=_get_file)
 
     called = False
-    async def fake_enqueue_text(upd, ctx, text):
+    async def fake_enqueue_text(upd, ctx, text, **kwargs):
         nonlocal called
         called = True
     msg_handler._enqueue_text = fake_enqueue_text
@@ -167,7 +169,7 @@ async def test_handle_file_image_routes_through_vision(msg_handler, tmp_path, mo
     context.bot.get_file = AsyncMock(side_effect=_get_file)
 
     enqueued = []
-    async def fake_enqueue_text(upd, ctx, text):
+    async def fake_enqueue_text(upd, ctx, text, **kwargs):
         enqueued.append(text)
     msg_handler._enqueue_text = fake_enqueue_text
 
@@ -200,7 +202,7 @@ async def test_handle_file_image_falls_back_to_ocr_on_vision_failure(msg_handler
     context.bot.get_file = AsyncMock(side_effect=_get_file)
 
     enqueued = []
-    async def fake_enqueue_text(upd, ctx, text):
+    async def fake_enqueue_text(upd, ctx, text, **kwargs):
         enqueued.append(text)
     msg_handler._enqueue_text = fake_enqueue_text
 
@@ -231,7 +233,7 @@ async def test_handle_file_image_straight_to_ocr_when_no_vision_model(msg_handle
     context.bot.get_file = AsyncMock(side_effect=_get_file)
 
     enqueued = []
-    async def fake_enqueue_text(upd, ctx, text):
+    async def fake_enqueue_text(upd, ctx, text, **kwargs):
         enqueued.append(text)
     msg_handler._enqueue_text = fake_enqueue_text
 
@@ -249,7 +251,7 @@ async def test_handle_file_too_large_rejected_early(msg_handler, tmp_path, monke
     context = _mock_context(tmp_path)
 
     enqueued = []
-    async def fake_enqueue_text(upd, ctx, text):
+    async def fake_enqueue_text(upd, ctx, text, **kwargs):
         enqueued.append(text)
     msg_handler._enqueue_text = fake_enqueue_text
 
@@ -267,7 +269,7 @@ async def test_handle_file_deduplicates(msg_handler, tmp_path, monkeypatch):
     context = _mock_context(tmp_path)
 
     count = 0
-    async def fake_enqueue_text(upd, ctx, text):
+    async def fake_enqueue_text(upd, ctx, text, **kwargs):
         nonlocal count
         count += 1
     msg_handler._enqueue_text = fake_enqueue_text
