@@ -1,5 +1,6 @@
 """Message Handler - Process regular messages through Holmes."""
 import asyncio
+import base64
 import logging
 import random
 import structlog
@@ -26,6 +27,16 @@ from src.bot.utils.file_extractor import (
 from src.bot.services import vision_service
 
 logger = structlog.get_logger(__name__)
+
+
+def _build_data_url(path: str, mime: str) -> str:
+    """Read a file from disk and return a `data:<mime>;base64,...` URL suitable
+    for `image_url` content blocks sent to OpenAI / Anthropic vision endpoints.
+    """
+    import os
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
 
 # In-memory cache to prevent duplicate topic creation (user_id -> timestamp)
 _recent_topic_creation: dict[int, float] = {}
@@ -57,6 +68,7 @@ class _PendingBatch:
     updates: list = field(default_factory=list)   # Telegram Update objects for reply threading
     texts: list = field(default_factory=list)
     user_ids: list = field(default_factory=list)
+    images: list = field(default_factory=list)    # OpenAI vision image dicts to attach
     timer: Optional[asyncio.TimerHandle] = None
     started_at: float = 0.0
     cancel_event: Optional[threading.Event] = None  # set only while a dispatch is in flight
@@ -212,13 +224,23 @@ class MessageHandler:
 
         await self._enqueue_text(update, context, message_text)
 
-    async def _enqueue_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str, force_flush: bool = False):
+    async def _enqueue_text(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        message_text: str,
+        force_flush: bool = False,
+        images: Optional[list] = None,
+    ):
         """Validate chat context and enqueue a text turn into the per-topic batch.
 
         Shared by `handle_message` (plain text/sticker/etc.) and `handle_file`
         (file uploads whose contents have been extracted to text). Set
         `force_flush=True` to skip the debounce quiet window and dispatch
-        immediately (used for file/image uploads).
+        immediately (used for file/image uploads). `images` (optional list of
+        OpenAI vision image dicts) attaches the image to the user message so
+        a multimodal main LLM can read it directly; text-only main LLMs should
+        not pass `images` (they should extract text first).
         """
         user = update.effective_user
         user_id = user.id
@@ -249,7 +271,10 @@ class MessageHandler:
         logger.info("Received message", user_id=user_id, chat_id=chat_id, topic_id=topic_id, text=message_text[:50])
 
         # Batch per topic: rapid consecutive messages combine into one Holmes request.
-        await self._enqueue_for_batch(update, context, chat_id, topic_id, user, message_text, force_flush=force_flush)
+        await self._enqueue_for_batch(
+            update, context, chat_id, topic_id, user, message_text,
+            force_flush=force_flush, images=images,
+        )
 
     async def handle_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle a document or photo upload: download, extract text, enqueue as a text turn.
@@ -316,13 +341,38 @@ class MessageHandler:
             tg_file = await context.bot.get_file(file_id)
             await tg_file.download_to_drive(tmp_path)
 
-            # Run extraction in a thread so PDF/DOCX/XLSX/OCR work doesn't block
-            # the event loop. `extract_text_from_file` returns IMAGE_SENTINEL for
-            # images; the handler then routes to vision_model → OCR fallback.
             from pathlib import Path as _Path
-            extracted = await asyncio.to_thread(extract_text_from_file, _Path(tmp_path), mime)
 
-            if extracted == IMAGE_SENTINEL:
+            # Fast path: if the main Holmes LLM accepts image_url content
+            # blocks (gpt-4o, claude-3-5-sonnet, qwen-vl-max, ...), attach the
+            # raw image bytes directly to the user message and let the main
+            # model read it — skip the vision pre-step / OCR entirely. Falls
+            # through to the extraction path when the flag is off or the file
+            # isn't an image.
+            extract_preview = await asyncio.to_thread(extract_text_from_file, _Path(tmp_path), mime)
+            is_image = extract_preview == IMAGE_SENTINEL
+
+            if is_image and config.main_model_supports_images:
+                try:
+                    data_url = await asyncio.to_thread(_build_data_url, tmp_path, mime or "image/jpeg")
+                except Exception as e:
+                    logger.warning("Failed to build data URL for multimodal path; falling back to extraction", error=str(e))
+                    data_url = None
+
+                if data_url:
+                    # Caption becomes the user-visible text; image is attached
+                    # so the main model can inspect it directly. No "--- File ---"
+                    # wrapper needed since the model sees the image itself.
+                    combined = caption or "(_image uploaded — please inspect)"
+                    await self._enqueue_text(
+                        update, context, combined, force_flush=True,
+                        images=[{"url": data_url}],
+                    )
+                    return
+                # else: fall through to extraction
+
+            extracted = extract_preview
+            if is_image:
                 # Vision pre-step if configured, else OCR directly.
                 if config.vision_model:
                     try:
@@ -375,6 +425,7 @@ class MessageHandler:
         user,
         message_text: str,
         force_flush: bool = False,
+        images: Optional[list] = None,
     ):
         """Accumulate messages per topic and flush after a quiet period (debounce)."""
         key = (chat_id, topic_id)
@@ -393,6 +444,8 @@ class MessageHandler:
         batch.updates.append(update)
         batch.texts.append(message_text)
         batch.user_ids.append(user.id)
+        if images:
+            batch.images.extend(images)
 
         # Cancel any previously armed timer (debounce: reset the quiet window).
         if batch.timer is not None:
@@ -435,6 +488,7 @@ class MessageHandler:
         updates = list(batch.updates)
         texts = list(batch.texts)
         user_ids = list(batch.user_ids)
+        images = list(batch.images) if batch.images else []
         if batch.timer is not None:
             batch.timer.cancel()
         # Mark in-flight by setting cancel_event; /stop checks it.
@@ -476,11 +530,13 @@ class MessageHandler:
                     await self._handle_streaming_response(
                         context, first_update, conversation, user_permissions,
                         combined_text, chat_id, topic_id, cancel_event=cancel_event,
+                        images=images,
                     )
                 else:
                     await self._handle_regular_response(
                         context, first_update, conversation, user_permissions,
                         combined_text, chat_id, topic_id, cancel_event=cancel_event,
+                        images=images,
                     )
 
                 # If the user stopped mid-flight, surface it on the saved conversation.
@@ -831,6 +887,7 @@ class MessageHandler:
         chat_id: int,
         topic_id: int,
         cancel_event: Optional[threading.Event] = None,
+        images: Optional[list] = None,
     ):
         """Handle non-streaming response.
 
@@ -852,6 +909,7 @@ class MessageHandler:
                 chat_id=chat_id,
                 topic_id=topic_id,
                 cancel_event=cancel_event,
+                images=images,
             )
             async for event in async_gen:
                 event_type = event.get("type", "unknown")
@@ -918,6 +976,7 @@ class MessageHandler:
         chat_id: int,
         topic_id: int,
         cancel_event: Optional[threading.Event] = None,
+        images: Optional[list] = None,
     ):
         """Handle streaming response with clean task progress updates."""
         import asyncio
@@ -949,6 +1008,7 @@ class MessageHandler:
                 chat_id=chat_id,
                 topic_id=topic_id,
                 cancel_event=cancel_event,
+                images=images,
             )
             _set_investigation_status(chat_id, topic_id, current_status, tasks=current_tasks, last_tool=last_tool)
 

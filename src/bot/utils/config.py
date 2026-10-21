@@ -48,6 +48,13 @@ class Config:
     file_upload_tmp_dir: str = "/tmp/bot_uploads"
     vision_model: Optional[str] = "Qwen3.8-27B"
 
+    # Set True when the main Holmes LLM accepts OpenAI-style image_url content
+    # blocks (e.g. gpt-4o, claude-3-5-sonnet, qwen-vl-max). When True, image
+    # uploads skip the vision pre-step / OCR and are attached directly to the
+    # user message so the main model can read them. When False (default, safe),
+    # images go through vision_service → OCR fallback into plain text.
+    main_model_supports_images: bool = False
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -72,6 +79,7 @@ def load_config() -> Config:
         file_upload_max_text_bytes=int(os.getenv("FILE_UPLOAD_MAX_TEXT_BYTES", str(10 * 1024 * 1024))),
         file_upload_tmp_dir=os.getenv("FILE_UPLOAD_TMP_DIR", "/tmp/bot_uploads"),
         vision_model=os.getenv("VISION_MODEL") or "Qwen3.8-27B",
+        main_model_supports_images=os.getenv("MAIN_MODEL_SUPPORTS_IMAGES", "").lower() in ("1", "true", "yes", "on"),
     )
 
 

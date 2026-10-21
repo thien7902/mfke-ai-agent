@@ -123,6 +123,7 @@ def mock_config():
         mock.file_upload_max_text_bytes = 10 * 1024 * 1024
         mock.file_upload_tmp_dir = "/tmp/bot_uploads_test"
         mock.vision_model = None
+        mock.main_model_supports_images = False
         yield mock
 
 

@@ -600,7 +600,14 @@ class HolmesService:
         }
 
     def _convert_messages_to_holmes_format(self, messages: List[Message]) -> List[Dict[str, Any]]:
-        """Convert our Message model to Holmes message format (with tool_calls, tool_call_id, name)."""
+        """Convert our Message model to Holmes message format (with tool_calls, tool_call_id, name).
+
+        When a user message carries `metadata["images"]`, the `content` becomes
+        an OpenAI vision content array (text + image_url blocks) so the main
+        LLM can read the image directly. Images are stored as data URLs or
+        http(s) URLs in `metadata["images"]` (list of dicts with `url`,
+        optional `detail`, optional `format`).
+        """
         holmes_messages = []
         for msg in messages:
             holmes_msg = {
@@ -613,6 +620,22 @@ class HolmesService:
                 holmes_msg["tool_calls"] = msg.tool_calls
             if msg.tool_call_id:
                 holmes_msg["tool_call_id"] = msg.tool_call_id
+
+            # Multimodal user message: replace string content with content
+            # array when images are attached. Tool/assistant messages keep
+            # plain string content.
+            if msg.role == "user" and msg.metadata.get("images"):
+                try:
+                    from holmes.core.prompt import build_vision_content
+                    holmes_msg["content"] = build_vision_content(
+                        msg.content or "", msg.metadata["images"]
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to build vision content; falling back to text",
+                        error=str(e),
+                    )
+
             holmes_messages.append(holmes_msg)
         return holmes_messages
 
@@ -775,6 +798,7 @@ class HolmesService:
         chat_id: int = 0,
         topic_id: int = 0,
         cancel_event: Optional[threading.Event] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
     ) -> str | AsyncGenerator[str, None]:
         """
         Send a message to Holmes and get response.
@@ -790,14 +814,23 @@ class HolmesService:
             topic_id: Topic ID for approval messages
             cancel_event: Optional threading.Event; when set, Holmes aborts between
                 iterations and cancels running tools (see ToolCallingLLM cancel_event).
+            images: Optional list of image dicts (OpenAI vision format: `{"url": ...,
+                "detail"?: ..., "format"?: ...}`). When attached, the user message
+                becomes a multimodal content array so the main LLM reads the image
+                directly. Caller must ensure the main model accepts image_url blocks
+                (see Config.main_model_supports_images).
 
         Returns:
             Response text or async generator for streaming
         """
         await self.initialize()
 
-        # Add user message to conversation
+        # Add user message to conversation. Images are persisted on
+        # metadata["images"] so history replay rehydrates the multimodal
+        # content array (see _convert_messages_to_holmes_format).
         user_msg = Message(role="user", content=user_message)
+        if images:
+            user_msg.metadata["images"] = images
         conversation.add_message(user_msg)
 
         # Convert to Holmes format using build_initial_ask_messages for proper formatting with system prompt additions
