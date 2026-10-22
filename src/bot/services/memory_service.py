@@ -200,8 +200,23 @@ class MemoryService:
         """Ingest a text blob as an episode. Returns the episode uuid, or None
         when memory is disabled or ingest fails.
         """
-        if not bot_config.graphiti_memory_enabled or not self._initialized:
+        if not bot_config.graphiti_memory_enabled:
+            logger.warning("add_episode_called_but_disabled")
             return None
+        if not self._initialized:
+            # Initialize failed at startup — main.py:120 logged it once with
+            # memory_init_failed_bot_continues, but every add_episode call
+            # silently returns None which makes /addmemory failures invisible.
+            # Log here too so the user sees the init failure linked to their
+            # add request (not just a generic "failed to add" from the command).
+            logger.error(
+                "add_episode_called_but_not_initialized",
+                hint="MemoryService.initialize() failed at startup — "
+                     "check earlier 'memory_init_failed_bot_continues' log "
+                     "for the cause (FalkorDB unreachable, embedder env "
+                     "missing, graphiti_core import error, etc.)",
+            )
+            raise RuntimeError("MemoryService is not initialized")
         if not text or not text.strip():
             return None
 
@@ -236,8 +251,9 @@ class MemoryService:
                 text_preview_head=text[:200],
                 text_preview_tail=text[-200:] if len(text) > 200 else "",
                 exc_info=True,
+                source=source_description,
             )
-            return None
+            raise
 
     async def close(self) -> None:
         if self._graphiti is not None:

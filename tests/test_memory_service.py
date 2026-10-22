@@ -167,14 +167,27 @@ async def test_add_episode_empty_text_returns_none():
 
 
 @pytest.mark.asyncio
-async def test_add_episode_swallows_errors():
+async def test_add_episode_raises_on_ingest_failure():
+    """add_episode now re-raises so callers see the actual exception."""
     with patch("src.bot.services.memory_service.bot_config") as cfg:
         cfg.graphiti_memory_enabled = True
         svc = MemoryService()
         svc._initialized = True
         svc._graphiti = MagicMock()
         svc._graphiti.add_episode = AsyncMock(side_effect=RuntimeError("ingest failed"))
-        assert await svc.add_episode("valid text") is None
+        with pytest.raises(RuntimeError, match="ingest failed"):
+            await svc.add_episode("valid text")
+
+
+@pytest.mark.asyncio
+async def test_add_episode_raises_when_not_initialized():
+    """When MemoryService init failed at startup, add_episode surfaces RuntimeError."""
+    with patch("src.bot.services.memory_service.bot_config") as cfg:
+        cfg.graphiti_memory_enabled = True
+        svc = MemoryService()
+        svc._initialized = False
+        with pytest.raises(RuntimeError, match="not initialized"):
+            await svc.add_episode("valid text")
 
 
 def test_build_embedder_uses_config_defaults():

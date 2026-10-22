@@ -138,16 +138,30 @@ class AddMemoryCommand:
 
         ok_ids: List[str] = []
         failures = 0
+        first_error: Optional[str] = None
         for i, chunk in enumerate(chunks, 1):
-            result_id = await self._memory.add_episode(
-                text=chunk,
-                source_description=f"{source} chunk={i}/{len(chunks)}",
-                name=f"addmemory-{uuid.uuid4().hex[:8]}",
-            )
-            if result_id:
-                ok_ids.append(result_id)
-            else:
+            try:
+                result_id = await self._memory.add_episode(
+                    text=chunk,
+                    source_description=f"{source} chunk={i}/{len(chunks)}",
+                    name=f"addmemory-{uuid.uuid4().hex[:8]}",
+                )
+                if result_id:
+                    ok_ids.append(result_id)
+                else:
+                    failures += 1
+                    if first_error is None:
+                        first_error = "(add_episode returned None without raising)"
+            except Exception as e:
                 failures += 1
+                if first_error is None:
+                    first_error = f"{type(e).__name__}: {e}"
+                logger.error(
+                    "addmemory_chunk_failed",
+                    chunk=f"{i}/{len(chunks)}",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
 
         if ok_ids:
             preview = text[:80].replace("\n", " ")
@@ -163,11 +177,17 @@ class AddMemoryCommand:
                 message_thread_id=topic_id,
             )
         else:
+            err_msg = (
+                f"❌ Failed to add to memory ({len(text)} chars, "
+                f"{len(chunks)} chunk(s) all failed).\n\n"
+                f"First error: {first_error or 'unknown'}"
+            )
+            # Keep the reply short enough — Telegram truncates long messages
+            # but we want the error visible without scrolling.
+            if len(err_msg) > 800:
+                err_msg = err_msg[:800] + "…"
             await message.reply_text(
-                f"❌ Failed to add to memory ({len(text)} chars, {len(chunks)} "
-                f"chunk(s) all failed). Common causes: LLM/embedder timeout, "
-                f"FalkorDB connection issue, or missing OPENAI_API_KEY for "
-                f"embedder. Check logs for the failure type.",
+                err_msg,
                 message_thread_id=topic_id,
             )
 

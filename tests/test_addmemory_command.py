@@ -121,7 +121,8 @@ async def test_addmemory_failure_replies_error():
         cfg.graphiti_memory_enabled = True
         cfg.file_upload_tmp_dir = "/tmp/uploads"
         svc = MagicMock(spec=MemoryService)
-        svc.add_episode = AsyncMock(return_value=None)
+        # Now that add_episode raises on failure, simulate that behavior.
+        svc.add_episode = AsyncMock(side_effect=RuntimeError("boom"))
         cmd = AddMemoryCommand(svc)
 
         update = _make_update(args=["some text"])
@@ -129,9 +130,27 @@ async def test_addmemory_failure_replies_error():
         await cmd.handle(update, ctx)
 
         svc.add_episode.assert_awaited_once()
-        # The reply_text is called multiple times: once for error. Find the failure msg.
         msgs = [c.args[0] for c in update.message.reply_text.call_args_list]
         assert any("Failed to add" in m for m in msgs)
+        assert any("RuntimeError: boom" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_addmemory_not_initialized_surfaces_runtime_error():
+    """If MemoryService failed to init, add_episode raises RuntimeError — surface it."""
+    with patch("src.bot.commands.add_memory.config") as cfg:
+        cfg.graphiti_memory_enabled = True
+        cfg.file_upload_tmp_dir = "/tmp/uploads"
+        svc = MagicMock(spec=MemoryService)
+        svc.add_episode = AsyncMock(side_effect=RuntimeError("MemoryService is not initialized"))
+        cmd = AddMemoryCommand(svc)
+
+        update = _make_update(args=["some text"])
+        ctx = _make_context(args=["some text"])
+        await cmd.handle(update, ctx)
+
+        msgs = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("not initialized" in m for m in msgs)
 
 
 @pytest.mark.asyncio
