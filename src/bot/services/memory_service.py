@@ -206,10 +206,23 @@ class MemoryService:
             logger.info("memory_retrieved",
                         query_preview=query[:60],
                         search_query=search_query,
-                        num_facts=len(facts))
+                        num_edges=len(edges),
+                        num_facts=len(facts),
+                        initialized=self._initialized)
             return facts
         except Exception as e:
-            logger.warning("memory_retrieval_failed", error=str(e))
+            # Distinguish "empty search" from "search raised" — when
+            # memory_retrieval_failed logs, the user's /addmemory data may
+            # be fine but search hit a FalkorDB error or embedder timeout.
+            # Without this we just see "no facts found" in the tool result
+            # and can't tell if DB is empty or broken.
+            logger.error(
+                "memory_retrieval_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                search_query=search_query,
+                exc_info=True,
+            )
             return []
 
     async def _extract_keywords(self, query: str) -> str:
