@@ -124,6 +124,13 @@ def mock_config():
         mock.file_upload_tmp_dir = "/tmp/bot_uploads_test"
         mock.vision_model = None
         mock.main_model_supports_images = False
+        mock.graphiti_memory_enabled = False
+        mock.graphiti_db_path = "data/graphiti_test.db"
+        mock.graphiti_falkor_mode = "embedded"
+        mock.graphiti_falkor_host = "localhost"
+        mock.graphiti_falkor_port = 6379
+        mock.graphiti_falkor_database = "default_db"
+        mock.graphiti_group_id = "global"
         yield mock
 
 

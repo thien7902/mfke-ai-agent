@@ -27,3 +27,10 @@ openai>=1.50.0
 pytest==8.2.1
 pytest-asyncio==0.23.3
 pytest-mock==3.14.0
+
+# Graph memory (Graphiti + FalkorDB). The falkordblite extra pulls in
+# falkordblite (embedded, in-process, no Docker) which only builds on
+# Linux/macOS — production runs in Docker/Linux so this is fine there.
+# On Windows dev, install graphiti-core without the extra and run the
+# bot against a separate FalkorDB Docker container instead.
+graphiti-core[falkordblite,anthropic]>=0.31.2

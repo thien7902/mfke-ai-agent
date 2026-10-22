@@ -21,8 +21,10 @@ from src.bot.utils.health import health_checker
 from src.bot.services.holmes_service import HolmesService, _holmes_executor
 from src.bot.services.conversation_service import ConversationService
 from src.bot.services.permission_service import PermissionService
+from src.bot.services.memory_service import MemoryService
 from src.bot.handlers.message_handler import MessageHandler
 from src.bot.handlers.command_handler import CommandHandler as BotCommandHandler
+from src.bot.commands.add_memory import AddMemoryCommand
 from src.bot.handlers.privilege_handler import PrivilegeHandler
 
 # Configure structlog
@@ -93,6 +95,7 @@ class TelegramBot:
         self.holmes_service: HolmesService = None
         self.conversation_service: ConversationService = None
         self.permission_service: PermissionService = None
+        self.memory_service: MemoryService = None
         self.last_update_time: float = 0  # Track last received update
         self.polling_restarts: int = 0    # Consecutive in-place restarts with no updates since
 
@@ -106,7 +109,17 @@ class TelegramBot:
         health_checker.set_mongodb_connected(True)
 
         # Initialize services
-        self.holmes_service = HolmesService()
+        self.memory_service = MemoryService()
+        # Memory init is best-effort: if FalkorDB is unreachable or graphiti
+        # fails to come up, the bot still runs — memory retrieval just returns
+        # [] and /addmemory replies with an error. Memory start failures are
+        # logged but never fatal.
+        try:
+            await self.memory_service.initialize()
+        except Exception as e:
+            logger.warning("memory_init_failed_bot_continues", error=str(e))
+
+        self.holmes_service = HolmesService(memory_service=self.memory_service)
         await self.holmes_service.initialize()
         health_checker.set_holmes_ready(True)
 
@@ -139,6 +152,7 @@ class TelegramBot:
         )
         cmd_handler = BotCommandHandler(self.permission_service, self.conversation_service)
         priv_handler = PrivilegeHandler(self.permission_service)
+        add_memory_handler = AddMemoryCommand(self.memory_service, self.permission_service)
 
         # Register command handlers
         self.application.add_handler(TelegramCommandHandler("start", cmd_handler.start_command))
@@ -151,6 +165,9 @@ class TelegramBot:
         self.application.add_handler(TelegramCommandHandler("shell", cmd_handler.shell_command))
         self.application.add_handler(TelegramCommandHandler("reconcile", cmd_handler.reconcile_command))
         self.application.add_handler(TelegramCommandHandler("kshell", cmd_handler.kshell_command))
+        # /addmemory — admin only; ingests replied message text or attached file
+        # content as a knowledge episode into Graphiti (see src/bot/commands/add_memory.py)
+        self.application.add_handler(TelegramCommandHandler("addmemory", add_memory_handler.handle))
 
         # Privilege commands
         self.application.add_handler(TelegramCommandHandler("grant", priv_handler.grant_command))
@@ -252,6 +269,9 @@ class TelegramBot:
         if self.holmes_service:
             await self.holmes_service.close()
             health_checker.set_holmes_ready(False)
+
+        if self.memory_service:
+            await self.memory_service.close()
 
         # Shutdown the Holmes thread pool executor
         _holmes_executor.shutdown(wait=True)

@@ -23,6 +23,7 @@ from holmes.core.models import PendingToolApproval, ToolApprovalDecision
 from src.bot.utils.config import config as bot_config
 from src.bot.models.conversation import Conversation, Message
 from src.bot.models.user import UserPermission
+from src.bot.services.memory_service import MemoryService
 
 logger = structlog.get_logger(__name__)
 
@@ -138,11 +139,12 @@ def _empty_llm_result() -> LLMResult:
 class HolmesService:
     """Service for interacting with HolmesGPT."""
 
-    def __init__(self):
+    def __init__(self, memory_service: Optional["MemoryService"] = None):
         self._config: Optional[Config] = None
         self._tool_executor: Optional[ToolExecutor] = None
         self._tool_calling_llm: Optional[ToolCallingLLM] = None
         self._initialized = False
+        self._memory: Optional["MemoryService"] = memory_service
 
     def _get_llm_config(self) -> Dict[str, Any]:
         """Get LLM configuration from environment variables."""
@@ -833,10 +835,23 @@ class HolmesService:
             user_msg.metadata["images"] = images
         conversation.add_message(user_msg)
 
+        # Retrieve relevant knowledge from the graph memory, if enabled.
+        # LLM-driven: the user message is distilled to search keywords, then
+        # Graphiti returns matching facts which we inject into the system
+        # prompt below via _build_holmes_messages.
+        memory_facts: List[str] = []
+        if self._memory is not None:
+            try:
+                memory_facts = await self._memory.retrieve_relevant(user_message)
+            except Exception as e:
+                logger.warning("memory_retrieval_error", error=str(e), user_id=user_id)
+                memory_facts = []
+
         # Convert to Holmes format using build_initial_ask_messages for proper formatting with system prompt additions
         holmes_messages = self._build_holmes_messages(
             self._convert_messages_to_holmes_format(conversation.messages),
-            user_id
+            user_id,
+            memory_facts=memory_facts,
         )
 
         # Get feature flags from permissions
@@ -882,16 +897,42 @@ class HolmesService:
             conversation.add_message(Message(role="assistant", content=error_msg))
             return error_msg
 
-    def _build_holmes_messages(self, messages: List[Dict[str, Any]], user_id: int) -> List[Dict[str, Any]]:
-        """Build Holmes-compatible messages with proper system prompt and tool formatting."""
+    def _build_holmes_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        user_id: int,
+        memory_facts: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Build Holmes-compatible messages with proper system prompt and tool formatting.
+
+        When `memory_facts` is non-empty, they are appended to the configured
+        Holmes system_prompt_additions so the LLM sees relevant knowledge
+        pulled from the graph memory alongside whatever additions were already
+        configured (existing additions are preserved, not replaced).
+        """
+        additions = bot_config.holmes_system_prompt_additions
+        if memory_facts:
+            memory_block = self._format_memory_facts(memory_facts)
+            additions = f"{additions}\n\n{memory_block}" if additions else memory_block
+
         # Use Holmes' native message builder for proper formatting
         return build_initial_ask_messages(
             initial_user_prompt="",  # We'll override with actual messages
             file_paths=None,
             tool_executor=self._tool_executor,
             skills=self._config.get_skill_catalog() if self._config else None,
-            system_prompt_additions=bot_config.holmes_system_prompt_additions,
+            system_prompt_additions=additions,
         ) + messages
+
+    @staticmethod
+    def _format_memory_facts(facts: List[str]) -> str:
+        """Format retrieved memory facts as a system-prompt addition block."""
+        lines = "\n".join(f"- {f}" for f in facts if f)
+        return (
+            "Known facts that may be relevant to the user's message "
+            "(retrieved from the knowledge memory; use if relevant, ignore if not):\n"
+            f"{lines}"
+        )
 
     async def _non_stream_chat(
         self, messages: List[Dict[str, Any]], features: Dict[str, bool], user_id: int

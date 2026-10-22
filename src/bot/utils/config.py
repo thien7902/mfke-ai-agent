@@ -55,6 +55,21 @@ class Config:
     # images go through vision_service → OCR fallback into plain text.
     main_model_supports_images: bool = False
 
+    # Graph memory (Graphiti). When disabled, MemoryService is a no-op
+    # so existing deployments keep working without the graph DB running.
+    graphiti_memory_enabled: bool = False
+    # Embedded FalkorDB on-disk path. Used when graphiti_falkor_mode="embedded".
+    # For the non-embedded Docker mode, set FALKOR_HOST=FALKOR_PORT instead.
+    graphiti_db_path: str = "data/graphiti.db"
+    # "embedded" (falkordblite, in-process, no Docker) or "server" (separate FalkorDB container).
+    graphiti_falkor_mode: str = "embedded"
+    graphiti_falkor_host: str = "localhost"
+    graphiti_falkor_port: int = 6379
+    graphiti_falkor_database: str = "default_db"
+    # Group id used when ingesting /addmemory episodes. All global knowledge
+    # shares one group so search is cross-conversation.
+    graphiti_group_id: str = "global"
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -80,6 +95,13 @@ def load_config() -> Config:
         file_upload_tmp_dir=os.getenv("FILE_UPLOAD_TMP_DIR", "/tmp/bot_uploads"),
         vision_model=os.getenv("VISION_MODEL") or "Qwen3.8-27B",
         main_model_supports_images=os.getenv("MAIN_MODEL_SUPPORTS_IMAGES", "").lower() in ("1", "true", "yes", "on"),
+        graphiti_memory_enabled=os.getenv("GRAPHITI_MEMORY_ENABLED", "").lower() in ("1", "true", "yes", "on"),
+        graphiti_db_path=os.getenv("GRAPHITI_DB_PATH", "data/graphiti.db"),
+        graphiti_falkor_mode=os.getenv("GRAPHITI_FALKOR_MODE", "embedded"),
+        graphiti_falkor_host=os.getenv("GRAPHITI_FALKOR_HOST", "localhost"),
+        graphiti_falkor_port=int(os.getenv("GRAPHITI_FALKOR_PORT", "6379")),
+        graphiti_falkor_database=os.getenv("GRAPHITI_FALKOR_DATABASE", "default_db"),
+        graphiti_group_id=os.getenv("GRAPHITI_GROUP_ID", "global"),
     )
 
 
