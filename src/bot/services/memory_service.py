@@ -69,23 +69,50 @@ class MemoryService:
         async with self._init_lock:
             if self._initialized:
                 return
-            mods = _import_graphiti()
-            Graphiti = mods["Graphiti"]
-            FalkorDriver = mods["FalkorDriver"]
-            AnthropicClient = mods["AnthropicClient"]
+            # Log each step so the startup failure log points at the exact
+            # phase that broke — otherwise we just get a generic "memory init
+            # failed" and have to guess which sub-step (import, driver, embedder,
+            # index build) threw.
+            try:
+                logger.info("memory_init_step", step="import_graphiti")
+                mods = _import_graphiti()
+                Graphiti = mods["Graphiti"]
+                FalkorDriver = mods["FalkorDriver"]
+                AnthropicClient = mods["AnthropicClient"]
 
-            driver = self._build_driver(FalkorDriver)
-            llm_client = AnthropicClient()
-            embedder = self._build_embedder(mods["OpenAIEmbedder"], mods["OpenAIEmbedderConfig"])
+                logger.info("memory_init_step",
+                            step="build_driver",
+                            mode=bot_config.graphiti_falkor_mode,
+                            db_path=bot_config.graphiti_db_path,
+                            host=bot_config.graphiti_falkor_host,
+                            port=bot_config.graphiti_falkor_port)
+                driver = self._build_driver(FalkorDriver)
 
-            self._graphiti = Graphiti(
-                graph_driver=driver,
-                llm_client=llm_client,
-                embedder=embedder,
-            )
-            await self._graphiti.build_indices_and_constraints()
+                logger.info("memory_init_step",
+                            step="build_embedder",
+                            model=bot_config.graphiti_embedding_model,
+                            dim=bot_config.graphiti_embedding_dim,
+                            has_openai_key=bool(os.environ.get("OPENAI_API_KEY")),
+                            openai_base=os.environ.get("OPENAI_API_BASE", "<unset>"))
+                llm_client = AnthropicClient()
+                embedder = self._build_embedder(mods["OpenAIEmbedder"], mods["OpenAIEmbedderConfig"])
 
-            self._anthropic = anthropic.AsyncAnthropic()
+                self._graphiti = Graphiti(
+                    graph_driver=driver,
+                    llm_client=llm_client,
+                    embedder=embedder,
+                )
+
+                logger.info("memory_init_step", step="build_indices")
+                await self._graphiti.build_indices_and_constraints()
+
+                self._anthropic = anthropic.AsyncAnthropic()
+            except Exception:
+                # Re-raise with step context so the caller's except block
+                # logs which phase failed — no more guessing from a generic
+                # exception message.
+                logger.exception("memory_init_failed_at_step")
+                raise
 
             self._initialized = True
             logger.info("graphiti_memory_initialized",

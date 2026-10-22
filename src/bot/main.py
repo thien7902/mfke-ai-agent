@@ -117,7 +117,17 @@ class TelegramBot:
         try:
             await self.memory_service.initialize()
         except Exception as e:
-            logger.warning("memory_init_failed_bot_continues", error=str(e))
+            logger.error(
+                "memory_init_failed_bot_continues",
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True,
+            )
+            # Also print to stdout so it's impossible to miss in docker logs
+            # even when structlog formatting is being filtered by log level.
+            import traceback
+            print(f"[MEMORY INIT FAILED] {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
 
         self.holmes_service = HolmesService(memory_service=self.memory_service)
         await self.holmes_service.initialize()
