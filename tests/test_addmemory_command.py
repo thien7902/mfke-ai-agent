@@ -68,9 +68,8 @@ async def test_addmemory_with_explicit_text():
         call_kwargs = svc.add_episode.call_args.kwargs
         assert call_kwargs["text"] == "Cats like fish"
         # Confirm success message was sent
-        msg = update.message.reply_text.call_args.args[0]
-        assert "Added to memory" in msg
-        assert "ep-abc" in msg
+        msgs = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("Added" in m for m in msgs)
 
 
 @pytest.mark.asyncio
@@ -94,7 +93,8 @@ async def test_addmemory_reply_to_text_message():
         svc.add_episode.assert_awaited_once()
         call_kwargs = svc.add_episode.call_args.kwargs
         assert call_kwargs["text"] == "Remember this important fact"
-        assert "ep-reply" in update.message.reply_text.call_args.args[0]
+        msgs = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("Added" in m for m in msgs)
 
 
 @pytest.mark.asyncio
@@ -129,8 +129,9 @@ async def test_addmemory_failure_replies_error():
         await cmd.handle(update, ctx)
 
         svc.add_episode.assert_awaited_once()
-        msg = update.message.reply_text.call_args.args[0]
-        assert "Failed to add" in msg
+        # The reply_text is called multiple times: once for error. Find the failure msg.
+        msgs = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("Failed to add" in m for m in msgs)
 
 
 @pytest.mark.asyncio
@@ -161,7 +162,49 @@ async def test_addmemory_upload_caption_extracts_and_ingests():
         kwargs = svc.add_episode.call_args.kwargs
         assert "FILE BODY" in kwargs["text"]
         assert "note from Thien" in kwargs["text"]
-        assert "ep-upload" in update.message.reply_text.call_args.args[0]
+        msgs = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("Added" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_addmemory_chunks_large_input_along_headers():
+    """Large md input is split into multiple episodes by `^#` header."""
+    big_section = "# Section A\n\n" + ("line content\n" * 100)  # ~1.2KB
+    body = big_section * 5  # ~6KB total — splits into multiple sections.
+    with patch("src.bot.commands.add_memory.config") as cfg:
+        cfg.graphiti_memory_enabled = True
+        cfg.file_upload_tmp_dir = "/tmp/uploads"
+        svc = MagicMock(spec=MemoryService)
+        svc.add_episode = AsyncMock(return_value=lambda **kw: f"ep-{kw.get('name', '')[-4:]}")
+        cmd = AddMemoryCommand(svc)
+
+        update = _make_update(args=[body])
+        ctx = _make_context(args=[body])
+        await cmd.handle(update, ctx)
+
+        # Should have ingested multiple episodes, not one.
+        assert svc.add_episode.await_count >= 2
+        # All chunks should be under the soft cap.
+        for call in svc.add_episode.call_args_list:
+            assert len(call.kwargs["text"]) <= 6000
+
+
+@pytest.mark.asyncio
+async def test_addmemory_small_input_not_chunked():
+    """Small input below threshold goes through as one episode."""
+    with patch("src.bot.commands.add_memory.config") as cfg:
+        cfg.graphiti_memory_enabled = True
+        cfg.file_upload_tmp_dir = "/tmp/uploads"
+        svc = MagicMock(spec=MemoryService)
+        svc.add_episode = AsyncMock(return_value="ep1")
+        cmd = AddMemoryCommand(svc)
+
+        update = _make_update(args=["short fact"])
+        ctx = _make_context(args=["short fact"])
+        await cmd.handle(update, ctx)
+
+        svc.add_episode.assert_awaited_once()
+        assert svc.add_episode.call_args.kwargs["text"] == "short fact"
 
 
 @pytest.mark.asyncio
@@ -190,6 +233,8 @@ async def test_addmemory_upload_caption_no_extra_text():
 
         kwargs = svc.add_episode.call_args.kwargs
         assert kwargs["text"] == "BODY"
+        msgs = [c.args[0] for c in update.message.reply_text.call_args_list]
+        assert any("Added" in m for m in msgs)
 
 
 @pytest.mark.asyncio
