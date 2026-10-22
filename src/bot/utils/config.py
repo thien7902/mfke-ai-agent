@@ -60,7 +60,9 @@ class Config:
     graphiti_memory_enabled: bool = False
     # Embedded FalkorDB on-disk path. Used when graphiti_falkor_mode="embedded".
     # For the non-embedded Docker mode, set FALKOR_HOST=FALKOR_PORT instead.
-    graphiti_db_path: str = "data/graphiti.db"
+    # Default under /root/.holmes so it survives container restarts when
+    # the holmes_config volume is mounted (see docker-compose.yml).
+    graphiti_db_path: str = "/root/.holmes/graphiti.db"
     # "embedded" (falkordblite, in-process, no Docker) or "server" (separate FalkorDB container).
     graphiti_falkor_mode: str = "embedded"
     graphiti_falkor_host: str = "localhost"
@@ -69,6 +71,11 @@ class Config:
     # Group id used when ingesting /addmemory episodes. All global knowledge
     # shares one group so search is cross-conversation.
     graphiti_group_id: str = "global"
+    # Embedder: must match the model served at the OpenAI-compatible endpoint
+    # configured via OPENAI_API_BASE / OPENAI_API_KEY. multilingual-e5-large
+    # produces 1024-dim vectors — matches Graphiti's default dim.
+    graphiti_embedding_model: str = "multilingual-e5-large"
+    graphiti_embedding_dim: int = 1024
 
 
 def load_config() -> Config:
@@ -96,12 +103,14 @@ def load_config() -> Config:
         vision_model=os.getenv("VISION_MODEL") or "Qwen3.8-27B",
         main_model_supports_images=os.getenv("MAIN_MODEL_SUPPORTS_IMAGES", "").lower() in ("1", "true", "yes", "on"),
         graphiti_memory_enabled=os.getenv("GRAPHITI_MEMORY_ENABLED", "").lower() in ("1", "true", "yes", "on"),
-        graphiti_db_path=os.getenv("GRAPHITI_DB_PATH", "data/graphiti.db"),
+        graphiti_db_path=os.getenv("GRAPHITI_DB_PATH", "/root/.holmes/graphiti.db"),
         graphiti_falkor_mode=os.getenv("GRAPHITI_FALKOR_MODE", "embedded"),
         graphiti_falkor_host=os.getenv("GRAPHITI_FALKOR_HOST", "localhost"),
         graphiti_falkor_port=int(os.getenv("GRAPHITI_FALKOR_PORT", "6379")),
         graphiti_falkor_database=os.getenv("GRAPHITI_FALKOR_DATABASE", "default_db"),
         graphiti_group_id=os.getenv("GRAPHITI_GROUP_ID", "global"),
+        graphiti_embedding_model=os.getenv("GRAPHITI_EMBEDDING_MODEL", "multilingual-e5-large"),
+        graphiti_embedding_dim=int(os.getenv("GRAPHITI_EMBEDDING_DIM", "1024")),
     )
 
 

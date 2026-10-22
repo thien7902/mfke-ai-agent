@@ -175,3 +175,39 @@ async def test_add_episode_swallows_errors():
         svc._graphiti = MagicMock()
         svc._graphiti.add_episode = AsyncMock(side_effect=RuntimeError("ingest failed"))
         assert await svc.add_episode("valid text") is None
+
+
+def test_build_embedder_uses_config_defaults():
+    """_build_embedder pulls model + dim from config and creds from env."""
+    import os as _os
+    with patch("src.bot.services.memory_service.bot_config") as cfg, \
+         patch.dict(_os.environ, {
+             "OPENAI_API_KEY": "sk-test",
+             "OPENAI_API_BASE": "https://embed.test/v1",
+         }):
+        cfg.graphiti_embedding_model = "multilingual-e5-large"
+        cfg.graphiti_embedding_dim = 1024
+
+        # Fake OpenAIEmbedder/OpenAIEmbedderConfig to capture the kwargs passed
+        seen = {}
+
+        class FakeConfig:
+            def __init__(self, **kwargs):
+                seen["config"] = kwargs
+
+        class FakeEmbedder:
+            def __init__(self, config=None):
+                seen["embedder"] = config
+
+        svc = MemoryService()
+        out = svc._build_embedder(FakeEmbedder, FakeConfig)
+
+        # Returns the embedder instance
+        assert out is not None
+        # Embedder received the config object
+        assert seen["embedder"] is not None
+        # Config was built with the correct model + dim from graphiti config
+        assert seen["config"]["embedding_model"] == "multilingual-e5-large"
+        assert seen["config"]["embedding_dim"] == 1024
+        assert seen["config"]["api_key"] == "sk-test"
+        assert seen["config"]["base_url"] == "https://embed.test/v1"

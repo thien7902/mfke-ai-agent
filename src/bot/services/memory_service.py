@@ -73,18 +73,10 @@ class MemoryService:
             Graphiti = mods["Graphiti"]
             FalkorDriver = mods["FalkorDriver"]
             AnthropicClient = mods["AnthropicClient"]
-            OpenAIEmbedder = mods["OpenAIEmbedder"]
-            OpenAIEmbedderConfig = mods["OpenAIEmbedderConfig"]
 
             driver = self._build_driver(FalkorDriver)
-
             llm_client = AnthropicClient()
-
-            embedder_config = OpenAIEmbedderConfig(
-                api_key=os.environ.get("OPENAI_API_KEY"),
-                base_url=os.environ.get("OPENAI_API_BASE"),
-            )
-            embedder = OpenAIEmbedder(config=embedder_config)
+            embedder = self._build_embedder(mods["OpenAIEmbedder"], mods["OpenAIEmbedderConfig"])
 
             self._graphiti = Graphiti(
                 graph_driver=driver,
@@ -99,6 +91,20 @@ class MemoryService:
             logger.info("graphiti_memory_initialized",
                         mode=bot_config.graphiti_falkor_mode,
                         group_id=bot_config.graphiti_group_id)
+
+    def _build_embedder(self, OpenAIEmbedder, OpenAIEmbedderConfig):
+        """Build the OpenAI-compatible embedder from config + env.
+
+        Pulls model name + dim from Config (default: multilingual-e5-large /
+        1024-dim) and API credentials from OPENAI_API_KEY / OPENAI_API_BASE.
+        """
+        embedder_config = OpenAIEmbedderConfig(
+            api_key=os.environ.get("OPENAI_API_KEY"),
+            base_url=os.environ.get("OPENAI_API_BASE"),
+            embedding_model=bot_config.graphiti_embedding_model,
+            embedding_dim=bot_config.graphiti_embedding_dim,
+        )
+        return OpenAIEmbedder(config=embedder_config)
 
     def _build_driver(self, FalkorDriver):
         if bot_config.graphiti_falkor_mode == "embedded":

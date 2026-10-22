@@ -284,7 +284,7 @@ async def test_holmes_chat_persists_images_on_user_message_metadata(monkeypatch)
     svc = HolmesService()
     svc._initialized = True
     # Stub _build_holmes_messages + _get_user_permissions + streaming path
-    svc._build_holmes_messages = lambda msgs, uid, memory_facts=None: msgs
+    svc._build_holmes_messages = lambda msgs, uid: msgs
     svc._get_user_permissions = lambda perms: {
         "agents": False, "tools": False, "memory": False,
         "streaming": False, "tool_approval": False,

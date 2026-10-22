@@ -24,6 +24,7 @@ from src.bot.utils.config import config as bot_config
 from src.bot.models.conversation import Conversation, Message
 from src.bot.models.user import UserPermission
 from src.bot.services.memory_service import MemoryService
+from src.bot.tools.search_memory_tool import SearchMemoryTool
 
 logger = structlog.get_logger(__name__)
 
@@ -270,6 +271,7 @@ class HolmesService:
             self._tool_executor = self._tool_calling_llm.tool_executor
             self._wrap_todo_write_tool()
             self._wrap_bash_tool_timeout()
+            self._register_search_memory_tool()
 
             self._initialized = True
             # Patch bash tool to kill the whole process group on timeout, so
@@ -398,6 +400,22 @@ class HolmesService:
                     object.__setattr__(tool, 'invoke', make_bash_wrapper(original_invoke))
                     logger.info("Wrapped bash tool to cap timeout at %ds", BASH_TIMEOUT_MAX_SECONDS)
                     break
+
+    def _register_search_memory_tool(self):
+        """Register the search_memory Holmes tool so the LLM can call it.
+
+        Memory retrieval is exposed as a Holmes tool, not as a pre-LLM injection.
+        A rule in HOLMES_SYSTEM_PROMPT_ADDITIONS governs when Holmes should call
+        it: only after at least one investigative tool has produced concrete
+        signals (pod names, errors, service names), not on raw user messages.
+        When memory is disabled, we still register the tool — it returns a
+        'memory disabled' message so Holmes doesn't error if called.
+        """
+        if not self._tool_executor or not self._memory:
+            return
+        tool = SearchMemoryTool(self._memory)
+        self._tool_executor.tools_by_name[tool.name] = tool
+        logger.info("Registered search_memory tool")
 
     def get_latest_investigation_tasks(self) -> List[Dict[str, Any]]:
         """Get the latest investigation tasks captured from TodoWrite."""
@@ -835,23 +853,16 @@ class HolmesService:
             user_msg.metadata["images"] = images
         conversation.add_message(user_msg)
 
-        # Retrieve relevant knowledge from the graph memory, if enabled.
-        # LLM-driven: the user message is distilled to search keywords, then
-        # Graphiti returns matching facts which we inject into the system
-        # prompt below via _build_holmes_messages.
-        memory_facts: List[str] = []
-        if self._memory is not None:
-            try:
-                memory_facts = await self._memory.retrieve_relevant(user_message)
-            except Exception as e:
-                logger.warning("memory_retrieval_error", error=str(e), user_id=user_id)
-                memory_facts = []
+        # Memory retrieval is now exposed as a Holmes tool (`search_memory`),
+        # not as a pre-LLM injection. Holmes decides when to call it based on
+        # the tool-use rule in HOLMES_SYSTEM_PROMPT_ADDITIONS — only after at
+        # least one investigative tool has produced concrete signals, not on
+        # raw user messages. See src/bot/tools/search_memory_tool.py.
 
         # Convert to Holmes format using build_initial_ask_messages for proper formatting with system prompt additions
         holmes_messages = self._build_holmes_messages(
             self._convert_messages_to_holmes_format(conversation.messages),
             user_id,
-            memory_facts=memory_facts,
         )
 
         # Get feature flags from permissions
@@ -897,42 +908,51 @@ class HolmesService:
             conversation.add_message(Message(role="assistant", content=error_msg))
             return error_msg
 
+    # Default search_memory tool-use rule. Appended to HOLMES_SYSTEM_PROMPT_ADDITIONS
+    # when graphiti_memory_enabled is True so all deployments that turn on memory
+    # get the rule without each user having to write it. Users can override by
+    # setting their own rule in HOLMES_SYSTEM_PROMPT_ADDITIONS — the default is
+    # added AFTER user additions, not replacing them.
+    _MEMORY_TOOL_RULE = (
+        "\n\n--- search_memory TOOL USE POLICY ---\n"
+        "search_memory retrieves facts from the bot's knowledge memory.\n"
+        "1. Do NOT call search_memory as your first action. Always run at least one "
+        "investigative tool first (kubectl, query logs, curl, etc.) to obtain concrete signals.\n"
+        "2. Call search_memory ONLY when you have specific signals — pod names, error "
+        "messages, service names, or metric anomalies — distilled from prior tool results.\n"
+        "   Pass a concise query like 'api-gw-7 CrashLoopBackOff', not full sentences.\n"
+        "3. Do NOT call search_memory when the user's question is generic and does not need "
+        "prior knowledge (e.g. 'list pods'). It is optional, not required.\n"
+        "4. Use the returned facts if relevant; ignore them if not. Cite them in your "
+        "answer only if they actually contributed."
+    )
+
     def _build_holmes_messages(
         self,
         messages: List[Dict[str, Any]],
         user_id: int,
-        memory_facts: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Build Holmes-compatible messages with proper system prompt and tool formatting.
 
-        When `memory_facts` is non-empty, they are appended to the configured
-        Holmes system_prompt_additions so the LLM sees relevant knowledge
-        pulled from the graph memory alongside whatever additions were already
-        configured (existing additions are preserved, not replaced).
+        Memory facts are no longer injected here — memory retrieval is now
+        exposed as the `search_memory` Holmes tool (see
+        src/bot/tools/search_memory_tool.py), governed by a rule appended
+        to HOLMES_SYSTEM_PROMPT_ADDITIONS when graphiti_memory_enabled is True.
         """
-        additions = bot_config.holmes_system_prompt_additions
-        if memory_facts:
-            memory_block = self._format_memory_facts(memory_facts)
-            additions = f"{additions}\n\n{memory_block}" if additions else memory_block
-
+        additions = bot_config.holmes_system_prompt_additions or ""
+        # Append the search_memory tool-use rule when memory is enabled so
+        # Holmes knows when to call the tool. User-written additions are
+        # preserved (the rule goes after, not replacing them).
+        if getattr(bot_config, "graphiti_memory_enabled", False):
+            additions = (additions + self._MEMORY_TOOL_RULE).strip()
         # Use Holmes' native message builder for proper formatting
         return build_initial_ask_messages(
             initial_user_prompt="",  # We'll override with actual messages
             file_paths=None,
             tool_executor=self._tool_executor,
             skills=self._config.get_skill_catalog() if self._config else None,
-            system_prompt_additions=additions,
+            system_prompt_additions=additions or None,
         ) + messages
-
-    @staticmethod
-    def _format_memory_facts(facts: List[str]) -> str:
-        """Format retrieved memory facts as a system-prompt addition block."""
-        lines = "\n".join(f"- {f}" for f in facts if f)
-        return (
-            "Known facts that may be relevant to the user's message "
-            "(retrieved from the knowledge memory; use if relevant, ignore if not):\n"
-            f"{lines}"
-        )
 
     async def _non_stream_chat(
         self, messages: List[Dict[str, Any]], features: Dict[str, bool], user_id: int
