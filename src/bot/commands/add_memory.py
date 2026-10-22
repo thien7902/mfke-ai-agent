@@ -5,6 +5,7 @@ Usage:
 - Reply to a message with `/addmemory` — ingest the replied message's text.
 - Reply to a document with `/addmemory` — extract the file's text and ingest it.
 - `/addmemory` with an attached document — extract and ingest the attachment.
+- Attach a file with caption `/addmemory` — extract and ingest the attachment.
 
 When memory is disabled (GRAPHITI_MEMORY_ENABLED=false), replies with a
 notice and exits without raising.
@@ -52,17 +53,62 @@ class AddMemoryCommand:
         topic_id = message.message_thread_id or None
 
         text = await self._collect_text(update, context)
-
         if not text or not text.strip():
             await message.reply_text(
                 "ℹ️ Usage:\n"
                 "• `/addmemory <text>` — ingest the given text\n"
                 "• Reply to a message with `/addmemory` — ingest that message's text\n"
                 "• Reply to a document with `/addmemory` — ingest the document's extracted text\n"
-                "• Send `/addmemory` with an attached file — ingest the attachment",
+                "• Send `/addmemory` with an attached file — ingest the attachment\n"
+                "• Attach a file with caption `/addmemory` — ingest the attachment",
                 message_thread_id=topic_id,
                 parse_mode="Markdown",
             )
+            return
+
+        await self._ingest(update, text, topic_id)
+
+    @admin_only
+    async def handle_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Entry point for file uploads whose caption starts with `/addmemory`.
+
+        Telegram sets `message.text=None` and `message.caption="/addmemory ..."`
+        when a file is attached with a command-style caption, so PTB's
+        CommandHandler (which only matches `message.text`) never fires. This
+        handler is registered as a MessageHandler on documents/photos so we
+        catch that case.
+        """
+        if not config.graphiti_memory_enabled:
+            await update.message.reply_text(
+                "⚠️ Memory is disabled. Set GRAPHITI_MEMORY_ENABLED=true to use /addmemory."
+            )
+            return
+
+        message = update.message
+        topic_id = message.message_thread_id or None
+
+        # Pull any text after the /addmemory command in the caption.
+        caption = message.caption or ""
+        caption_extra = ""
+        parts = caption.split(maxsplit=1)
+        if len(parts) > 1:
+            caption_extra = parts[1].strip()
+
+        extracted = await self._extract_from_attachment(message, context)
+        if not extracted:
+            await message.reply_text(
+                "❌ Could not extract text from the attached file.",
+                message_thread_id=topic_id,
+            )
+            return
+
+        text = f"{caption_extra}\n\n{extracted}".strip() if caption_extra else extracted
+        await self._ingest(update, text, topic_id)
+
+    async def _ingest(self, update: Update, text: str, topic_id) -> None:
+        """Shared finish path: add episode and reply with result."""
+        message = update.message
+        if not text or not text.strip():
             return
 
         source = self._build_source_description(update)

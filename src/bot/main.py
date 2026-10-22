@@ -185,6 +185,25 @@ class TelegramBot:
             TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler.handle_message)
         )
 
+        # Document/photo uploads with caption starting with `/addmemory` —
+        # PTB's CommandHandler only matches commands in `message.text`, not in
+        # `message.caption`, so a file upload captioned "/addmemory" would
+        # otherwise fall through to handle_file as a normal user message. This
+        # handler catches that case and routes to AddMemoryCommand.handle_upload.
+        # Registered before the generic handle_file handler so it wins the match.
+        #
+        # The CaptionRegex filter matches the command form, including an optional
+        # "/addmemory@BotName" suffix and any text after it. The handler parses
+        # trailing args as extra caption text to ingest alongside the file.
+        self.application.add_handler(
+            TelegramMessageHandler(
+                (filters.Document.ALL | filters.PHOTO)
+                & filters.CaptionRegex(r"^/addmemory(\s|$|@)"),
+                add_memory_handler.handle_upload,
+            ),
+            group=1,  # Separate group so a non-/addmemory caption still falls through to handle_file
+        )
+
         # Document/photo uploads: download, extract text, and run through the
         # same batch/streaming pipeline as text messages. See MessageHandler.handle_file.
         self.application.add_handler(

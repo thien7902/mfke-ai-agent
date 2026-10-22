@@ -131,3 +131,112 @@ async def test_addmemory_failure_replies_error():
         svc.add_episode.assert_awaited_once()
         msg = update.message.reply_text.call_args.args[0]
         assert "Failed to add" in msg
+
+
+@pytest.mark.asyncio
+async def test_addmemory_upload_caption_extracts_and_ingests():
+    """File upload with caption '/addmemory' routes through handle_upload."""
+    with patch("src.bot.commands.add_memory.config") as cfg, \
+         patch("src.bot.commands.add_memory.extract_text_from_file", return_value="FILE BODY"):
+        cfg.graphiti_memory_enabled = True
+        cfg.file_upload_tmp_dir = "/tmp/uploads"
+        svc = MagicMock(spec=MemoryService)
+        svc.add_episode = AsyncMock(return_value="ep-upload")
+        cmd = AddMemoryCommand(svc)
+
+        document = MagicMock()
+        document.file_id = "f1"
+        document.file_name = "notes.md"
+        document.mime_type = "text/markdown"
+        update = _make_update(args=None, document=document, caption="/addmemory note from Thien", text=None)
+        ctx = _make_context(args=None)
+        ctx.bot.get_file = AsyncMock()
+        tg_file = MagicMock()
+        tg_file.download_to_drive = AsyncMock()
+        ctx.bot.get_file.return_value = tg_file
+
+        await cmd.handle_upload(update, ctx)
+
+        svc.add_episode.assert_awaited_once()
+        kwargs = svc.add_episode.call_args.kwargs
+        assert "FILE BODY" in kwargs["text"]
+        assert "note from Thien" in kwargs["text"]
+        assert "ep-upload" in update.message.reply_text.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_addmemory_upload_caption_no_extra_text():
+    """Caption is just '/addmemory' with no extra args — only file content ingested."""
+    with patch("src.bot.commands.add_memory.config") as cfg, \
+         patch("src.bot.commands.add_memory.extract_text_from_file", return_value="BODY"):
+        cfg.graphiti_memory_enabled = True
+        cfg.file_upload_tmp_dir = "/tmp/uploads"
+        svc = MagicMock(spec=MemoryService)
+        svc.add_episode = AsyncMock(return_value="ep1")
+        cmd = AddMemoryCommand(svc)
+
+        document = MagicMock()
+        document.file_id = "f1"
+        document.file_name = "doc.txt"
+        document.mime_type = "text/plain"
+        update = _make_update(args=None, document=document, caption="/addmemory", text=None)
+        ctx = _make_context(args=None)
+        ctx.bot.get_file = AsyncMock()
+        tg_file = MagicMock()
+        tg_file.download_to_drive = AsyncMock()
+        ctx.bot.get_file.return_value = tg_file
+
+        await cmd.handle_upload(update, ctx)
+
+        kwargs = svc.add_episode.call_args.kwargs
+        assert kwargs["text"] == "BODY"
+
+
+@pytest.mark.asyncio
+async def test_addmemory_upload_extract_failure_replies_error():
+    """If the attachment yields no text, reply with an extraction failure message."""
+    with patch("src.bot.commands.add_memory.config") as cfg, \
+         patch("src.bot.commands.add_memory.extract_text_from_file", return_value=""):
+        cfg.graphiti_memory_enabled = True
+        cfg.file_upload_tmp_dir = "/tmp/uploads"
+        svc = MagicMock(spec=MemoryService)
+        svc.add_episode = AsyncMock(return_value="ep1")
+        cmd = AddMemoryCommand(svc)
+
+        document = MagicMock()
+        document.file_id = "f1"
+        document.file_name = "bad.bin"
+        document.mime_type = "application/octet-stream"
+        update = _make_update(args=None, document=document, caption="/addmemory", text=None)
+        ctx = _make_context(args=None)
+        ctx.bot.get_file = AsyncMock()
+        tg_file = MagicMock()
+        tg_file.download_to_drive = AsyncMock()
+        ctx.bot.get_file.return_value = tg_file
+
+        await cmd.handle_upload(update, ctx)
+
+        svc.add_episode.assert_not_awaited()
+        msg = update.message.reply_text.call_args.args[0]
+        assert "Could not extract" in msg
+
+
+@pytest.mark.asyncio
+async def test_addmemory_upload_disabled_replies_notice():
+    with patch("src.bot.commands.add_memory.config") as cfg:
+        cfg.graphiti_memory_enabled = False
+        cfg.file_upload_tmp_dir = "/tmp/uploads"
+        svc = MagicMock(spec=MemoryService)
+        cmd = AddMemoryCommand(svc)
+
+        document = MagicMock()
+        document.file_id = "f1"
+        document.file_name = "x.txt"
+        document.mime_type = "text/plain"
+        update = _make_update(args=None, document=document, caption="/addmemory", text=None)
+        ctx = _make_context(args=None)
+        await cmd.handle_upload(update, ctx)
+
+        msg = update.message.reply_text.call_args.args[0]
+        assert "disabled" in msg.lower()
+        svc.add_episode.assert_not_awaited()
