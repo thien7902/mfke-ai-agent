@@ -131,7 +131,7 @@ def mock_config():
         mock.graphiti_falkor_port = 6379
         mock.graphiti_falkor_database = "default_db"
         mock.graphiti_group_id = "global"
-        mock.graphiti_embedding_model = "multilingual-e5-large"
+        mock.graphiti_embedding_model = "Vietnamese_Embedding"
         mock.graphiti_embedding_dim = 1024
         yield mock
 

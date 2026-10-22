@@ -198,7 +198,7 @@ def test_build_embedder_uses_config_defaults():
              "OPENAI_API_KEY": "sk-test",
              "OPENAI_API_BASE": "https://embed.test/v1",
          }):
-        cfg.graphiti_embedding_model = "multilingual-e5-large"
+        cfg.graphiti_embedding_model = "Vietnamese_Embedding"
         cfg.graphiti_embedding_dim = 1024
 
         # Fake OpenAIEmbedder/OpenAIEmbedderConfig to capture the kwargs passed
@@ -220,7 +220,7 @@ def test_build_embedder_uses_config_defaults():
         # Embedder received the config object
         assert seen["embedder"] is not None
         # Config was built with the correct model + dim from graphiti config
-        assert seen["config"]["embedding_model"] == "multilingual-e5-large"
+        assert seen["config"]["embedding_model"] == "Vietnamese_Embedding"
         assert seen["config"]["embedding_dim"] == 1024
         assert seen["config"]["api_key"] == "sk-test"
         assert seen["config"]["base_url"] == "https://embed.test/v1"

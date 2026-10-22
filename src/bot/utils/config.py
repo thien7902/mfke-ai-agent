@@ -73,9 +73,9 @@ class Config:
     # shares one group so search is cross-conversation.
     graphiti_group_id: str = "global"
     # Embedder: must match the model served at the OpenAI-compatible endpoint
-    # configured via OPENAI_API_BASE / OPENAI_API_KEY. multilingual-e5-large
-    # produces 1024-dim vectors — matches Graphiti's default dim.
-    graphiti_embedding_model: str = "multilingual-e5-large"
+    # configured via OPENAI_API_BASE / OPENAI_API_KEY. Vietnamese_Embedding
+    # (aiteamvn/vietnamese-embedding) — produces 1024-dim vectors.
+    graphiti_embedding_model: str = "Vietnamese_Embedding"
     graphiti_embedding_dim: int = 1024
 
 
@@ -110,7 +110,7 @@ def load_config() -> Config:
         graphiti_falkor_port=int(os.getenv("GRAPHITI_FALKOR_PORT", "6379")),
         graphiti_falkor_database=os.getenv("GRAPHITI_FALKOR_DATABASE", "default_db"),
         graphiti_group_id=os.getenv("GRAPHITI_GROUP_ID", "global"),
-        graphiti_embedding_model=os.getenv("GRAPHITI_EMBEDDING_MODEL", "multilingual-e5-large"),
+        graphiti_embedding_model=os.getenv("GRAPHITI_EMBEDDING_MODEL", "Vietnamese_Embedding"),
         graphiti_embedding_dim=int(os.getenv("GRAPHITI_EMBEDDING_DIM", "1024")),
     )
 

@@ -122,7 +122,7 @@ class MemoryService:
     def _build_embedder(self, OpenAIEmbedder, OpenAIEmbedderConfig):
         """Build the OpenAI-compatible embedder from config + env.
 
-        Pulls model name + dim from Config (default: multilingual-e5-large /
+        Pulls model name + dim from Config (default: Vietnamese_Embedding /
         1024-dim) and API credentials from OPENAI_API_KEY / OPENAI_API_BASE.
         """
         embedder_config = OpenAIEmbedderConfig(
