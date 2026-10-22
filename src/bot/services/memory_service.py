@@ -225,7 +225,18 @@ class MemoryService:
                         text_len=len(text))
             return getattr(result, "uuid", None) or ep_name
         except Exception as e:
-            logger.error("memory_episode_failed", error=str(e), text_preview=text[:80])
+            # Log with full traceback + the first/last 200 chars of the
+            # episode body so we can diagnose whether it was a size limit,
+            # LLM error, embedder error, or FalkorDB write failure.
+            logger.error(
+                "memory_episode_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                text_len=len(text),
+                text_preview_head=text[:200],
+                text_preview_tail=text[-200:] if len(text) > 200 else "",
+                exc_info=True,
+            )
             return None
 
     async def close(self) -> None:

@@ -129,7 +129,11 @@ class AddMemoryCommand:
             )
         else:
             await message.reply_text(
-                "❌ Failed to add to memory. Check logs for details.",
+                f"❌ Failed to add to memory ({len(text)} chars). "
+                f"Check logs for details — common causes: LLM/embedder timeout "
+                f"on very large inputs (try /addmemory with a smaller file, or "
+                f"use `python -m scripts.ingest_file` for bulk), FalkorDB "
+                f"connection issue, or missing OPENAI_API_KEY for embedder.",
                 message_thread_id=topic_id,
             )
 
