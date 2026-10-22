@@ -55,9 +55,10 @@ class Config:
     # images go through vision_service → OCR fallback into plain text.
     main_model_supports_images: bool = False
 
-    # Graph memory (Graphiti). When disabled, MemoryService is a no-op
-    # so existing deployments keep working without the graph DB running.
-    graphiti_memory_enabled: bool = False
+    # Graph memory (Graphiti). Enabled by default — MemoryService.init is
+    # wrapped in try/except in main.py, so a FalkorDB/embedder failure only
+    # disables memory, not the whole bot.
+    graphiti_memory_enabled: bool = True
     # Embedded FalkorDB on-disk path. Used when graphiti_falkor_mode="embedded".
     # For the non-embedded Docker mode, set FALKOR_HOST=FALKOR_PORT instead.
     # Default under /root/.holmes so it survives container restarts when
@@ -102,7 +103,7 @@ def load_config() -> Config:
         file_upload_tmp_dir=os.getenv("FILE_UPLOAD_TMP_DIR", "/tmp/bot_uploads"),
         vision_model=os.getenv("VISION_MODEL") or "Qwen3.8-27B",
         main_model_supports_images=os.getenv("MAIN_MODEL_SUPPORTS_IMAGES", "").lower() in ("1", "true", "yes", "on"),
-        graphiti_memory_enabled=os.getenv("GRAPHITI_MEMORY_ENABLED", "").lower() in ("1", "true", "yes", "on"),
+        graphiti_memory_enabled=os.getenv("GRAPHITI_MEMORY_ENABLED", "true").lower() in ("1", "true", "yes", "on"),
         graphiti_db_path=os.getenv("GRAPHITI_DB_PATH", "/root/.holmes/graphiti.db"),
         graphiti_falkor_mode=os.getenv("GRAPHITI_FALKOR_MODE", "embedded"),
         graphiti_falkor_host=os.getenv("GRAPHITI_FALKOR_HOST", "localhost"),
