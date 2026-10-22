@@ -135,7 +135,12 @@ class MemoryService:
 
     def _build_driver(self, FalkorDriver):
         if bot_config.graphiti_falkor_mode == "embedded":
-            from redislite.async_falkordb_client import AsyncFalkorDB
+            # falkordblite provides an in-process FalkorDB server backed by
+            # redislite (on-disk at graphiti_db_path). Its AsyncFalkorDB class
+            # is what FalkorDriver accepts via the `falkor_db=` kwarg.
+            # NOTE: falkordblite only builds on Linux/macOS (redislite doesn't
+            # support win32), so this code path is dev-unreachable on Windows.
+            from falkordblite import AsyncFalkorDB
             falkordb_client = AsyncFalkorDB(dbfilename=bot_config.graphiti_db_path)
             return FalkorDriver(
                 falkor_db=falkordb_client,

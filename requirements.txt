@@ -29,20 +29,14 @@ pytest-asyncio==0.23.3
 pytest-mock==3.14.0
 
 # Graph memory (Graphiti + FalkorDB).
-# Two extras are needed:
-#   - `falkordb`: required for FalkorDriver even when using the embedded
-#     mode. FalkorDriver.py imports `falkordb.Graph` / `falkordb.asyncio`
-#     unconditionally.
-#   - `falkordblite`: only installs on Python 3.12+ — pip silently skips
-#     it on 3.10 (which is what the Docker image runs). Without it the
-#     embedded driver falls back to `AsyncFalkorDB` from `redislite` which
-#     is imported separately in memory_service._build_driver. For server
-#     mode (FalkorDB container), `falkordb` alone is enough.
+# Three extras are needed for embedded mode:
+#   - `falkordb`: the server client — FalkorDriver imports
+#     `falkordb.Graph` / `falkordb.asyncio` unconditionally.
+#   - `falkordblite`: the embedded server (FalkorDB running in-process via
+#     redislite). Requires Python 3.12+ (Docker image is ubuntu:24.04 +
+#     python3.12) and linux/macOS to build (redislite dependency does not
+#     support win32). Provides `falkordblite.AsyncFalkorDB` which we pass
+#     to FalkorDriver in embedded mode (see memory_service._build_driver).
 #   - `anthropic`: AnthropicClient for LLM-driven extraction.
-graphiti-core[falkordb,anthropic]>=0.31.2
-# redislite provides AsyncFalkorDB for embedded mode, which is a separate
-# package graphiti-core does not pull in as an extra. Only builds on
-# Linux/macOS — production runs in Docker/Linux so this is fine there.
-# On Windows dev, set GRAPHITI_FALKOR_MODE=server and point at a FalkorDB
-# Docker container instead.
-redislite>=0.5.0
+# Only `falkordb,anthropic` is needed for server mode (FalkorDB container).
+graphiti-core[falkordb,falkordblite,anthropic]>=0.31.2
