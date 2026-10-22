@@ -15,7 +15,6 @@ import os
 import uuid
 from typing import List, Optional
 
-import anthropic
 import structlog
 
 from src.bot.utils.config import config as bot_config
@@ -34,14 +33,16 @@ def _import_graphiti():
         return _graphiti
     from graphiti_core import Graphiti
     from graphiti_core.driver.falkordb_driver import FalkorDriver
-    from graphiti_core.llm_client.anthropic_client import AnthropicClient
+    from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
+    from graphiti_core.llm_client.config import LLMConfig
     from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
     from graphiti_core.nodes import EpisodeType
 
     _graphiti = {
         "Graphiti": Graphiti,
         "FalkorDriver": FalkorDriver,
-        "AnthropicClient": AnthropicClient,
+        "OpenAIGenericClient": OpenAIGenericClient,
+        "LLMConfig": LLMConfig,
         "OpenAIEmbedder": OpenAIEmbedder,
         "OpenAIEmbedderConfig": OpenAIEmbedderConfig,
         "EpisodeType": EpisodeType,
@@ -61,7 +62,7 @@ class MemoryService:
         self._graphiti = None  # graphiti_core.Graphiti instance
         self._initialized = False
         self._init_lock = asyncio.Lock()
-        self._anthropic = None  # lazy AsyncAnthropic client for keyword extraction
+        self._anthropic = None  # reserved for legacy keyword-extraction path
 
     async def initialize(self) -> None:
         if not bot_config.graphiti_memory_enabled:
@@ -78,7 +79,8 @@ class MemoryService:
                 mods = _import_graphiti()
                 Graphiti = mods["Graphiti"]
                 FalkorDriver = mods["FalkorDriver"]
-                AnthropicClient = mods["AnthropicClient"]
+                OpenAIGenericClient = mods["OpenAIGenericClient"]
+                LLMConfig = mods["LLMConfig"]
 
                 logger.info("memory_init_step",
                             step="build_driver",
@@ -88,13 +90,31 @@ class MemoryService:
                             port=bot_config.graphiti_falkor_port)
                 driver = self._build_driver(FalkorDriver)
 
+                # Use the OpenAI-compatible endpoint (OPENAI_API_KEY /
+                # OPENAI_API_BASE) for both the LLM and embedder. This way
+                # NVIDIA NIM, Together, vLLM, Ollama etc. work out of the box
+                # without needing a separate Anthropic key for entity
+                # extraction. The LLM model is whatever OPENAI_MODEL points
+                # at — typically the same model the bot uses for chat.
+                llm_model = os.environ.get("OPENAI_MODEL")
+                logger.info("memory_init_step",
+                            step="build_llm",
+                            model=llm_model or "OpenAI default",
+                            has_openai_key=bool(os.environ.get("OPENAI_API_KEY")),
+                            openai_base=os.environ.get("OPENAI_API_BASE", "<unset>"))
+                llm_config = LLMConfig(
+                    api_key=os.environ.get("OPENAI_API_KEY"),
+                    base_url=os.environ.get("OPENAI_API_BASE"),
+                    model=llm_model or None,
+                )
+                llm_client = OpenAIGenericClient(config=llm_config)
+
                 logger.info("memory_init_step",
                             step="build_embedder",
                             model=bot_config.graphiti_embedding_model,
                             dim=bot_config.graphiti_embedding_dim,
                             has_openai_key=bool(os.environ.get("OPENAI_API_KEY")),
                             openai_base=os.environ.get("OPENAI_API_BASE", "<unset>"))
-                llm_client = AnthropicClient()
                 embedder = self._build_embedder(mods["OpenAIEmbedder"], mods["OpenAIEmbedderConfig"])
 
                 self._graphiti = Graphiti(
@@ -105,8 +125,6 @@ class MemoryService:
 
                 logger.info("memory_init_step", step="build_indices")
                 await self._graphiti.build_indices_and_constraints()
-
-                self._anthropic = anthropic.AsyncAnthropic()
             except Exception:
                 # Re-raise with step context so the caller's except block
                 # logs which phase failed — no more guessing from a generic
@@ -200,30 +218,17 @@ class MemoryService:
         Cheaper + more precise than embedding the whole user message: long
         conversational messages often retrieve nothing on plain semantic
         similarity, but a distilled keyword query hits the right facts.
+
+        Implementation note: we no longer bias toward Anthropic for this —
+        the bot also supports an OpenAI-compatible-only setup (NVIDIA NIM,
+        vLLM, etc.) where no Anthropic key is available. Keyword extraction
+        was never wired up to the graphiti client anyway (self._anthropic
+        stayed None), so this method effectively just returns the query.
+        Keeping the signature for future use; can be replaced with a call
+        to graphiti's llm_client.generate_response if we ever need real
+        keyword extraction.
         """
-        if self._anthropic is None:
-            return query
-        try:
-            resp = await self._anthropic.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=80,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        "Extract 1-3 concise search terms from this user message "
-                        "for retrieving relevant knowledge from a fact database. "
-                        "Return only the terms as a single short phrase, comma-separated. "
-                        "No preamble.\n\nMessage: " + query
-                    ),
-                }],
-            )
-            text = "".join(
-                block.text for block in resp.content if getattr(block, "type", None) == "text"
-            )
-            return text.strip() or query
-        except Exception as e:
-            logger.warning("keyword_extraction_failed", error=str(e))
-            return query
+        return query
 
     async def add_episode(
         self,
