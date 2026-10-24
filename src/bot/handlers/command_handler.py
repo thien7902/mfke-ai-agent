@@ -1073,7 +1073,7 @@ class CommandHandler:
         )
 
         # Lazy-import to avoid a circular import at module load.
-        from src.bot.handlers.message_handler import _set_investigation_status, _clear_investigation_status
+        from src.bot.handlers.message_handler import _set_investigation_status, _clear_investigation
 
         try:
             from holmes.core.tool_calling_llm import LLMInterruptedError as _LLMInterrupted
@@ -1144,7 +1144,7 @@ class CommandHandler:
         if cancel_event.is_set() and "🛑 Stopped by user." not in response:
             response = (response or "") + "\n\n🛑 Stopped by user."
 
-        _clear_investigation_status(chat_id, topic_id)
+        _clear_investigation(chat_id, topic_id)
 
         await conv_service.save_conversation(conversation)
 
