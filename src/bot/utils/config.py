@@ -24,6 +24,9 @@ class Config:
     # Holmes
     holmes_config_path: str
     holmes_system_prompt_additions: Optional[str] = None
+    # Key into ~/.holmes/model_list.yaml for the /claude one-shot enterprise model.
+    # When unset, /claude replies with a "not configured" error.
+    claude_enterprise_model: Optional[str] = None
 
     # Logging
     log_level: str = "INFO"
@@ -93,6 +96,7 @@ def load_config() -> Config:
         admin_user_ids=admin_user_ids,
         holmes_config_path=os.getenv("HOLMES_CONFIG_PATH", "/root/.holmes/config.yaml"),
         holmes_system_prompt_additions=os.getenv("HOLMES_SYSTEM_PROMPT_ADDITIONS"),
+        claude_enterprise_model=os.getenv("CLAUDE_ENTERPRISE_MODEL") or None,
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "30")),
         permission_request_expiry_minutes=int(os.getenv("PERMISSION_REQUEST_EXPIRY_MINUTES", "10")),

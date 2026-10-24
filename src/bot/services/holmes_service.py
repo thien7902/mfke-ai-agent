@@ -146,6 +146,12 @@ class HolmesService:
         self._tool_calling_llm: Optional[ToolCallingLLM] = None
         self._initialized = False
         self._memory: Optional["MemoryService"] = memory_service
+        # Lazily-built second ToolCallingLLM keyed by CLAUDE_ENTERPRISE_MODEL
+        # (a key in ~/.holmes/model_list.yaml). Built on first /claude call so
+        # a missing or misconfigured enterprise model doesn't break startup.
+        self._enterprise_tcll: Optional[ToolCallingLLM] = None
+        self._enterprise_tracer = None
+        self._enterprise_init_lock = asyncio.Lock()
 
     def _get_llm_config(self) -> Dict[str, Any]:
         """Get LLM configuration from environment variables."""
@@ -239,6 +245,7 @@ class HolmesService:
             # Create tracer for LLM wrapping
             tracer_factory = TracingFactory()
             tracer = tracer_factory.create_tracer("langchain")
+            self._enterprise_tracer = tracer
 
             # Initialize tool executor using Config's built-in method to load proper toolsets
             self._tool_executor = self._config.create_tool_executor(
@@ -284,12 +291,13 @@ class HolmesService:
             logger.error("Failed to initialize Holmes service", error=str(e))
             raise
 
-    def _wrap_todo_write_tool(self):
+    def _wrap_todo_write_tool(self, tool_executor=None):
         """Wrap the TodoWrite tool to capture investigation task updates."""
-        if not self._tool_executor:
+        te = tool_executor if tool_executor is not None else self._tool_executor
+        if not te:
             return
 
-        for toolset in self._tool_executor.toolsets:
+        for toolset in te.toolsets:
             for i, tool in enumerate(toolset.tools):
                 if tool.name == "TodoWrite":
                     original_invoke = tool.invoke
@@ -360,7 +368,7 @@ class HolmesService:
             for t in normalized:
                 logger.info("Task", id=t.get("id"), content=t.get("content"), status=t.get("status"))
 
-    def _wrap_bash_tool_timeout(self):
+    def _wrap_bash_tool_timeout(self, tool_executor=None):
         """Clamp the bash tool's timeout parameter to BASH_TIMEOUT_MAX_SECONDS.
 
         The Holmes bash tool declares 30s as the default timeout but honors any
@@ -368,10 +376,11 @@ class HolmesService:
         long-running command it requests 60s/120s/300s+, and Holmes waits that
         long. This wrapper caps the value before the tool executes.
         """
-        if not self._tool_executor:
+        te = tool_executor if tool_executor is not None else self._tool_executor
+        if not te:
             return
 
-        for toolset in self._tool_executor.toolsets:
+        for toolset in te.toolsets:
             for tool in toolset.tools:
                 if tool.name == "bash":
                     original_invoke = tool.invoke
@@ -401,7 +410,7 @@ class HolmesService:
                     logger.info("Wrapped bash tool to cap timeout at %ds", BASH_TIMEOUT_MAX_SECONDS)
                     break
 
-    def _register_search_memory_tool(self):
+    def _register_search_memory_tool(self, tool_executor=None):
         """Register the search_memory Holmes tool so the LLM can call it.
 
         Memory retrieval is exposed as a Holmes tool, not as a pre-LLM injection.
@@ -411,10 +420,11 @@ class HolmesService:
         When memory is disabled, we still register the tool — it returns a
         'memory disabled' message so Holmes doesn't error if called.
         """
-        if not self._tool_executor or not self._memory:
+        te = tool_executor if tool_executor is not None else self._tool_executor
+        if not te or not self._memory:
             return
         tool = SearchMemoryTool(self._memory)
-        self._tool_executor.tools_by_name[tool.name] = tool
+        te.tools_by_name[tool.name] = tool
         logger.info("Registered search_memory tool")
 
     def get_latest_investigation_tasks(self) -> List[Dict[str, Any]]:
@@ -451,6 +461,57 @@ class HolmesService:
         self._tool_executor = None
         self._config = None
         self._initialized = False
+        self._enterprise_tcll = None
+
+    async def _get_enterprise_tcll(self) -> ToolCallingLLM:
+        """Lazily build a ToolCallingLLM for the configured enterprise model.
+
+        The model key comes from `bot_config.claude_enterprise_model` and must
+        exist in `~/.holmes/model_list.yaml` — Holmes' LLMModelRegistry
+        resolves it (api_base, api_key, etc.) so we don't duplicate credentials.
+
+        Built once per process; cached on `self._enterprise_tcll`. Reuses the
+        same tracer and the same tool wrappers (TodoWrite capture, bash timeout
+        clamp, search_memory) as the default LLM so /ping and tool calls behave
+        identically.
+        """
+        if self._enterprise_tcll is not None:
+            return self._enterprise_tcll
+
+        async with self._enterprise_init_lock:
+            if self._enterprise_tcll is not None:
+                return self._enterprise_tcll
+
+            model_key = bot_config.claude_enterprise_model
+            if not model_key:
+                raise RuntimeError(
+                    "CLAUDE_ENTERPRISE_MODEL not configured. Set it to a key "
+                    "from ~/.holmes/model_list.yaml to use /claude."
+                )
+
+            await self.initialize()
+            tcll = self._config.create_toolcalling_llm(
+                toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+                enable_all_toolsets_possible=True,
+                prerequisite_cache=PrerequisiteCacheMode.ENABLED,
+                model=model_key,
+                tracer=self._enterprise_tracer,
+                tool_results_dir=None,
+            )
+            # Apply the same wrappers as the default LLM. create_toolcalling_llm
+            # builds its own tool_executor, so re-wrap on that executor (same
+            # pattern as initialize() does for the default LLM).
+            self._wrap_todo_write_tool(tcll.tool_executor)
+            self._wrap_bash_tool_timeout(tcll.tool_executor)
+            self._register_search_memory_tool(tcll.tool_executor)
+
+            self._enterprise_tcll = tcll
+            logger.info("Enterprise ToolCallingLLM initialized", model=model_key)
+            return self._enterprise_tcll
+
+    def enterprise_model_configured(self) -> bool:
+        """True when CLAUDE_ENTERPRISE_MODEL points at a model key in model_list.yaml."""
+        return bool(bot_config.claude_enterprise_model)
 
     def _create_approval_callback(self, user_id: int, chat_id: int, topic_id: int, context: Any) -> Callable[[PendingToolApproval], Tuple[bool, Optional[str]]]:
         """Create an approval callback that sends request to Telegram and waits for response."""
@@ -908,6 +969,69 @@ class HolmesService:
             conversation.add_message(Message(role="assistant", content=error_msg))
             return error_msg
 
+    async def chat_enterprise(
+        self,
+        user_id: int,
+        user_message: str,
+        conversation: Conversation,
+        user_permissions: List[UserPermission],
+        stream: bool = True,
+        telegram_context: Any = None,
+        chat_id: int = 0,
+        topic_id: int = 0,
+        cancel_event: Optional[threading.Event] = None,
+        images: Optional[List[Dict[str, Any]]] = None,
+    ) -> str | AsyncGenerator[str, None]:
+        """One-shot turn routed to a different ToolCallingLLM.
+
+        Mirrors `chat()` but uses `_get_enterprise_tcll()` instead of the
+        default `self._tool_calling_llm`. Used by the /claude command. The
+        user prompt and assistant reply are appended to the same conversation
+        as normal turns, so follow-ups on the default LLM still see this turn
+        in history.
+        """
+        enterprise_tcll = await self._get_enterprise_tcll()
+
+        user_msg = Message(role="user", content=user_message)
+        if images:
+            user_msg.metadata["images"] = images
+        conversation.add_message(user_msg)
+
+        holmes_messages = self._build_holmes_messages(
+            self._convert_messages_to_holmes_format(conversation.messages),
+            user_id,
+        )
+        features = self._get_user_permissions(user_permissions)
+
+        try:
+            if stream:
+                return self._stream_chat(
+                    holmes_messages, features, user_id, conversation,
+                    telegram_context, chat_id, topic_id, cancel_event=cancel_event,
+                    tcll=enterprise_tcll,
+                )
+            else:
+                response_text, llm_result = await self._non_stream_chat_with_memory(
+                    holmes_messages, features, user_id, telegram_context, chat_id, topic_id,
+                    cancel_event=cancel_event, tcll=enterprise_tcll,
+                )
+                try:
+                    for msg in self._convert_llm_result_to_messages(llm_result):
+                        conversation.add_message(msg)
+                except Exception as e:
+                    logger.warning("Failed to save assistant message, continuing without tool calls", error=str(e))
+                    conversation.add_message(Message(role="assistant", content=response_text or ""))
+                self.update_conversation_memory(conversation, {
+                    "session_id": llm_result.metadata.get("session_id") if llm_result.metadata else None,
+                    "metadata": llm_result.metadata or {},
+                })
+                return response_text
+        except Exception as e:
+            logger.error("Enterprise chat error", user_id=user_id, error=str(e))
+            error_msg = "I encountered an error while processing your request. Please try again."
+            conversation.add_message(Message(role="assistant", content=error_msg))
+            return error_msg
+
     # Default search_memory tool-use rule. Appended to HOLMES_SYSTEM_PROMPT_ADDITIONS
     # when graphiti_memory_enabled is True so all deployments that turn on memory
     # get the rule without each user having to write it. Users can override by
@@ -982,9 +1106,11 @@ class HolmesService:
         chat_id: int = 0,
         topic_id: int = 0,
         cancel_event: Optional[threading.Event] = None,
+        tcll: Optional[ToolCallingLLM] = None,
     ) -> tuple[str, LLMResult]:
         """Non-streaming chat with Holmes, returning full result for memory storage."""
         loop = asyncio.get_event_loop()
+        llm = tcll if tcll is not None else self._tool_calling_llm
 
         # Use approval callback if tool_approval feature is enabled and we have telegram context
         enable_approval = features.get("tool_approval", False) and telegram_context is not None
@@ -1001,7 +1127,7 @@ class HolmesService:
             try:
                 result: LLMResult = await loop.run_in_executor(
                     _holmes_executor,
-                    lambda: self._tool_calling_llm.call(
+                    lambda: llm.call(
                         messages=messages,
                         request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
                         approval_callback=approval_callback,
@@ -1018,7 +1144,7 @@ class HolmesService:
             try:
                 result: LLMResult = await loop.run_in_executor(
                     _holmes_executor,
-                    lambda: self._tool_calling_llm.call(
+                    lambda: llm.call(
                         messages=messages,
                         request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
                         cancel_event=cancel_event,
@@ -1034,6 +1160,7 @@ class HolmesService:
         self, messages: List[Dict[str, Any]], features: Dict[str, bool], user_id: int, conversation: Conversation = None,
         telegram_context: Any = None, chat_id: int = 0, topic_id: int = 0,
         cancel_event: Optional[threading.Event] = None,
+        tcll: Optional[ToolCallingLLM] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Streaming chat with Holmes, yielding structured events including task updates and handling tool approval.
 
@@ -1047,7 +1174,7 @@ class HolmesService:
 
         async for evt in self._run_holmes_stream(
             messages, None, features, user_id, conversation, telegram_context, chat_id, topic_id, task_state,
-            cancel_event=cancel_event,
+            cancel_event=cancel_event, tcll=tcll,
         ):
             event_type = evt.get("type")
 
@@ -1154,16 +1281,18 @@ class HolmesService:
         topic_id: int,
         task_state: Dict[str, Any],
         cancel_event: Optional[threading.Event] = None,
+        tcll: Optional[ToolCallingLLM] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run (or resume) one Holmes stream call, recursing on APPROVAL_REQUIRED
         so any number of approval rounds are handled with the correctly
         updated message list each time."""
         loop = asyncio.get_event_loop()
         enable_approval = features.get("tool_approval", False)
+        llm = tcll if tcll is not None else self._tool_calling_llm
 
         def stream_generator():
             logger.warning("Stream generator", enable_approval=enable_approval, has_tool_decisions=tool_decisions is not None)
-            return self._tool_calling_llm.call_stream(
+            return llm.call_stream(
                 msgs=messages,
                 request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
                 enable_tool_approval=enable_approval,
@@ -1364,7 +1493,7 @@ class HolmesService:
                     async for resumed_evt in self._run_holmes_stream(
                         updated_messages, decisions, features, user_id, conversation,
                         telegram_context, chat_id, topic_id, task_state,
-                        cancel_event=cancel_event,
+                        cancel_event=cancel_event, tcll=llm,
                     ):
                         yield resumed_evt
                 return

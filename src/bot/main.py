@@ -160,7 +160,9 @@ class TelegramBot:
             self.conversation_service,
             self.permission_service,
         )
-        cmd_handler = BotCommandHandler(self.permission_service, self.conversation_service)
+        cmd_handler = BotCommandHandler(
+            self.permission_service, self.conversation_service, holmes_service=self.holmes_service
+        )
         priv_handler = PrivilegeHandler(self.permission_service)
         add_memory_handler = AddMemoryCommand(self.memory_service, self.permission_service)
 
@@ -175,6 +177,10 @@ class TelegramBot:
         self.application.add_handler(TelegramCommandHandler("shell", cmd_handler.shell_command))
         self.application.add_handler(TelegramCommandHandler("reconcile", cmd_handler.reconcile_command))
         self.application.add_handler(TelegramCommandHandler("kshell", cmd_handler.kshell_command))
+        # /claude — admin only; routes a one-shot turn through the enterprise
+        # model configured via CLAUDE_ENTERPRISE_MODEL (key in
+        # ~/.holmes/model_list.yaml). See CommandHandler.claude_command.
+        self.application.add_handler(TelegramCommandHandler("claude", cmd_handler.claude_command))
         # /addmemory — admin only; ingests replied message text or attached file
         # content as a knowledge episode into Graphiti (see src/bot/commands/add_memory.py)
         self.application.add_handler(TelegramCommandHandler("addmemory", add_memory_handler.handle))

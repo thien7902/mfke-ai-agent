@@ -2,11 +2,14 @@
 import asyncio
 import shlex
 import structlog
+import threading
+from typing import Optional
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from src.bot.services.permission_service import PermissionService
 from src.bot.services.conversation_service import ConversationService
+from src.bot.services.holmes_service import HolmesService
 from src.bot.models.user import UserPermission
 from src.bot.utils.decorators import admin_only, rate_limit
 from src.bot.utils.kubeconfig_crypto import (
@@ -14,6 +17,7 @@ from src.bot.utils.kubeconfig_crypto import (
     decrypt_to_tempfile,
     cleanup_tempfile,
 )
+from src.bot.utils.telegram_helpers import send_long_message
 
 logger = structlog.get_logger(__name__)
 
@@ -21,9 +25,15 @@ logger = structlog.get_logger(__name__)
 class CommandHandler:
     """Handle basic bot commands."""
 
-    def __init__(self, permission_service: PermissionService, conversation_service: ConversationService = None):
+    def __init__(
+        self,
+        permission_service: PermissionService,
+        conversation_service: ConversationService = None,
+        holmes_service: Optional[HolmesService] = None,
+    ):
         self.permissions = permission_service
         self.conversations = conversation_service
+        self.holmes = holmes_service
 
     @rate_limit
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -77,6 +87,7 @@ class CommandHandler:
                 "\n\n🔧 **Admin commands:**\n"
                 "/shell <command> - Execute a shell command in the bot container\n"
                 "/kshell [kc_name] <command> - Run command with a decrypted kubeconfig (/kshell alone to list)\n"
+                "/claude <prompt> - Run a one-shot turn on the enterprise model\n"
                 "/grant <user_id> <permission> - Request permission for user\n"
                 "/revoke <user_id> <permission> - Revoke user permission\n"
                 "/user_permissions <user_id> - View user's permissions\n"
@@ -124,6 +135,7 @@ class CommandHandler:
                 "\n**Admin Commands:**\n"
                 "/shell <command> - Execute a shell command in the bot container\n"
                 "/kshell [kc_name] <command> - Run command with a decrypted kubeconfig (/kshell alone to list)\n"
+                "/claude <prompt> - Run a one-shot turn on the enterprise model\n"
                 "/grant <user_id> <permission> - Request a permission for a user\n"
                 "/revoke <user_id> <permission> - Revoke a user's permission\n"
                 "/user_permissions <user_id> - View another user's permissions\n"
@@ -979,3 +991,185 @@ class CommandHandler:
             )
         except Exception:
             pass
+
+    @admin_only
+    @rate_limit
+    async def claude_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /claude <prompt> — route a one-shot turn through the enterprise model.
+
+        Admin-only. The model key is configured via CLAUDE_ENTERPRISE_MODEL (a
+        key in ~/.holmes/model_list.yaml); Holmes' LLMModelRegistry resolves
+        it to api_base + api_key, so no credentials are duplicated here. The
+        prompt and reply are appended to the same topic conversation as normal
+        turns, so follow-up plain messages on the default model still see
+        this turn in history.
+        """
+        if not update.message:
+            return
+
+        chat = update.effective_chat
+        topic_id = update.message.message_thread_id or 0
+
+        if chat.type == "private":
+            await update.message.reply_text(
+                "🚫 Private chats are disabled. Please use the bot in a group forum topic.",
+                message_thread_id=None,
+            )
+            return
+
+        if not (chat.type in ("group", "supergroup") and chat.is_forum and topic_id):
+            await update.message.reply_text(
+                "ℹ️ /claude only works inside a forum topic.",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: /claude <prompt>\nExample: /claude summarize the latest pod logs",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        prompt = " ".join(context.args).strip()
+        if not prompt:
+            await update.message.reply_text(
+                "❌ Empty prompt.",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        if self.holmes is None:
+            await update.message.reply_text(
+                "❌ Holmes service is not wired up. /claude is unavailable.",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        if not self.holmes.enterprise_model_configured():
+            await update.message.reply_text(
+                "❌ Enterprise model not configured. Set CLAUDE_ENTERPRISE_MODEL "
+                "to a key from ~/.holmes/model_list.yaml.",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        user = update.effective_user
+        chat_id = chat.id
+
+        user_model = await self.permissions.get_or_create_user(
+            telegram_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+        )
+
+        if self.conversations is not None:
+            conv_service = self.conversations
+        else:
+            conv_service = ConversationService()
+        conversation = await conv_service.get_conversation(
+            user.id, topic_id=topic_id, chat_id=chat_id
+        )
+
+        # Lazy-import to avoid a circular import at module load.
+        from src.bot.handlers.message_handler import _set_investigation_status, _clear_investigation_status
+
+        try:
+            from holmes.core.tool_calling_llm import LLMInterruptedError as _LLMInterrupted
+        except Exception:
+            _LLMInterrupted = ()
+
+        ack = await update.message.reply_text(
+            f"🧭 Routing to enterprise model...\n\n📝 Prompt:\n`{prompt[:200]}`",
+            message_thread_id=topic_id or None,
+            parse_mode="Markdown",
+        )
+
+        # Streaming via enterprise LLM, but deliver only final text (matches
+        # /ping-capable regular-response flow).
+        _set_investigation_status(chat_id, topic_id, "🧭 Enterprise model...")
+        cancel_event = threading.Event()
+        response = ""
+        try:
+            async_gen = await self.holmes.chat_enterprise(
+                user_id=user.id,
+                user_message=prompt,
+                conversation=conversation,
+                user_permissions=user_model.permissions,
+                stream=True,
+                telegram_context=context,
+                chat_id=chat_id,
+                topic_id=topic_id,
+                cancel_event=cancel_event,
+            )
+            async for event in async_gen:
+                event_type = event.get("type", "unknown")
+                if event_type == "content":
+                    response += event.get("content", "")
+                    _set_investigation_status(
+                        chat_id, topic_id, response_preview=response[-300:],
+                    )
+                elif event_type == "task_update":
+                    _set_investigation_status(
+                        chat_id, topic_id, None, tasks=event.get("tasks", []),
+                    )
+                elif event_type == "tool_call":
+                    tool_name = event.get("tool_name", "unknown")
+                    _set_investigation_status(
+                        chat_id, topic_id,
+                        status_text=f"🔧 Using {tool_name}...",
+                        last_tool=tool_name,
+                        last_activity=f"🔧 {tool_name}",
+                    )
+                elif event_type == "tool_result":
+                    tool_name = event.get("tool_name", "unknown")
+                    _set_investigation_status(
+                        chat_id, topic_id,
+                        status_text=f"✅ Completed {tool_name}",
+                        last_activity=f"✅ {tool_name}",
+                    )
+        except _LLMInterrupted:
+            if cancel_event is not None:
+                cancel_event.set()
+        except Exception as e:
+            logger.error("/claude failed", user_id=user.id, error=str(e))
+            _clear_investigation(chat_id, topic_id)
+            await ack.edit_text(
+                f"❌ Enterprise model call failed: {e}",
+                parse_mode=None,
+            )
+            return
+
+        if cancel_event.is_set() and "🛑 Stopped by user." not in response:
+            response = (response or "") + "\n\n🛑 Stopped by user."
+
+        _clear_investigation_status(chat_id, topic_id)
+
+        await conv_service.save_conversation(conversation)
+
+        if not response.strip():
+            response = "(no output from enterprise model)"
+
+        try:
+            await ack.delete()
+        except Exception:
+            pass
+
+        try:
+            await send_long_message(
+                context.bot,
+                chat_id,
+                response,
+                message_thread_id=topic_id or None,
+            )
+        except Exception as e:
+            logger.warning("Failed to deliver /claude response", user_id=user.id, error=str(e))
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ The enterprise response was generated but couldn't be delivered. Please try again.",
+                    message_thread_id=topic_id or None,
+                )
+            except Exception:
+                pass
