@@ -5,53 +5,16 @@ investigations. The tool-use policy (when to call, what query text) is
 governed by a rule in HOLMES_SYSTEM_PROMPT_ADDITIONS — not by Holmes
 deciding freely.
 
-Tool.invoke is sync, but MemoryService.retrieve_relevant is async. We
-bridge via a dedicated event loop running in a worker thread so we don't
-stomp on Telegram's main loop and don't deadlock when called from inside
-Holmes' own thread pool.
+MemoryService owns its dedicated event loop and handles cross-loop
+bridging internally, so this tool is a trivial sync call into the service.
 """
-import asyncio
 import logging
-import threading
 from typing import Dict, Optional
 
 import structlog
 from holmes.core.tools import Tool, ToolParameter, StructuredToolResult, StructuredToolResultStatus, ToolInvokeContext
 
 logger = structlog.get_logger(__name__)
-
-
-# Module-level loop + thread shared by all search_memory invocations.
-# Created lazily on first invoke — avoids spinning a thread in tests that
-# never call the tool.
-_loop: Optional[asyncio.AbstractEventLoop] = None
-_loop_lock = threading.Lock()
-_loop_thread: Optional[threading.Thread] = None
-
-
-def _get_loop() -> asyncio.AbstractEventLoop:
-    global _loop, _loop_thread
-    if _loop is not None and not _loop.is_closed():
-        return _loop
-    with _loop_lock:
-        if _loop is None or _loop.is_closed():
-            _loop = asyncio.new_event_loop()
-            _loop_thread = threading.Thread(
-                target=_loop.run_forever, name="search-memory-loop", daemon=True
-            )
-            _loop_thread.start()
-    return _loop
-
-
-def _run_async(coro, timeout: float = 30.0):
-    """Run an async coroutine from sync context on the dedicated loop."""
-    loop = _get_loop()
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
-    try:
-        return future.result(timeout=timeout)
-    except Exception as e:
-        logger.warning("search_memory_async_failed", error=str(e))
-        return []
 
 
 class SearchMemoryTool(Tool):
@@ -93,7 +56,6 @@ class SearchMemoryTool(Tool):
     )
 
     def __init__(self, memory_service):
-        # Pydantic BaseModel __init__ — pass fields explicitly then stash svc
         super().__init__()
         self._memory = memory_service
 
@@ -122,8 +84,37 @@ class SearchMemoryTool(Tool):
         except (TypeError, ValueError):
             k = 5
 
-        # MemoryService.retrieve_relevant is async — bridge to sync.
-        facts = _run_async(self._memory.retrieve_relevant(query, k=k))
+        # MemoryService.retrieve_relevant is async. Holmes calls _invoke
+        # from a sync context (its own thread pool), so we need to await
+        # the coroutine. The synchronous call we want is: block on the
+        # event loop that owns graphiti's connections and return the result.
+        # MemoryService owns that loop and exposes `_run` for sync callers.
+        try:
+            import asyncio as _asyncio
+            # Is there a running loop in this thread? If yes (rare for Holmes
+            # tools), we can't block on a coroutine — use the service's loop
+            # via run_coroutine_threadsafe.
+            try:
+                _asyncio.get_running_loop()
+                running = True
+            except RuntimeError:
+                running = False
+
+            coro = self._memory.retrieve_relevant(query, k=k)
+            if running:
+                # Use the service's dedicated loop to avoid blocking our own.
+                loop = self._memory._ensure_loop()
+                future = _asyncio.run_coroutine_threadsafe(coro, loop)
+                facts = future.result(timeout=30.0)
+            else:
+                # No loop running in this thread — block on the coroutine
+                # via the service's loop.
+                facts = self._memory._run(coro, timeout=30.0)
+        except Exception as e:
+            logger.warning("search_memory_failed", error=str(e),
+                           error_type=type(e).__name__)
+            facts = []
+
         if not facts:
             data = "No relevant facts found in memory."
         else:

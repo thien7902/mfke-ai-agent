@@ -7,11 +7,20 @@ facts which are injected into the system prompt.
 
 Disabled by default (Config.graphiti_memory_enabled=False) — when off,
 every method is a no-op so the bot keeps working without a graph DB.
+
+Threading model: MemoryService owns a dedicated event loop running in a
+daemon thread ("memory-loop"). All graphiti calls (initialize, add_episode,
+search, close) run on that loop. The Telegram main loop and the Holmes
+worker thread both reach the service via run_coroutine_threadsafe — graphiti
+holds redis/FalkorDB connections bound to a specific loop, so every access
+must go through the same loop, otherwise we hit "Future attached to a
+different loop" RuntimeError.
 """
 import asyncio
 import datetime
 import logging
 import os
+import threading
 import uuid
 from typing import List, Optional
 
@@ -53,9 +62,10 @@ def _import_graphiti():
 class MemoryService:
     """Singleton-ish service wrapping Graphiti.
 
-    Lifecycle: instantiate once at app start, call `await initialize()` before
-    first use, call `await close()` on shutdown. When `graphiti_memory_enabled`
-    is False, every method becomes a no-op.
+    Lifecycle: instantiate once at app start. The dedicated loop is started
+    lazily on first use (initialize or any public method). Call
+    `await initialize()` before first use, call `await close()` on shutdown.
+    When `graphiti_memory_enabled` is False, every method becomes a no-op.
     """
 
     def __init__(self):
@@ -64,16 +74,67 @@ class MemoryService:
         self._init_lock = asyncio.Lock()
         self._anthropic = None  # reserved for legacy keyword-extraction path
 
+        # Dedicated loop + worker thread for all graphiti calls. Created
+        # lazily so tests that never touch memory don't spin a thread.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
+        self._loop_lock = threading.Lock()
+
+    # ------------------------------------------------------------------ #
+    # Loop management
+    # ------------------------------------------------------------------ #
+
+    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+        """Return the dedicated loop, starting it in a daemon thread if needed."""
+        if self._loop is not None and not self._loop.is_closed():
+            return self._loop
+        with self._loop_lock:
+            if self._loop is None or self._loop.is_closed():
+                self._loop = asyncio.new_event_loop()
+                self._loop_thread = threading.Thread(
+                    target=self._loop.run_forever,
+                    name="memory-loop",
+                    daemon=True,
+                )
+                self._loop_thread.start()
+        return self._loop
+
+    def _run(self, coro, timeout: Optional[float] = None):
+        """Schedule a coroutine on the dedicated loop and block until done.
+
+        Use this from sync contexts (e.g. SearchMemoryTool._invoke running in
+        Holmes' ThreadPoolExecutor). From async contexts, prefer
+        `await self._run_async(coro)` which uses run_coroutine_threadsafe and
+        awaits the threaded future via asyncio.wrap_future — that avoids
+        blocking the caller's loop and stays cooperative.
+        """
+        loop = self._ensure_loop()
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result(timeout=timeout)
+
+    async def _run_async(self, coro):
+        """Schedule a coroutine on the dedicated loop and await it from
+        the caller's loop without blocking."""
+        loop = self._ensure_loop()
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return await asyncio.wrap_future(future)
+
+    # ------------------------------------------------------------------ #
+    # Public API — all async methods schedule onto the dedicated loop
+    # ------------------------------------------------------------------ #
+
     async def initialize(self) -> None:
         if not bot_config.graphiti_memory_enabled:
             return
+        # Initialize is itself async and runs on the caller's loop. We need
+        # it to run on the dedicated loop so graphiti's connections bind to
+        # the dedicated loop (not the caller's loop). Schedule + await.
+        await self._run_async(self._initialize_on_loop())
+
+    async def _initialize_on_loop(self) -> None:
         async with self._init_lock:
             if self._initialized:
                 return
-            # Log each step so the startup failure log points at the exact
-            # phase that broke — otherwise we just get a generic "memory init
-            # failed" and have to guess which sub-step (import, driver, embedder,
-            # index build) threw.
             try:
                 logger.info("memory_init_step", step="import_graphiti")
                 mods = _import_graphiti()
@@ -90,12 +151,6 @@ class MemoryService:
                             port=bot_config.graphiti_falkor_port)
                 driver = self._build_driver(FalkorDriver)
 
-                # Use the OpenAI-compatible endpoint (OPENAI_API_KEY /
-                # OPENAI_API_BASE) for both the LLM and embedder. This way
-                # NVIDIA NIM, Together, vLLM, Ollama etc. work out of the box
-                # without needing a separate Anthropic key for entity
-                # extraction. The LLM model is whatever OPENAI_MODEL points
-                # at — typically the same model the bot uses for chat.
                 llm_model = os.environ.get("OPENAI_MODEL")
                 logger.info("memory_init_step",
                             step="build_llm",
@@ -126,9 +181,6 @@ class MemoryService:
                 logger.info("memory_init_step", step="build_indices")
                 await self._graphiti.build_indices_and_constraints()
             except Exception:
-                # Re-raise with step context so the caller's except block
-                # logs which phase failed — no more guessing from a generic
-                # exception message.
                 logger.exception("memory_init_failed_at_step")
                 raise
 
@@ -138,11 +190,6 @@ class MemoryService:
                         group_id=bot_config.graphiti_group_id)
 
     def _build_embedder(self, OpenAIEmbedder, OpenAIEmbedderConfig):
-        """Build the OpenAI-compatible embedder from config + env.
-
-        Pulls model name + dim from Config (default: Vietnamese_Embedding /
-        1024-dim) and API credentials from OPENAI_API_KEY / OPENAI_API_BASE.
-        """
         embedder_config = OpenAIEmbedderConfig(
             api_key=os.environ.get("OPENAI_API_KEY"),
             base_url=os.environ.get("OPENAI_API_BASE"),
@@ -153,14 +200,6 @@ class MemoryService:
 
     def _build_driver(self, FalkorDriver):
         if bot_config.graphiti_falkor_mode == "embedded":
-            # falkordblite is a meta-package that installs/patches the
-            # `redislite` module with an extra `async_falkordb_client`
-            # submodule providing `AsyncFalkorDB` — an in-process FalkorDB
-            # server backed by redislite (on-disk at graphiti_db_path).
-            # That AsyncFalkorDB instance is what FalkorDriver accepts via
-            # the `falkor_db=` kwarg.
-            # NOTE: falkordblite only builds on Linux/macOS (redislite doesn't
-            # support win32), so this code path is dev-unreachable on Windows.
             from redislite.async_falkordb_client import AsyncFalkorDB
             falkordb_client = AsyncFalkorDB(dbfilename=bot_config.graphiti_db_path)
             return FalkorDriver(
@@ -181,14 +220,28 @@ class MemoryService:
         query (keyword extraction), then Graphiti's hybrid search returns
         matching facts. Returns an empty list when memory is disabled.
         """
+        if not bot_config.graphiti_memory_enabled:
+            return []
+        if not query or not query.strip():
+            return []
+        if not self._initialized:
+            # Auto-init on first use. If init failed before, this will raise
+            # from _initialize_on_loop and retrieve returns [] via the except
+            # below.
+            try:
+                await self.initialize()
+            except Exception as e:
+                logger.warning("retrieve_relevant_init_failed",
+                               error=str(e), error_type=type(e).__name__)
+                return []
+        return await self._run_async(self._retrieve_on_loop(query, k))
+
+    async def _retrieve_on_loop(self, query: str, k: int) -> List[str]:
         if not bot_config.graphiti_memory_enabled or not self._initialized:
             return []
         if not query or not query.strip():
             return []
 
-        # Keyword extraction is best-effort: if it fails, fall back to the raw
-        # user query so we still try to retrieve. Failures here are logged but
-        # not fatal — the search step below is what matters.
         try:
             search_query = await self._extract_keywords(query)
             if not search_query:
@@ -201,21 +254,18 @@ class MemoryService:
             edges = await self._graphiti.search(
                 query=search_query,
                 num_results=k,
+                group_ids=[bot_config.graphiti_group_id],
             )
             facts = [e.fact for e in edges if getattr(e, "fact", None)]
             logger.info("memory_retrieved",
                         query_preview=query[:60],
                         search_query=search_query,
+                        group_id=bot_config.graphiti_group_id,
                         num_edges=len(edges),
                         num_facts=len(facts),
                         initialized=self._initialized)
             return facts
         except Exception as e:
-            # Distinguish "empty search" from "search raised" — when
-            # memory_retrieval_failed logs, the user's /addmemory data may
-            # be fine but search hit a FalkorDB error or embedder timeout.
-            # Without this we just see "no facts found" in the tool result
-            # and can't tell if DB is empty or broken.
             logger.error(
                 "memory_retrieval_failed",
                 error=str(e),
@@ -226,21 +276,6 @@ class MemoryService:
             return []
 
     async def _extract_keywords(self, query: str) -> str:
-        """Ask the LLM to compress the user message into 1-3 search terms.
-
-        Cheaper + more precise than embedding the whole user message: long
-        conversational messages often retrieve nothing on plain semantic
-        similarity, but a distilled keyword query hits the right facts.
-
-        Implementation note: we no longer bias toward Anthropic for this —
-        the bot also supports an OpenAI-compatible-only setup (NVIDIA NIM,
-        vLLM, etc.) where no Anthropic key is available. Keyword extraction
-        was never wired up to the graphiti client anyway (self._anthropic
-        stayed None), so this method effectively just returns the query.
-        Keeping the signature for future use; can be replaced with a call
-        to graphiti's llm_client.generate_response if we ever need real
-        keyword extraction.
-        """
         return query
 
     async def add_episode(
@@ -257,11 +292,6 @@ class MemoryService:
             logger.warning("add_episode_called_but_disabled")
             return None
         if not self._initialized:
-            # Initialize failed at startup — main.py:120 logged it once with
-            # memory_init_failed_bot_continues, but every add_episode call
-            # silently returns None which makes /addmemory failures invisible.
-            # Log here too so the user sees the init failure linked to their
-            # add request (not just a generic "failed to add" from the command).
             logger.error(
                 "add_episode_called_but_not_initialized",
                 hint="MemoryService.initialize() failed at startup — "
@@ -272,7 +302,17 @@ class MemoryService:
             raise RuntimeError("MemoryService is not initialized")
         if not text or not text.strip():
             return None
+        return await self._run_async(
+            self._add_episode_on_loop(text, source_description, reference_time, name)
+        )
 
+    async def _add_episode_on_loop(
+        self,
+        text: str,
+        source_description: str,
+        reference_time: Optional[datetime.datetime],
+        name: Optional[str],
+    ) -> Optional[str]:
         mods = _import_graphiti()
         EpisodeType = mods["EpisodeType"]
         ref_time = reference_time or datetime.datetime.now(datetime.timezone.utc)
@@ -293,9 +333,6 @@ class MemoryService:
                         text_len=len(text))
             return getattr(result, "uuid", None) or ep_name
         except Exception as e:
-            # Log with full traceback + the first/last 200 chars of the
-            # episode body so we can diagnose whether it was a size limit,
-            # LLM error, embedder error, or FalkorDB write failure.
             logger.error(
                 "memory_episode_failed",
                 error=str(e),
@@ -311,8 +348,16 @@ class MemoryService:
     async def close(self) -> None:
         if self._graphiti is not None:
             try:
-                await self._graphiti.close()
+                await self._run_async(self._graphiti.close())
             except Exception as e:
                 logger.warning("graphiti_close_failed", error=str(e))
         self._graphiti = None
         self._initialized = False
+        # Stop the dedicated loop
+        if self._loop is not None and not self._loop.is_closed():
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except Exception:
+                pass
+        self._loop = None
+        self._loop_thread = None

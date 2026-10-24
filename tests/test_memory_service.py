@@ -41,6 +41,7 @@ async def test_retrieve_relevant_extracts_keywords_then_searches():
     with patch("src.bot.services.memory_service.bot_config") as cfg:
         cfg.graphiti_memory_enabled = True
         cfg.graphiti_falkor_mode = "server"
+        cfg.graphiti_group_id = "global"
 
         svc = MemoryService()
         svc._initialized = True
@@ -64,6 +65,9 @@ async def test_retrieve_relevant_extracts_keywords_then_searches():
         call_kwargs = svc._graphiti.search.call_args.kwargs
         assert call_kwargs["query"] == "deploy kubernetes"
         assert call_kwargs["num_results"] == 5
+        # Search must target the same graph add_episode writes to (group_id),
+        # otherwise it queries default_db and finds nothing.
+        assert call_kwargs["group_ids"] == ["global"]
 
 
 @pytest.mark.asyncio

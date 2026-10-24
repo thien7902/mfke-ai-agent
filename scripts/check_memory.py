@@ -28,38 +28,59 @@ async def print_stats(memory: MemoryService) -> None:
         print("memory not initialized — add_episode can't have written anything")
         return
 
-    # Graphiti exposes the driver; query episodes through it.
+    # Graphiti writes go to the graph named after group_id (default: "global"),
+    # NOT the driver's _database ("default_db"). Clone the driver to point at
+    # the same graph graphiti writes to, otherwise counts come back empty.
+    from src.bot.utils.config import config as bot_config
+    group_id = bot_config.graphiti_group_id
     driver = memory._graphiti.driver
-    try:
-        # Use the FalkorDriver session to query the Graphiti schema — _all
-        # episodes live as nodes with label='Episode'. The exact attribute
-        # name may vary by graphiti version; we use the fact that the
-        # FalkorDriver exposes a `session()` async context manager.
-        async with driver.session() as sess:
-            # Count episodes
-            result = await sess.run(
-                "MATCH (n:EpisodeEntity) RETURN count(n) AS c"
-            )
-            records = await result.to_list()
-            for r in records:
-                print(f"EpisodeEntity count: {r['c']}")
+    if driver._database != group_id:
+        driver = driver.clone(database=group_id)
 
-            # Last 10 episodes by createdAt if available, else by name
-            try:
-                result = await sess.run(
-                    "MATCH (n:EpisodeEntity) "
-                    "RETURN n.name AS name, n.group_id AS gid, n.source_description AS src "
-                    "ORDER BY n.created_at DESC LIMIT 10"
-                )
-                records = await result.to_list()
-                if records:
-                    print("\nLast 10 episodes:")
-                    for r in records:
-                        print(f"  - {r.get('name')!r} gid={r.get('gid')} src={r.get('src')}")
-                else:
-                    print("No episode records returned (label may differ).")
-            except Exception as e:
-                print(f"could not list recent episodes: {e}")
+    async def _run(cypher):
+        """FalkorDriver.execute_query returns (records_list, columns, metadata).
+        Normalize to just the records list. Returns [] when execute_query
+        returns None (e.g. "Index already exists" suppression path)."""
+        result = await driver.execute_query(cypher)
+        if result is None:
+            return []
+        if isinstance(result, tuple):
+            return result[0]
+        return result
+
+    try:
+        # Graphiti 0.31 uses label "Episodic" (not "EpisodeEntity")
+        records = await _run("MATCH (n:Episodic) RETURN count(n) AS c")
+        for r in records:
+            c = r['c'] if isinstance(r, dict) else r.get('c')
+            print(f"Episodic count: {c}")
+
+        records = await _run("MATCH (n:Entity) RETURN count(n) AS c")
+        for r in records:
+            c = r['c'] if isinstance(r, dict) else r.get('c')
+            print(f"Entity count: {c}")
+
+        records = await _run("MATCH ()-[r]->() RETURN count(r) AS c")
+        for r in records:
+            c = r['c'] if isinstance(r, dict) else r.get('c')
+            print(f"Edge count: {c}")
+
+        # Last 10 episodes
+        try:
+            records = await _run(
+                "MATCH (n:Episodic) "
+                "RETURN n.name AS name, n.group_id AS gid, n.source_description AS src "
+                "ORDER BY n.created_at DESC LIMIT 10"
+            )
+            if records:
+                print("\nLast 10 episodes:")
+                for r in records:
+                    get = (r.get if isinstance(r, dict) else lambda k: getattr(r, k, None))
+                    print(f"  - {get('name')!r} gid={get('gid')} src={get('src')}")
+            else:
+                print("No episode records returned.")
+        except Exception as e:
+            print(f"could not list recent episodes: {e}")
     except Exception as e:
         print(f"stat query failed: {type(e).__name__}: {e}")
 
