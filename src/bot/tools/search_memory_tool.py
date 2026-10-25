@@ -47,7 +47,7 @@ class SearchMemoryTool(Tool):
             required=True,
         ),
         "k": ToolParameter(
-            description="Max number of facts to return. Default 5.",
+            description="Max number of facts to return. Default 20.",
             type="integer",
             required=False,
         ),
@@ -81,9 +81,9 @@ class SearchMemoryTool(Tool):
                 invocation=self.get_parameterized_one_liner(params),
             )
         try:
-            k = int((params or {}).get("k") or 5)
+            k = int((params or {}).get("k") or 20)
         except (TypeError, ValueError):
-            k = 5
+            k = 20
 
         try:
             facts = self._run_retrieve(query, k)

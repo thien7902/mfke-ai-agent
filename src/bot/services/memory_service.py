@@ -230,7 +230,7 @@ class MemoryService:
                 database=bot_config.graphiti_falkor_database,
             )
 
-    async def retrieve_relevant(self, query: str, k: int = 5) -> List[str]:
+    async def retrieve_relevant(self, query: str, k: int = 20) -> List[str]:
         """Return up to k facts relevant to the query.
 
         LLM-driven: the user message is first converted to a concise search
