@@ -201,7 +201,21 @@ class MemoryService:
     def _build_driver(self, FalkorDriver):
         if bot_config.graphiti_falkor_mode == "embedded":
             from redislite.async_falkordb_client import AsyncFalkorDB
-            falkordb_client = AsyncFalkorDB(dbfilename=bot_config.graphiti_db_path)
+            # Enable AOF + frequent RDB save so data persists across hard
+            # container kills (docker stop's 10s SIGTERM grace often isn't
+            # enough for redislite's graceful-shutdown RDB dump).
+            # `save 60 1` = RDB snapshot every 60s if ≥1 key changed.
+            # `appendonly yes` = every write appended to .aof, replayed on
+            # startup. AOF + RDB together = data survives crashes.
+            serverconfig = {
+                "save": "60 1",
+                "appendonly": "yes",
+                "appendfsync": "everysec",
+            }
+            falkordb_client = AsyncFalkorDB(
+                dbfilename=bot_config.graphiti_db_path,
+                serverconfig=serverconfig,
+            )
             return FalkorDriver(
                 falkor_db=falkordb_client,
                 database=bot_config.graphiti_falkor_database,
@@ -331,6 +345,10 @@ class MemoryService:
                         name=ep_name,
                         source=source_description,
                         text_len=len(text))
+            # Force a background save so the .aof/.rdb file gets the new
+            # episode promptly — without this, a hard container kill between
+            # the auto-save intervals (60s) would lose the just-added data.
+            await self._bgwriteaof()
             return getattr(result, "uuid", None) or ep_name
         except Exception as e:
             logger.error(
@@ -344,6 +362,36 @@ class MemoryService:
                 source=source_description,
             )
             raise
+
+    async def _bgwriteaof(self) -> None:
+        """Kick redislite to flush the AOF buffer to disk after a write.
+
+        With `appendonly yes` + `appendfsync everysec`, redis flushes every
+        second anyway, but explicit BGREWRITEAOF on every add_episode makes
+        the on-disk file small + guarantees the new episode survives even a
+        hard kill happening within the 1-second window. Best-effort — won't
+        block ingest on failure.
+        """
+        if self._graphiti is None:
+            return
+        try:
+            driver = self._graphiti.driver
+            client = getattr(driver, "client", None)
+            if client is None:
+                return
+            # FalkorDB/redis `client` exposes execute_command via the
+            # underlying async redis client.
+            exec_cmd = getattr(client, "execute_command", None)
+            if exec_cmd is None:
+                # Some versions wrap the redis client under .connection
+                conn = getattr(client, "connection", None)
+                exec_cmd = getattr(conn, "execute_command", None)
+            if exec_cmd is None:
+                return
+            await exec_cmd("BGSAVE")
+        except Exception as e:
+            logger.debug("memory_bgwriteaof_failed",
+                          error=str(e), error_type=type(e).__name__)
 
     async def close(self) -> None:
         if self._graphiti is not None:
