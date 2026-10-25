@@ -897,11 +897,13 @@ class MessageHandler:
 
             if use_streaming:
                 await self._handle_streaming_response_in_topic(
-                    context, conversation, user_permissions, process_message, chat_id, topic_id, user.id
+                    context, conversation, user_permissions, process_message, chat_id, topic_id, user.id,
+                    user_display_name=_user_display_name(user),
                 )
             else:
                 await self._handle_regular_response_in_topic(
-                    context, conversation, user_permissions, process_message, chat_id, topic_id, user.id
+                    context, conversation, user_permissions, process_message, chat_id, topic_id, user.id,
+                    user_display_name=_user_display_name(user),
                 )
 
         except Exception as e:
@@ -1312,6 +1314,7 @@ class MessageHandler:
         chat_id: int,
         topic_id: int,
         user_id: int,
+        user_display_name: Optional[str] = None,
     ):
         """Handle non-streaming response in a specific topic (without update object).
 
@@ -1330,6 +1333,7 @@ class MessageHandler:
                 telegram_context=context,
                 chat_id=chat_id,
                 topic_id=topic_id,
+                user_display_name=user_display_name,
             )
             async for event in async_gen:
                 event_type = event.get("type", "unknown")
@@ -1392,6 +1396,7 @@ class MessageHandler:
         chat_id: int,
         topic_id: int,
         user_id: int,
+        user_display_name: Optional[str] = None,
     ):
         """Handle streaming response in a specific topic (without update object)."""
         import asyncio
@@ -1427,6 +1432,7 @@ class MessageHandler:
                 telegram_context=context,
                 chat_id=chat_id,
                 topic_id=topic_id,
+                user_display_name=user_display_name,
             )
             _set_investigation_status(chat_id, topic_id, current_status, tasks=current_tasks, last_tool=last_tool)
 

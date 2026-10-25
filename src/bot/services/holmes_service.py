@@ -935,10 +935,17 @@ class HolmesService:
                 if holmes_messages_src[i].get("role") == "user":
                     content = holmes_messages_src[i].get("content", "")
                     if isinstance(content, str):
+                        prefixed = f"User: {user_display_name}\n{content}"
                         holmes_messages_src[i] = {
                             **holmes_messages_src[i],
-                            "content": f"User: {user_display_name}\n{content}",
+                            "content": prefixed,
                         }
+                        logger.info(
+                            "holmes_user_display_name_prefixed",
+                            user_id=user_id,
+                            display_name=user_display_name,
+                            content_preview=prefixed[:120],
+                        )
                     break
         holmes_messages = self._build_holmes_messages(
             holmes_messages_src,
