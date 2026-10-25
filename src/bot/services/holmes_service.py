@@ -880,6 +880,7 @@ class HolmesService:
         topic_id: int = 0,
         cancel_event: Optional[threading.Event] = None,
         images: Optional[List[Dict[str, Any]]] = None,
+        user_display_name: Optional[str] = None,
     ) -> str | AsyncGenerator[str, None]:
         """
         Send a message to Holmes and get response.
@@ -920,9 +921,27 @@ class HolmesService:
         # least one investigative tool has produced concrete signals, not on
         # raw user messages. See src/bot/tools/search_memory_tool.py.
 
-        # Convert to Holmes format using build_initial_ask_messages for proper formatting with system prompt additions
+        # Build the Holmes-visible message list. The user-message content is
+        # prefixed with the user's display name (from Telegram / MongoDB) so
+        # the LLM knows who it's talking to per-turn without that info leaking
+        # into conversation.messages (which is shown as-is in logs / future
+        # history replay). Only the most recent user message gets the prefix
+        # — earlier history already had it when it was the live turn.
+        holmes_messages_src = self._convert_messages_to_holmes_format(conversation.messages)
+        if user_display_name and holmes_messages_src:
+            # Prefix the last user message (the one just added above) so the
+            # LLM sees "User: <name>\n<text>" for the current turn only.
+            for i in range(len(holmes_messages_src) - 1, -1, -1):
+                if holmes_messages_src[i].get("role") == "user":
+                    content = holmes_messages_src[i].get("content", "")
+                    if isinstance(content, str):
+                        holmes_messages_src[i] = {
+                            **holmes_messages_src[i],
+                            "content": f"User: {user_display_name}\n{content}",
+                        }
+                    break
         holmes_messages = self._build_holmes_messages(
-            self._convert_messages_to_holmes_format(conversation.messages),
+            holmes_messages_src,
             user_id,
         )
 

@@ -6,7 +6,8 @@ governed by a rule in HOLMES_SYSTEM_PROMPT_ADDITIONS — not by Holmes
 deciding freely.
 
 MemoryService owns its dedicated event loop and handles cross-loop
-bridging internally, so this tool is a trivial sync call into the service.
+bridging internally via `MemoryService.run_sync(coro)`. We call that from
+the sync `_invoke`.
 """
 import logging
 from typing import Dict, Optional
@@ -84,36 +85,41 @@ class SearchMemoryTool(Tool):
         except (TypeError, ValueError):
             k = 5
 
-        # MemoryService.retrieve_relevant is async. Holmes calls _invoke
-        # from a sync context (its own thread pool), so we need to await
-        # the coroutine. The synchronous call we want is: block on the
-        # event loop that owns graphiti's connections and return the result.
-        # MemoryService owns that loop and exposes `_run` for sync callers.
         try:
-            import asyncio as _asyncio
-            # Is there a running loop in this thread? If yes (rare for Holmes
-            # tools), we can't block on a coroutine — use the service's loop
-            # via run_coroutine_threadsafe.
-            try:
-                _asyncio.get_running_loop()
-                running = True
-            except RuntimeError:
-                running = False
-
-            coro = self._memory.retrieve_relevant(query, k=k)
-            if running:
-                # Use the service's dedicated loop to avoid blocking our own.
-                loop = self._memory._ensure_loop()
-                future = _asyncio.run_coroutine_threadsafe(coro, loop)
-                facts = future.result(timeout=30.0)
-            else:
-                # No loop running in this thread — block on the coroutine
-                # via the service's loop.
-                facts = self._memory._run(coro, timeout=30.0)
+            facts = self._run_retrieve(query, k)
         except Exception as e:
             logger.warning("search_memory_failed", error=str(e),
                            error_type=type(e).__name__)
             facts = []
+
+        if not facts:
+            data = "No relevant facts found in memory."
+        else:
+            data = "\n".join(f"- {f}" for f in facts)
+        return StructuredToolResult(
+            status=StructuredToolResultStatus.SUCCESS,
+            data=data,
+            params=params,
+            invocation=f"search_memory(query={query!r}, k={k})",
+        )
+
+    def _run_retrieve(self, query: str, k: int):
+        """Run retrieve_relevant on the memory service's loop and block.
+
+        Tests typically stub `memory_service.retrieve_relevant` with an
+        AsyncMock. The real service exposes `run_sync(coro, timeout)` which
+        drives the coroutine via the service's dedicated loop. For test
+        mocks (MagicMock) we fall back to asyncio.run in this thread — works
+        because AsyncMock returns a real coroutine.
+
+        Don't try/catch inside — outer caller handles exceptions.
+        """
+        from src.bot.services.memory_service import MemoryService
+        coro = self._memory.retrieve_relevant(query, k=k)
+        if isinstance(self._memory, MemoryService):
+            return self._memory.run_sync(coro, timeout=30.0)
+        import asyncio as _asyncio
+        return _asyncio.run(coro)
 
         if not facts:
             data = "No relevant facts found in memory."

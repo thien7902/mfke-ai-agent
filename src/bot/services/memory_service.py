@@ -112,6 +112,9 @@ class MemoryService:
         future = asyncio.run_coroutine_threadsafe(coro, loop)
         return future.result(timeout=timeout)
 
+    # Public alias for tests/tools that want to invoke via a stable name.
+    run_sync = _run
+
     async def _run_async(self, coro):
         """Schedule a coroutine on the dedicated loop and await it from
         the caller's loop without blocking."""

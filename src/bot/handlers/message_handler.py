@@ -138,6 +138,40 @@ def _get_investigation(chat_id: int, topic_id: int) -> Optional[_ActiveInvestiga
     return _active_investigations.get((chat_id, topic_id))
 
 
+def _user_display_name(user) -> Optional[str]:
+    """Build a concise display name from a Telegram user object.
+
+    Prefers @username (always present in chat mentions) and falls back to
+    first_name + last_name. Returns None when the user has neither — the
+    caller treats None as "don't inject" so the LLM isn't told 'User: None'.
+    """
+    if user is None:
+        return None
+    parts = []
+    if getattr(user, "username", None):
+        parts.append(f"@{user.username}")
+    if getattr(user, "first_name", None):
+        parts.append(user.first_name)
+    if getattr(user, "last_name", None):
+        parts.append(user.last_name)
+    return " ".join(parts) if parts else None
+
+
+def _user_model_display_name(user_model) -> Optional[str]:
+    """Same as _user_display_name but for the bot's own User model from
+    permission_service.get_or_create_user."""
+    if user_model is None:
+        return None
+    parts = []
+    if getattr(user_model, "username", None):
+        parts.append(f"@{user_model.username}")
+    if getattr(user_model, "first_name", None):
+        parts.append(user_model.first_name)
+    if getattr(user_model, "last_name", None):
+        parts.append(user_model.last_name)
+    return " ".join(parts) if parts else None
+
+
 def _generate_topic_name(user_message: str, user_id: int) -> str:
     """Generate a topic name from user message: 2-3 word summary + random ID."""
     # Simple keyword extraction - take first few meaningful words
@@ -910,6 +944,7 @@ class MessageHandler:
                 topic_id=topic_id,
                 cancel_event=cancel_event,
                 images=images,
+                user_display_name=_user_display_name(update.effective_user),
             )
             async for event in async_gen:
                 event_type = event.get("type", "unknown")
@@ -1009,6 +1044,7 @@ class MessageHandler:
                 topic_id=topic_id,
                 cancel_event=cancel_event,
                 images=images,
+                user_display_name=_user_display_name(update.effective_user),
             )
             _set_investigation_status(chat_id, topic_id, current_status, tasks=current_tasks, last_tool=last_tool)
 
