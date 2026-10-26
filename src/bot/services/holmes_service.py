@@ -25,6 +25,7 @@ from src.bot.models.conversation import Conversation, Message
 from src.bot.models.user import UserPermission
 from src.bot.services.memory_service import MemoryService
 from src.bot.tools.search_memory_tool import SearchMemoryTool
+from src.bot.tools.loop_guard import wrap_tools_with_loop_guard
 
 logger = structlog.get_logger(__name__)
 
@@ -279,6 +280,7 @@ class HolmesService:
             self._wrap_todo_write_tool()
             self._wrap_bash_tool_timeout()
             self._register_search_memory_tool()
+            wrap_tools_with_loop_guard(self._tool_executor)
 
             self._initialized = True
             # Patch bash tool to kill the whole process group on timeout, so
@@ -504,6 +506,7 @@ class HolmesService:
             self._wrap_todo_write_tool(tcll.tool_executor)
             self._wrap_bash_tool_timeout(tcll.tool_executor)
             self._register_search_memory_tool(tcll.tool_executor)
+            wrap_tools_with_loop_guard(tcll.tool_executor)
 
             self._enterprise_tcll = tcll
             logger.info("Enterprise ToolCallingLLM initialized", model=model_key)
