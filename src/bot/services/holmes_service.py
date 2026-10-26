@@ -935,7 +935,7 @@ class HolmesService:
                 if holmes_messages_src[i].get("role") == "user":
                     content = holmes_messages_src[i].get("content", "")
                     if isinstance(content, str):
-                        prefixed = f"User: {user_display_name}\n{content}"
+                        prefixed = f"From: {user_display_name}\n{content}"
                         holmes_messages_src[i] = {
                             **holmes_messages_src[i],
                             "content": prefixed,
