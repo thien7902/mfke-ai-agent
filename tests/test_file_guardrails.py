@@ -234,3 +234,96 @@ def test_restriction_is_restored_not_double_wrapped(tmp_path):
 def test_restriction_no_op_on_none_executor():
     with restrict_tools_during_untrusted_file(None, ["/tmp"]):
         pass
+
+
+# ---------- the streaming-lifetime regression ----------
+
+def test_guarded_tcll_is_a_clone_original_untouched(tmp_path):
+    """Guard by cloning. Mutating the shared executor in a `with` block looks
+    correct in a unit test but exits before the async generator runs — the LLM
+    then sees the full tool list. A clone cannot have that bug because the
+    restriction lives on the object the turn actually uses."""
+    from src.bot.utils.file_guardrails import build_guarded_tcll
+
+    te = _executor(ALL_TOOLS)
+    te.clone_with_extra_tools = lambda extra: _clone(te)
+
+    class Tcll:
+        def __init__(self, executor):
+            self.tool_executor = executor
+
+        def with_executor(self, executor):
+            return Tcll(executor)
+
+    original = Tcll(te)
+    guarded = build_guarded_tcll(original, [tmp_path])
+
+    assert "bash" not in guarded.tool_executor.tools_by_name
+    assert "kubectl" not in guarded.tool_executor.tools_by_name
+    # Every other turn in the process keeps its tools.
+    assert set(original.tool_executor.tools_by_name) == set(ALL_TOOLS)
+
+
+def _clone(src):
+    c = MagicMock()
+    c.tools_by_name = dict(src.tools_by_name)
+    c.toolsets = src.toolsets
+    return c
+
+
+def test_guarded_read_tool_copy_does_not_constrain_shared_tool(tmp_path):
+    """The path guard must live on a per-turn copy. Patching the shared tool
+    would silently restrict the default model's read_file forever."""
+    from src.bot.utils.file_guardrails import build_guarded_tcll
+
+    te = _executor(ALL_TOOLS)
+    te.clone_with_extra_tools = lambda extra: _clone(te)
+
+    class Tcll:
+        def __init__(self, executor):
+            self.tool_executor = executor
+
+        def with_executor(self, executor):
+            return Tcll(executor)
+
+    original = Tcll(te)
+    guarded = build_guarded_tcll(original, [tmp_path])
+
+    # Guarded copy refuses outside paths...
+    blocked = guarded.tool_executor.tools_by_name["read_file"].invoke(
+        {"path": "/root/.holmes/kubeconfig.enc"}
+    )
+    assert "blocked" in str(getattr(blocked, "error", "")).lower()
+
+    # ...while the shared tool still reads anything it is asked to.
+    assert original.tool_executor.tools_by_name["read_file"].invoke(
+        {"path": "/root/.holmes/kubeconfig.enc"}
+    ) == "ran read_file"
+
+
+def test_build_guarded_tcll_fails_closed_without_clone_support(tmp_path):
+    """Holmes version drift (no clone_with_extra_tools) must strip tools on the
+    object the turn uses rather than hand back an unrestricted one."""
+    from src.bot.utils.file_guardrails import build_guarded_tcll
+
+    te = MagicMock()
+    te.tools_by_name = {
+        n: MagicMock(name=n, invoke=lambda p, c=None, _n=n: f"ran {_n}")
+        for n in ALL_TOOLS
+    }
+    for n, tool in te.tools_by_name.items():
+        tool.name = n
+    # No clone_with_extra_tools on this executor at all.
+    del te.clone_with_extra_tools
+    te.toolsets = []
+
+    class Tcll:
+        def __init__(self, executor):
+            self.tool_executor = executor
+
+        def with_executor(self, executor):
+            return Tcll(executor)
+
+    result = build_guarded_tcll(Tcll(te), [tmp_path])
+    assert "bash" not in result.tool_executor.tools_by_name
+    assert "kubectl" not in result.tool_executor.tools_by_name

@@ -255,49 +255,204 @@ def path_is_allowed(candidate: str, allowed_roots: Iterable[str | Path]) -> bool
     return False
 
 
+def build_guarded_tcll(tcll, allowed_roots: Iterable[str | Path]):
+    """Return a ToolCallingLLM whose tool list is safe for an untrusted file.
+
+    Preferred over mutating the shared executor. The original object is never
+    touched, so a concurrent turn in another topic keeps bash/kubectl — critical,
+    since the executor is shared by every request in the process.
+
+    Uses Holmes' own `clone_with_extra_tools` + `with_executor` (see
+    tool_executor._clone_base): toolsets are shared, the `tools_by_name` dict is
+    a copy. Removing from the copy therefore affects only this turn.
+
+    Path-restricting the surviving read tools still patches those *tool objects*,
+    which are shared with the clone. That patch is installed on the shared tool
+    and left installed: it fails closed (a path outside the upload's directory is
+    refused) and is harmless for turns that never set an allowlist, because
+    `_untrusted_allowed_roots` is only populated here and consumed per call.
+    """
+    if tcll is None:
+        return tcll
+
+    roots = [str(r) for r in allowed_roots]
+    try:
+        executor = tcll.tool_executor
+        clone = executor.clone_with_extra_tools([])
+
+        dropped = []
+        for name in list(clone.tools_by_name):
+            if name in UNTRUSTED_FILE_ALLOWED_TOOLS:
+                continue
+            clone.tools_by_name.pop(name, None)
+            dropped.append(name)
+
+        # The surviving read tools are *copies*: patching the shared instance
+        # would leave the default model's read_file permanently constrained to
+        # this turn's directory. The copy delegates to the shared tool's current
+        # invoke, so loop_guard and any other wrapper still applies.
+        for name in UNTRUSTED_FILE_ALLOWED_TOOLS:
+            shared = clone.tools_by_name.get(name)
+            if shared is None:
+                continue
+            clone.tools_by_name[name] = _guarded_copy(shared, name, roots)
+
+        logger.info(
+            "untrusted_file_executor_cloned",
+            removed=sorted(dropped),
+            kept=sorted(clone.tools_by_name),
+            allowed_roots=roots,
+        )
+        return tcll.with_executor(clone)
+    except Exception as e:  # noqa: BLE001
+        # Fail closed. If cloning is unavailable (Holmes version drift), build a
+        # stripped executor explicitly and hand it to the turn — returning `tcll`
+        # unchanged would leave bash available, which is the one outcome this
+        # whole module exists to prevent.
+        logger.error("untrusted_file_clone_failed_falling_back", error=str(e))
+        return _stripped_fallback(tcll, roots)
+
+
+def _stripped_fallback(tcll, allowed_roots: List[str]):
+    """Last-resort executor with dangerous tools removed and reads restricted.
+
+    Builds a fresh ToolExecutor from the shared one's registries instead of
+    relying on Holmes' clone helper. Shares toolsets (not the registry dicts), so
+    the original turn's tools are unaffected.
+    """
+    from holmes.core.tools_utils.tool_executor import ToolExecutor
+
+    shared = tcll.tool_executor
+    fallback = ToolExecutor.__new__(ToolExecutor)
+    fallback.toolsets = getattr(shared, "toolsets", [])
+    fallback.enabled_toolsets = getattr(shared, "enabled_toolsets", [])
+    fallback.tools_by_name = {
+        name: tool
+        for name, tool in getattr(shared, "tools_by_name", {}).items()
+        if name in UNTRUSTED_FILE_ALLOWED_TOOLS
+    }
+    fallback._tool_to_toolset = dict(getattr(shared, "_tool_to_toolset", {}))
+    fallback.oauth_connector = getattr(shared, "oauth_connector", None)
+
+    for name in list(fallback.tools_by_name):
+        fallback.tools_by_name[name] = _guarded_copy(
+            fallback.tools_by_name[name], name, allowed_roots
+        )
+
+    logger.warning(
+        "untrusted_file_fallback_executor",
+        kept=sorted(fallback.tools_by_name),
+        allowed_roots=allowed_roots,
+    )
+    try:
+        return tcll.with_executor(fallback)
+    except Exception:
+        # Absolutely last resort: swap the executor on the object the turn uses.
+        tcll.tool_executor = fallback
+        return tcll
+
+
+def _guarded_copy(shared_tool, tool_name: str, allowed_roots: List[str]):
+    """A per-turn copy of `shared_tool` that only reads inside `allowed_roots`."""
+    try:
+        copy = shared_tool.model_copy()
+    except Exception:
+        copy = shared_tool
+
+    base_invoke = shared_tool.invoke
+
+    def guarded_invoke(params, context=None):
+        if isinstance(params, dict):
+            for key in ("path", "file", "filename", "file_path", "dir", "directory"):
+                value = params.get(key)
+                if isinstance(value, str) and value.strip():
+                    if not path_is_allowed(value, allowed_roots):
+                        logger.warning(
+                            "untrusted_file_path_blocked", tool=tool_name, path=value,
+                        )
+                        return _blocked_result(tool_name, params, value, allowed_roots)
+        return base_invoke(params, context)
+
+    object.__setattr__(copy, "invoke", guarded_invoke)
+    return copy
+
+
+def _install_path_guard(tool, tool_name: str, allowed_roots: List[str]) -> None:
+    """Allow `tool` to read only inside `allowed_roots`.
+
+    The allowlist is stored on the tool and read at call time, so one shared
+    wrapper serves every turn without per-turn patching.
+    """
+    if getattr(tool, "_untrusted_path_guard_installed", False) is True:
+        object.__setattr__(tool, "_untrusted_allowed_roots", allowed_roots)
+        return
+
+    original = tool.invoke
+
+    def guarded_invoke(params, context=None):
+        roots = getattr(tool, "_untrusted_allowed_roots", None)
+        if roots and isinstance(params, dict):
+            for key in ("path", "file", "filename", "file_path", "dir", "directory"):
+                value = params.get(key)
+                if isinstance(value, str) and value.strip():
+                    if not path_is_allowed(value, roots):
+                        logger.warning(
+                            "untrusted_file_path_blocked", tool=tool_name, path=value,
+                        )
+                        return _blocked_result(tool_name, params, value, roots)
+        return original(params, context)
+
+    object.__setattr__(tool, "invoke", guarded_invoke)
+    object.__setattr__(tool, "_untrusted_allowed_roots", allowed_roots)
+    object.__setattr__(tool, "_untrusted_path_guard_installed", True)
+
+
+def _blocked_result(tool_name: str, params: dict, value: str, roots: List[str]):
+    try:
+        from holmes.core.tools import StructuredToolResult, StructuredToolResultStatus
+
+        return StructuredToolResult(
+            status=StructuredToolResultStatus.ERROR,
+            error=(
+                f"Reading '{value}' is blocked: only the uploaded file and its "
+                f"directory may be read on this turn ({', '.join(roots)}). "
+                "Do not try other paths."
+            ),
+            params=params,
+            invocation=f"{tool_name}(blocked-path)",
+        )
+    except Exception:
+        raise PermissionError(f"Reading '{value}' is blocked on this turn.")
+
+
 class restrict_tools_during_untrusted_file:
     """Context manager that removes dangerous tools for one agent turn.
 
-    Used by `/claude` when the turn involves an uploaded file. The model's tool
-    list is the contract it plans against, so shrinking it is what turns "the
-    prompt says not to run bash" into "there is no bash". On exit the original
-    tool registry is restored exactly, including nested/cloned executors.
-
-    `ToolCallingLLM` snapshots tools per iteration from `tool_executor`, so a
-    mutation here is picked up on the next LLM call — but this object is shared
-    with the default model's turns, hence the restore discipline. Concurrency:
-    another turn in a different topic could observe the shrunk list while this
-    one runs. That is a fail-closed direction (a legitimate turn briefly loses
-    bash) and acceptable; a per-turn executor clone would remove it at the cost
-    of rebuilding toolset state per message.
+    Superseded by `build_guarded_tcll` for streaming turns: a context manager
+    cannot span an async generator's lifetime, and `_stream_chat` returns a
+    generator — the `with` block exits before the LLM takes a single step, so
+    the tools are back in place by the time they would be used. Kept for
+    non-streaming call sites and for unit tests of the removal logic.
     """
 
     def __init__(self, tool_executor, allowed_roots: Iterable[str | Path]):
         self._te = tool_executor
         self._allowed_roots = [str(r) for r in allowed_roots]
         self._removed: List[tuple] = []
-        self._wrapped: List[tuple] = []
 
     def __enter__(self):
         if self._te is None:
             return self
-
         tools_by_name = getattr(self._te, "tools_by_name", None)
         if isinstance(tools_by_name, dict):
             for name in list(tools_by_name):
-                if name in UNTRUSTED_FILE_ALLOWED_TOOLS or name in ("TodoWrite",):
+                if name in UNTRUSTED_FILE_ALLOWED_TOOLS:
                     continue
                 self._removed.append((name, tools_by_name.pop(name)))
-
-        # Path-allowlist the surviving read tools, so a prompt-injected
-        # "read /root/.holmes/x" is refused even though read_file is still
-        # present.
-        for name in UNTRUSTED_FILE_ALLOWED_TOOLS:
-            tool = (tools_by_name or {}).get(name)
-            if tool is None:
-                continue
-            self._wrap_read_tool(tool, name)
-
+            for name in UNTRUSTED_FILE_ALLOWED_TOOLS:
+                tool = tools_by_name.get(name)
+                if tool is not None:
+                    _install_path_guard(tool, name, self._allowed_roots)
         logger.info(
             "untrusted_file_tool_restriction_on",
             removed=sorted(n for n, _ in self._removed),
@@ -305,62 +460,17 @@ class restrict_tools_during_untrusted_file:
         )
         return self
 
-    def _wrap_read_tool(self, tool, name: str):
-        original = tool.invoke
-        # `is True`, not truthy: a Mock/auto-attribute (and some proxy objects)
-        # returns a truthy placeholder that would silently skip wrapping — the
-        # exact failure mode that leaves path checks off while logging success.
-        if getattr(tool, "_untrusted_path_wrapped", False) is True:
-            return
-        allowed = list(self._allowed_roots)
-
-        def wrapped(params, context=None):
-            if isinstance(params, dict):
-                for key in ("path", "file", "filename", "file_path", "dir", "directory"):
-                    value = params.get(key)
-                    if isinstance(value, str) and value.strip():
-                        if not path_is_allowed(value, allowed):
-                            logger.warning(
-                                "untrusted_file_path_blocked",
-                                tool=name, path=value,
-                            )
-                            try:
-                                from holmes.core.tools import (
-                                    StructuredToolResult,
-                                    StructuredToolResultStatus,
-                                )
-
-                                return StructuredToolResult(
-                                    status=StructuredToolResultStatus.ERROR,
-                                    error=(
-                                        f"Reading '{value}' is blocked: only the uploaded "
-                                        f"file and its directory may be read on this turn "
-                                        f"({', '.join(allowed)}). Do not try other paths."
-                                    ),
-                                    params=params,
-                                    invocation=f"{name}(blocked-path)",
-                                )
-                            except Exception:
-                                raise PermissionError(
-                                    f"Reading '{value}' is blocked on this turn."
-                                )
-            return original(params, context)
-
-        object.__setattr__(tool, "invoke", wrapped)
-        object.__setattr__(tool, "_untrusted_path_wrapped", True)
-        self._wrapped.append((tool, original))
-
     def __exit__(self, exc_type, exc, tb):
         tools_by_name = getattr(self._te, "tools_by_name", None)
         if isinstance(tools_by_name, dict):
             for name, tool in self._removed:
                 tools_by_name[name] = tool
-        for tool, original in self._wrapped:
-            object.__setattr__(tool, "invoke", original)
-            object.__setattr__(tool, "_untrusted_path_wrapped", False)
+        for name in UNTRUSTED_FILE_ALLOWED_TOOLS:
+            tool = (tools_by_name or {}).get(name)
+            if tool is not None:
+                object.__setattr__(tool, "_untrusted_allowed_roots", None)
         if self._removed:
             logger.info(
-                "untrusted_file_tool_restriction_off",
-                restored=len(self._removed),
+                "untrusted_file_tool_restriction_off", restored=len(self._removed),
             )
         return False
