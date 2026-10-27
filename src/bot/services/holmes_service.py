@@ -27,7 +27,6 @@ from src.bot.services.memory_service import MemoryService
 from src.bot.tools.search_memory_tool import SearchMemoryTool
 from src.bot.tools.send_file_tool import SendFileTool, ListChatFilesTool
 from src.bot.tools.loop_guard import wrap_tools_with_loop_guard
-from src.bot.utils.file_guardrails import build_guarded_tcll
 
 logger = structlog.get_logger(__name__)
 
@@ -110,31 +109,7 @@ def _patch_bash_kill_process_group():
 _CLI_REQUEST_CONTEXT = {"user_id": DEFAULT_CLI_USER}
 
 
-def _guard_allowed_roots(file_path: str) -> list:
-    """Directories the agent may read during an untrusted-file turn.
-
-    The attachment's own directory is the whole allowlist. Files land in
-    `<outbox>/received/`, so this permits the uploaded file and its siblings
-    (nothing else) — never /root/.holmes, /etc, or the bot's own source.
-    """
-    from pathlib import Path as _Path
-
-    try:
-        parent = _Path(str(file_path)).expanduser().resolve(strict=False).parent
-    except OSError:
-        parent = None
-    return [str(parent)] if parent else []
-
-
-def _nullcontext():
-    """contextlib.nullcontext, imported lazily to keep this module's imports flat."""
-    import contextlib
-
-    return contextlib.nullcontext()
-
-
 def _request_context(user_id: int, chat_id: int = 0, topic_id: int = 0) -> Dict[str, Any]:
-
     """Per-turn request context handed to Holmes and on to every tool.
 
     `chat_id` / `topic_id` are what lets the `chat_send_file` tool deliver a
@@ -944,7 +919,6 @@ class HolmesService:
         cancel_event: Optional[threading.Event] = None,
         images: Optional[List[Dict[str, Any]]] = None,
         user_display_name: Optional[str] = None,
-        untrusted_file_path: Optional[str] = None,
     ) -> str | AsyncGenerator[str, None]:
         """
         Send a message to Holmes and get response.
@@ -965,11 +939,9 @@ class HolmesService:
                 becomes a multimodal content array so the main LLM reads the image
                 directly. Caller must ensure the main model accepts image_url blocks
                 (see Config.main_model_supports_images).
-            untrusted_file_path: Set when this turn's content came from an uploaded
-                file whose text was inlined. Callers pass it only when the pre-scan
-                flagged injection markers — see MessageHandler.handle_file. While
-                the turn runs, shell/cluster tools are removed and read tools are
-                path-restricted (src/bot/utils/file_guardrails.py).
+
+        Returns:
+            Response text or async generator for streaming
         """
         await self.initialize()
 
@@ -1021,14 +993,6 @@ class HolmesService:
         # Get feature flags from permissions
         features = self._get_user_permissions(user_permissions)
 
-        # Same guard as chat_enterprise, but only engaged when the caller's scan
-        # flagged the upload as injected. A log/config file uploaded for a real
-        # cluster investigation must keep bash+kubectl, so this is not applied to
-        # every upload — only to turns where the content tried to steer the model.
-        tcll = self._tool_calling_llm
-        if untrusted_file_path:
-            tcll = build_guarded_tcll(tcll, _guard_allowed_roots(untrusted_file_path))
-
         try:
             if stream:
                 # Always stream when caller asks for it — the streaming
@@ -1038,13 +1002,12 @@ class HolmesService:
                 return self._stream_chat(
                     holmes_messages, features, user_id, conversation,
                     telegram_context, chat_id, topic_id, cancel_event=cancel_event,
-                    tcll=tcll,
                 )
             else:
                 # Pass telegram context for approval callback
                 response_text, llm_result = await self._non_stream_chat_with_memory(
                     holmes_messages, features, user_id, telegram_context, chat_id, topic_id,
-                    cancel_event=cancel_event, tcll=tcll,
+                    cancel_event=cancel_event,
                 )
 
                 # Save Holmes response with tool calls and metadata to conversation
@@ -1056,13 +1019,13 @@ class HolmesService:
                     # Add a basic message without tool calls so conversation continues
                     conversation.add_message(Message(role="assistant", content=response_text or ""))
 
-            # Update Holmes session memory
-            self.update_conversation_memory(conversation, {
-                "session_id": llm_result.metadata.get("session_id") if llm_result.metadata else None,
-                "metadata": llm_result.metadata or {},
-            })
+                # Update Holmes session memory
+                self.update_conversation_memory(conversation, {
+                    "session_id": llm_result.metadata.get("session_id") if llm_result.metadata else None,
+                    "metadata": llm_result.metadata or {},
+                })
 
-            return response_text
+                return response_text
         except Exception as e:
             logger.error("Holmes chat error", user_id=user_id, error=str(e))
             # Return a user-friendly error instead of crashing
@@ -1082,20 +1045,14 @@ class HolmesService:
         topic_id: int = 0,
         cancel_event: Optional[threading.Event] = None,
         images: Optional[List[Dict[str, Any]]] = None,
-        untrusted_file_path: Optional[str] = None,
     ) -> str | AsyncGenerator[str, None]:
         """One-shot turn routed to a different ToolCallingLLM.
 
         Mirrors `chat()` but uses `_get_enterprise_tcll()` instead of the
         default `self._tool_calling_llm`. Used by the /claude command. The
-        prompt and reply are appended to the same conversation as normal turns,
-        so follow-ups on the default LLM still see this turn in history.
-
-        `untrusted_file_path` names an attachment the agent is about to inspect
-        with its own code. While that turn runs, `bash`/`kubectl`/... are removed
-        from the tool list and the surviving read tools are path-restricted to
-        the file's directory (see src/bot/utils/file_guardrails.py). This is what
-        keeps a prompt-injected upload from turning into shell commands.
+        user prompt and assistant reply are appended to the same conversation
+        as normal turns, so follow-ups on the default LLM still see this turn
+        in history.
         """
         enterprise_tcll = await self._get_enterprise_tcll()
 
@@ -1109,16 +1066,6 @@ class HolmesService:
             user_id,
         )
         features = self._get_user_permissions(user_permissions)
-
-        # Guard by CLONING the executor, not by mutating it in a `with` block.
-        # `_stream_chat` returns an async generator, so a context manager would
-        # exit before the LLM takes a single step and the tools would be back in
-        # place by the time they matter. A clone also keeps concurrent turns in
-        # other topics fully equipped (see file_guardrails.build_guarded_tcll).
-        if untrusted_file_path:
-            enterprise_tcll = build_guarded_tcll(
-                enterprise_tcll, _guard_allowed_roots(untrusted_file_path)
-            )
 
         try:
             if stream:

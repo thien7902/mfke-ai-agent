@@ -20,11 +20,6 @@ python-docx>=1.1.0
 openpyxl>=3.1.0
 pytesseract>=0.3.10
 Pillow>=10.0.0
-# /claude hands attached files to the enterprise model as a path on disk, and
-# the agent analyses them by writing its own code. pandas is what it reaches
-# for on a spreadsheet, so ship it — without it the model either falls back to
-# raw openpyxl loops or tries `pip install pandas` and burns a tool call.
-pandas>=2.2.0
 # Pin anthropic for graphiti-core 0.31.2 compat: its AnthropicClient
 # passes `temperature=` to messages.create, which was removed in
 # anthropic SDK v1.0+. Keep <1.0 until graphiti is upgraded.
