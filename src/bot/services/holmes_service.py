@@ -27,6 +27,7 @@ from src.bot.services.memory_service import MemoryService
 from src.bot.tools.search_memory_tool import SearchMemoryTool
 from src.bot.tools.send_file_tool import SendFileTool, ListChatFilesTool
 from src.bot.tools.loop_guard import wrap_tools_with_loop_guard
+from src.bot.utils.file_guardrails import restrict_tools_during_untrusted_file
 
 logger = structlog.get_logger(__name__)
 
@@ -109,7 +110,31 @@ def _patch_bash_kill_process_group():
 _CLI_REQUEST_CONTEXT = {"user_id": DEFAULT_CLI_USER}
 
 
+def _guard_allowed_roots(file_path: str) -> list:
+    """Directories the agent may read during an untrusted-file turn.
+
+    The attachment's own directory is the whole allowlist. Files land in
+    `<outbox>/received/`, so this permits the uploaded file and its siblings
+    (nothing else) — never /root/.holmes, /etc, or the bot's own source.
+    """
+    from pathlib import Path as _Path
+
+    try:
+        parent = _Path(str(file_path)).expanduser().resolve(strict=False).parent
+    except OSError:
+        parent = None
+    return [str(parent)] if parent else []
+
+
+def _nullcontext():
+    """contextlib.nullcontext, imported lazily to keep this module's imports flat."""
+    import contextlib
+
+    return contextlib.nullcontext()
+
+
 def _request_context(user_id: int, chat_id: int = 0, topic_id: int = 0) -> Dict[str, Any]:
+
     """Per-turn request context handed to Holmes and on to every tool.
 
     `chat_id` / `topic_id` are what lets the `chat_send_file` tool deliver a
@@ -919,6 +944,7 @@ class HolmesService:
         cancel_event: Optional[threading.Event] = None,
         images: Optional[List[Dict[str, Any]]] = None,
         user_display_name: Optional[str] = None,
+        untrusted_file_path: Optional[str] = None,
     ) -> str | AsyncGenerator[str, None]:
         """
         Send a message to Holmes and get response.
@@ -939,9 +965,11 @@ class HolmesService:
                 becomes a multimodal content array so the main LLM reads the image
                 directly. Caller must ensure the main model accepts image_url blocks
                 (see Config.main_model_supports_images).
-
-        Returns:
-            Response text or async generator for streaming
+            untrusted_file_path: Set when this turn's content came from an uploaded
+                file whose text was inlined. Callers pass it only when the pre-scan
+                flagged injection markers — see MessageHandler.handle_file. While
+                the turn runs, shell/cluster tools are removed and read tools are
+                path-restricted (src/bot/utils/file_guardrails.py).
         """
         await self.initialize()
 
@@ -993,31 +1021,43 @@ class HolmesService:
         # Get feature flags from permissions
         features = self._get_user_permissions(user_permissions)
 
-        try:
-            if stream:
-                # Always stream when caller asks for it — the streaming
-                # *permission* only toggles visible typing-indicator UX in
-                # message_handler, not whether Holmes streams internally.
-                # Non-streaming users still get /ping progress this way.
-                return self._stream_chat(
-                    holmes_messages, features, user_id, conversation,
-                    telegram_context, chat_id, topic_id, cancel_event=cancel_event,
-                )
-            else:
-                # Pass telegram context for approval callback
-                response_text, llm_result = await self._non_stream_chat_with_memory(
-                    holmes_messages, features, user_id, telegram_context, chat_id, topic_id,
-                    cancel_event=cancel_event,
-                )
+        # Same guard as chat_enterprise, but only engaged when the caller's scan
+        # flagged the upload as injected. A log/config file uploaded for a real
+        # cluster investigation must keep bash+kubectl, so this is not applied to
+        # every upload — only to turns where the content tried to steer the model.
+        guard = _nullcontext()
+        if untrusted_file_path:
+            guard = restrict_tools_during_untrusted_file(
+                self._tool_calling_llm.tool_executor,
+                _guard_allowed_roots(untrusted_file_path),
+            )
 
-                # Save Holmes response with tool calls and metadata to conversation
-                try:
-                    for msg in self._convert_llm_result_to_messages(llm_result):
-                        conversation.add_message(msg)
-                except Exception as e:
-                    logger.warning("Failed to save assistant message, continuing without tool calls", error=str(e))
-                    # Add a basic message without tool calls so conversation continues
-                    conversation.add_message(Message(role="assistant", content=response_text or ""))
+        with guard:
+            try:
+                if stream:
+                    # Always stream when caller asks for it — the streaming
+                    # *permission* only toggles visible typing-indicator UX in
+                    # message_handler, not whether Holmes streams internally.
+                    # Non-streaming users still get /ping progress this way.
+                    return self._stream_chat(
+                        holmes_messages, features, user_id, conversation,
+                        telegram_context, chat_id, topic_id, cancel_event=cancel_event,
+                    )
+                else:
+                    # Pass telegram context for approval callback
+                    response_text, llm_result = await self._non_stream_chat_with_memory(
+                        holmes_messages, features, user_id, telegram_context, chat_id, topic_id,
+                        cancel_event=cancel_event,
+                    )
+
+                    # Save Holmes response with tool calls and metadata to conversation
+                    try:
+                        for msg in self._convert_llm_result_to_messages(llm_result):
+                            conversation.add_message(msg)
+                    except Exception as e:
+                        logger.warning("Failed to save assistant message, continuing without tool calls", error=str(e))
+                        # Add a basic message without tool calls so conversation continues
+                        conversation.add_message(Message(role="assistant", content=response_text or ""))
 
                 # Update Holmes session memory
                 self.update_conversation_memory(conversation, {
@@ -1026,12 +1066,12 @@ class HolmesService:
                 })
 
                 return response_text
-        except Exception as e:
-            logger.error("Holmes chat error", user_id=user_id, error=str(e))
-            # Return a user-friendly error instead of crashing
-            error_msg = "I encountered an error while processing your request. Please try again."
-            conversation.add_message(Message(role="assistant", content=error_msg))
-            return error_msg
+            except Exception as e:
+                logger.error("Holmes chat error", user_id=user_id, error=str(e))
+                # Return a user-friendly error instead of crashing
+                error_msg = "I encountered an error while processing your request. Please try again."
+                conversation.add_message(Message(role="assistant", content=error_msg))
+                return error_msg
 
     async def chat_enterprise(
         self,
@@ -1045,14 +1085,20 @@ class HolmesService:
         topic_id: int = 0,
         cancel_event: Optional[threading.Event] = None,
         images: Optional[List[Dict[str, Any]]] = None,
+        untrusted_file_path: Optional[str] = None,
     ) -> str | AsyncGenerator[str, None]:
         """One-shot turn routed to a different ToolCallingLLM.
 
         Mirrors `chat()` but uses `_get_enterprise_tcll()` instead of the
         default `self._tool_calling_llm`. Used by the /claude command. The
-        user prompt and assistant reply are appended to the same conversation
-        as normal turns, so follow-ups on the default LLM still see this turn
-        in history.
+        prompt and reply are appended to the same conversation as normal turns,
+        so follow-ups on the default LLM still see this turn in history.
+
+        `untrusted_file_path` names an attachment the agent is about to inspect
+        with its own code. While that turn runs, `bash`/`kubectl`/... are removed
+        from the tool list and the surviving read tools are path-restricted to
+        the file's directory (see src/bot/utils/file_guardrails.py). This is what
+        keeps a prompt-injected upload from turning into shell commands.
         """
         enterprise_tcll = await self._get_enterprise_tcll()
 
@@ -1067,34 +1113,45 @@ class HolmesService:
         )
         features = self._get_user_permissions(user_permissions)
 
-        try:
-            if stream:
-                return self._stream_chat(
-                    holmes_messages, features, user_id, conversation,
-                    telegram_context, chat_id, topic_id, cancel_event=cancel_event,
-                    tcll=enterprise_tcll,
-                )
-            else:
-                response_text, llm_result = await self._non_stream_chat_with_memory(
-                    holmes_messages, features, user_id, telegram_context, chat_id, topic_id,
-                    cancel_event=cancel_event, tcll=enterprise_tcll,
-                )
-                try:
-                    for msg in self._convert_llm_result_to_messages(llm_result):
-                        conversation.add_message(msg)
-                except Exception as e:
-                    logger.warning("Failed to save assistant message, continuing without tool calls", error=str(e))
-                    conversation.add_message(Message(role="assistant", content=response_text or ""))
-                self.update_conversation_memory(conversation, {
-                    "session_id": llm_result.metadata.get("session_id") if llm_result.metadata else None,
-                    "metadata": llm_result.metadata or {},
-                })
-                return response_text
-        except Exception as e:
-            logger.error("Enterprise chat error", user_id=user_id, error=str(e))
-            error_msg = "I encountered an error while processing your request. Please try again."
-            conversation.add_message(Message(role="assistant", content=error_msg))
-            return error_msg
+        # Scope the restriction to exactly this turn. The executor is shared with
+        # other topics, so the context manager restores the registry on exit even
+        # if the stream raises or is cancelled.
+        guard = _nullcontext()
+        if untrusted_file_path:
+            guard = restrict_tools_during_untrusted_file(
+                enterprise_tcll.tool_executor,
+                _guard_allowed_roots(untrusted_file_path),
+            )
+
+        with guard:
+            try:
+                if stream:
+                    return self._stream_chat(
+                        holmes_messages, features, user_id, conversation,
+                        telegram_context, chat_id, topic_id, cancel_event=cancel_event,
+                        tcll=enterprise_tcll,
+                    )
+                else:
+                    response_text, llm_result = await self._non_stream_chat_with_memory(
+                        holmes_messages, features, user_id, telegram_context, chat_id, topic_id,
+                        cancel_event=cancel_event, tcll=enterprise_tcll,
+                    )
+                    try:
+                        for msg in self._convert_llm_result_to_messages(llm_result):
+                            conversation.add_message(msg)
+                    except Exception as e:
+                        logger.warning("Failed to save assistant message, continuing without tool calls", error=str(e))
+                        conversation.add_message(Message(role="assistant", content=response_text or ""))
+                    self.update_conversation_memory(conversation, {
+                        "session_id": llm_result.metadata.get("session_id") if llm_result.metadata else None,
+                        "metadata": llm_result.metadata or {},
+                    })
+                    return response_text
+            except Exception as e:
+                logger.error("Enterprise chat error", user_id=user_id, error=str(e))
+                error_msg = "I encountered an error while processing your request. Please try again."
+                conversation.add_message(Message(role="assistant", content=error_msg))
+                return error_msg
 
     # Default search_memory tool-use rule. Appended to HOLMES_SYSTEM_PROMPT_ADDITIONS
     # when graphiti_memory_enabled is True so all deployments that turn on memory

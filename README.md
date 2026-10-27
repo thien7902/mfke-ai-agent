@@ -118,7 +118,7 @@ python -m src.bot.main
 | `/revoke <user_id> <permission>` | Revoke a user's permission |
 | `/user_permissions <user_id>` | View another user's permissions |
 | `/pending` | View pending permission requests |
-| `/claude <prompt>` | One-shot turn on the enterprise model (`CLAUDE_ENTERPRISE_MODEL`). Reads images natively |
+| `/claude <prompt>` | One-shot turn on the enterprise model (`CLAUDE_ENTERPRISE_MODEL`). Reads images natively; attached files are handed to the agent to inspect with code |
 
 #### `/claude` and images
 
@@ -133,8 +133,26 @@ This is controlled by `ENTERPRISE_MODEL_SUPPORTS_IMAGES` (default `true`) and is
 independent of `MAIN_MODEL_SUPPORTS_IMAGES`, which only governs the default
 model's path in `handle_file`. Set it to `false` for a text-only endpoint.
 
+Documents take a different route: **the file is not flattened to text**. It is
+saved to `<outbox>/received/` and the agent is given its absolute path, so it
+inspects the real file by writing code — which is what makes formulas, hidden
+sheets, embedded media, scanned PDFs and archives readable. The prompt lists the
+libraries available (`pandas`, `openpyxl`, `pypdf`, `python-docx`, `Pillow`,
+stdlib). Saved files inherit the outbox's 24h TTL and can be sent back to the
+chat with `chat_send_file` or `/sendfile`.
+
+Images and documents are mutually exclusive: an image goes in natively, any other
+file as a path, never both — otherwise the model would get OCR text beside an
+image it can already see.
+
+Only `/claude` works this way. The default model's `handle_file` still extracts
+text, which needs no tool calls and no file lifetime management.
+
 A `/claude` caption on an upload is matched before the generic file handler, so
-the image is answered once — by the enterprise model, not the default one.
+the attachment is answered once — by the enterprise model, not the default one.
+
+`/claude` is available to every user in a forum topic (it is rate-limited, not
+admin-gated).
 
 #### `/reconcile <shoot_name>` details
 

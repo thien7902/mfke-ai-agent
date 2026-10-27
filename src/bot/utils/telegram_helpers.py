@@ -4,9 +4,12 @@ import base64
 import logging
 import os
 import tempfile
+from pathlib import Path
 from typing import List, Optional
 
 from telegram.error import NetworkError, RetryAfter, TimedOut
+
+from src.bot.utils.file_extractor import extract_text_from_file
 
 logger = logging.getLogger(__name__)
 
@@ -237,27 +240,45 @@ async def edit_or_send_long_message(
 _MAX_IMAGE_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
 
+def attachment_target(message):
+    """Return (file_id, filename, mime) for a file attached to `message`.
+
+    Handles a document of any type and a photo (largest size). Returns None
+    when the message carries no attachment.
+    """
+    if message is None:
+        return None
+
+    doc = getattr(message, "document", None)
+    if doc:
+        return (
+            doc.file_id,
+            doc.file_name or "upload",
+            (doc.mime_type or "").lower() or None,
+        )
+
+    photo = getattr(message, "photo", None)
+    if photo:
+        largest = photo[-1]
+        return largest.file_id, f"photo_{largest.file_unique_id}.jpg", "image/jpeg"
+
+    return None
+
+
 def _image_target_from_message(message):
     """Return (file_id, mime, suffix) for an image attached to `message`.
 
     Handles a photo (largest size) or an image document (.png/.jpg/...).
     Returns None when the message carries no image, so callers can no-op.
     """
-    if message is None:
+    target = attachment_target(message)
+    if target is None:
         return None
 
-    photo = getattr(message, "photo", None)
-    if photo:
-        largest = photo[-1]
-        return largest.file_id, "image/jpeg", ".jpg"
-
-    doc = getattr(message, "document", None)
-    if doc:
-        mime = (doc.mime_type or "").lower()
-        name = (doc.file_name or "").lower()
-        if mime.startswith("image/"):
-            suffix = os.path.splitext(name)[1] or ".img"
-            return doc.file_id, mime, suffix
+    file_id, filename, mime = target
+    if (mime or "").startswith("image/"):
+        suffix = os.path.splitext(filename)[1] or ".img"
+        return file_id, mime, suffix
     return None
 
 
@@ -323,3 +344,124 @@ async def collect_vision_images(bot, message) -> List[dict]:
             images.append(image)
 
     return images
+
+
+# Hard cap on text extracted from an attachment attached to a command turn.
+# The enterprise model has a large context, but a 10 MB xlsx dumped in full
+# would still crowd out the conversation and the tool results.
+MAX_ATTACHMENT_TEXT_CHARS = 200_000
+
+# Telegram's bot download limit for a file fetched via get_file().
+_MAX_ATTACHMENT_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
+
+async def extract_attachment_text(bot, message) -> Optional[str]:
+    """Download the document on `message` and return its extracted text.
+
+    Returns None when the message has no *non-image* attachment or extraction
+    yields nothing — images are handled by `collect_vision_images` instead, and
+    an image reaching this function (e.g. an image document) is left alone so
+    the caller does not paste OCR text alongside the native image.
+
+    The temp download is always removed. Extraction runs off-thread because
+    pypdf/openpyxl on a large workbook are CPU-bound and would stall the loop.
+    """
+    target = attachment_target(message)
+    if target is None:
+        return None
+
+    file_id, filename, mime = target
+    if (mime or "").startswith("image/"):
+        return None
+
+    tmp_path = None
+    try:
+        tg_file = await bot.get_file(file_id)
+        size = getattr(tg_file, "file_size", 0) or 0
+        if size and size > _MAX_ATTACHMENT_DOWNLOAD_BYTES:
+            logger.warning(
+                "Attachment too large to extract: %s bytes (limit %s)",
+                size, _MAX_ATTACHMENT_DOWNLOAD_BYTES,
+            )
+            return None
+
+        suffix = os.path.splitext(filename)[1]
+        fd, tmp_path = tempfile.mkstemp(prefix="att-", suffix=suffix)
+        os.close(fd)
+        await tg_file.download_to_drive(tmp_path)
+
+        text = await asyncio.to_thread(extract_text_from_file, Path(tmp_path), mime)
+        if not text or not text.strip():
+            return None
+        if len(text) > MAX_ATTACHMENT_TEXT_CHARS:
+            text = (
+                text[:MAX_ATTACHMENT_TEXT_CHARS]
+                + f"\n\n[... truncated at {MAX_ATTACHMENT_TEXT_CHARS} characters ...]"
+            )
+        return text
+    except Exception as e:
+        logger.warning("Failed to extract attachment text: %s", e)
+        return None
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+async def save_attachment_for_agent(bot, message) -> Optional[tuple]:
+    """Save a non-image attachment to disk and return (path, filename).
+
+    Used by `/claude` only: instead of flattening the file to text, the bytes
+    are kept in the outbox's `received/` dir and the path is handed to the
+    enterprise model, which has bash + python and can inspect the real file
+    (formulas, hidden sheets, embedded media, scanned PDFs, archives) far more
+    thoroughly than a text extraction ever could.
+
+    Reusing the outbox means the file inherits its lifetime rules: pruned after
+    `FILE_SEND_OUTBOX_TTL_HOURS`, on the persistent volume, and deliverable back
+    to the chat with `chat_send_file` / `/sendfile`.
+
+    Returns None when there is no attachment, it is an image (handled natively
+    by the vision path), or it could not be stored.
+    """
+    target = attachment_target(message)
+    if target is None:
+        return None
+
+    file_id, filename, mime = target
+    if (mime or "").startswith("image/"):
+        return None
+
+    from src.bot.utils import file_sender as _file_sender
+
+    tmp_path = None
+    try:
+        tg_file = await bot.get_file(file_id)
+        size = getattr(tg_file, "file_size", 0) or 0
+        if size and size > _MAX_ATTACHMENT_DOWNLOAD_BYTES:
+            logger.warning(
+                "Attachment too large to save: %s bytes (limit %s)",
+                size, _MAX_ATTACHMENT_DOWNLOAD_BYTES,
+            )
+            return None
+
+        suffix = os.path.splitext(filename)[1]
+        fd, tmp_path = tempfile.mkstemp(prefix="att-", suffix=suffix)
+        os.close(fd)
+        await tg_file.download_to_drive(tmp_path)
+
+        stored = await asyncio.to_thread(_file_sender.stash_upload, tmp_path, filename)
+        if stored is None:
+            return None
+        return stored, filename
+    except Exception as e:
+        logger.warning("Failed to save attachment for agent: %s", e)
+        return None
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
