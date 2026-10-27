@@ -1,7 +1,10 @@
 """Telegram Helper Utilities."""
 import asyncio
+import base64
 import logging
-from typing import List
+import os
+import tempfile
+from typing import List, Optional
 
 from telegram.error import NetworkError, RetryAfter, TimedOut
 
@@ -227,3 +230,96 @@ async def edit_or_send_long_message(
         )
 
     return sent_messages
+
+# ---------- image attachments for vision-capable models ----------
+
+# Telegram bot download limit for a file produced by get_file().
+_MAX_IMAGE_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
+
+def _image_target_from_message(message):
+    """Return (file_id, mime, suffix) for an image attached to `message`.
+
+    Handles a photo (largest size) or an image document (.png/.jpg/...).
+    Returns None when the message carries no image, so callers can no-op.
+    """
+    if message is None:
+        return None
+
+    photo = getattr(message, "photo", None)
+    if photo:
+        largest = photo[-1]
+        return largest.file_id, "image/jpeg", ".jpg"
+
+    doc = getattr(message, "document", None)
+    if doc:
+        mime = (doc.mime_type or "").lower()
+        name = (doc.file_name or "").lower()
+        if mime.startswith("image/"):
+            suffix = os.path.splitext(name)[1] or ".img"
+            return doc.file_id, mime, suffix
+    return None
+
+
+async def download_image_as_data_url(bot, message) -> Optional[dict]:
+    """Download the image on `message` and return a vision `{"url": ...}` dict.
+
+    Returns an OpenAI-style `data:<mime>;base64,...` URL wrapped as
+    `{"url": ...}` (the shape `build_vision_content` and Holmes' multimodal
+    path expect), or None when the message has no image / the download fails.
+    The temp file is always removed.
+    """
+    target = _image_target_from_message(message)
+    if target is None:
+        return None
+
+    file_id, mime, suffix = target
+    tmp_path = None
+    try:
+        tg_file = await bot.get_file(file_id)
+        size = getattr(tg_file, "file_size", 0) or 0
+        if size and size > _MAX_IMAGE_DOWNLOAD_BYTES:
+            logger.warning(
+                "Image too large to attach: %s bytes (limit %s)",
+                size, _MAX_IMAGE_DOWNLOAD_BYTES,
+            )
+            return None
+
+        fd, tmp_path = tempfile.mkstemp(prefix="img-", suffix=suffix)
+        os.close(fd)
+        await tg_file.download_to_drive(tmp_path)
+
+        with open(tmp_path, "rb") as f:
+            payload = base64.b64encode(f.read()).decode("ascii")
+        return {"url": f"data:{mime};base64,{payload}"}
+    except Exception as e:
+        logger.warning("Failed to download image for vision model: %s", e)
+        return None
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+async def collect_vision_images(bot, message) -> List[dict]:
+    """Images to attach for a command turn.
+
+    Looks at the command's own message (an image uploaded *with* the command as
+    its caption) and, additionally, at the message it replies to. Dedupes by
+    file_id so an unlikely overlap is attached once.
+    """
+    images: List[dict] = []
+    seen = set()
+
+    for candidate in (message, getattr(message, "reply_to_message", None)):
+        target = _image_target_from_message(candidate)
+        if target is None or target[0] in seen:
+            continue
+        seen.add(target[0])
+        image = await download_image_as_data_url(bot, candidate)
+        if image:
+            images.append(image)
+
+    return images

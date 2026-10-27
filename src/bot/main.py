@@ -225,6 +225,21 @@ class TelegramBot:
             TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler.handle_message)
         )
 
+        # Document/photo uploads with caption starting with `/claude` — same
+        # PTB limitation as /addmemory: a command only in `caption` never
+        # reaches CommandHandler. Registering this in group 0 *before*
+        # handle_file matters: PTB runs at most one handler per group and stops
+        # at the first match, so a later group means handle_file already
+        # answered the image with the default model and the enterprise model
+        # would then answer the same upload a second time.
+        self.application.add_handler(
+            TelegramMessageHandler(
+                (filters.Document.ALL | filters.PHOTO)
+                & filters.CaptionRegex(r"^/claude(\s|$|@)"),
+                cmd_handler.claude_upload_command,
+            )
+        )
+
         # Document/photo uploads with caption starting with `/addmemory` —
         # PTB's CommandHandler only matches commands in `message.text`, not in
         # `message.caption`, so a file upload captioned "/addmemory" would

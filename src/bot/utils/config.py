@@ -58,6 +58,13 @@ class Config:
     # images go through vision_service → OCR fallback into plain text.
     main_model_supports_images: bool = False
 
+    # Enterprise model used by /claude. It reads uploaded images natively
+    # (attached as image_url blocks) by default — that is how /claude is meant
+    # to be used with screenshots. Set ENTERPRISE_MODEL_SUPPORTS_IMAGES=false
+    # if the configured endpoint is text-only, in which case /claude falls back
+    # to the vision pre-step / OCR into plain text.
+    enterprise_model_supports_images: bool = True
+
     # Outbound files (bot → user). The `chat_send_file` Holmes tool and the
     # /sendfile command may only send files from this directory — it is the
     # model's workspace, kept separate so a generated file cannot be aimed at
@@ -124,6 +131,7 @@ def load_config() -> Config:
         file_upload_tmp_dir=os.getenv("FILE_UPLOAD_TMP_DIR", "/tmp/bot_uploads"),
         vision_model=os.getenv("VISION_MODEL") or "Qwen3.8-27B",
         main_model_supports_images=os.getenv("MAIN_MODEL_SUPPORTS_IMAGES", "").lower() in ("1", "true", "yes", "on"),
+        enterprise_model_supports_images=os.getenv("ENTERPRISE_MODEL_SUPPORTS_IMAGES", "true").lower() in ("1", "true", "yes", "on"),
         file_send_outbox_dir=os.getenv("FILE_SEND_OUTBOX_DIR", "/root/.holmes/outbox"),
         file_send_max_bytes=int(os.getenv("FILE_SEND_MAX_BYTES", str(50 * 1024 * 1024))),
         file_send_outbox_ttl_hours=int(os.getenv("FILE_SEND_OUTBOX_TTL_HOURS", "24")),

@@ -118,6 +118,23 @@ python -m src.bot.main
 | `/revoke <user_id> <permission>` | Revoke a user's permission |
 | `/user_permissions <user_id>` | View another user's permissions |
 | `/pending` | View pending permission requests |
+| `/claude <prompt>` | One-shot turn on the enterprise model (`CLAUDE_ENTERPRISE_MODEL`). Reads images natively |
+
+#### `/claude` and images
+
+`/claude` attaches image bytes to the message as `image_url` content blocks, so
+the enterprise model reads a screenshot directly — no OCR, no vision pre-step.
+Two ways to send one:
+
+- Attach a screenshot with the caption `/claude <prompt>`
+- Reply to an image with `/claude <prompt>`
+
+This is controlled by `ENTERPRISE_MODEL_SUPPORTS_IMAGES` (default `true`) and is
+independent of `MAIN_MODEL_SUPPORTS_IMAGES`, which only governs the default
+model's path in `handle_file`. Set it to `false` for a text-only endpoint.
+
+A `/claude` caption on an upload is matched before the generic file handler, so
+the image is answered once — by the enterprise model, not the default one.
 
 #### `/reconcile <shoot_name>` details
 

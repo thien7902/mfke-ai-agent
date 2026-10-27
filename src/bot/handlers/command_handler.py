@@ -11,13 +11,14 @@ from src.bot.services.permission_service import PermissionService
 from src.bot.services.conversation_service import ConversationService
 from src.bot.services.holmes_service import HolmesService
 from src.bot.models.user import UserPermission
+from src.bot.utils.config import config
 from src.bot.utils.decorators import admin_only, rate_limit
 from src.bot.utils.kubeconfig_crypto import (
     migrate_kubeconfigs,
     decrypt_to_tempfile,
     cleanup_tempfile,
 )
-from src.bot.utils.telegram_helpers import send_long_message
+from src.bot.utils.telegram_helpers import send_long_message, collect_vision_images
 
 logger = structlog.get_logger(__name__)
 
@@ -88,7 +89,7 @@ class CommandHandler:
                 "\n\n🔧 **Admin commands:**\n"
                 "/shell <command> - Execute a shell command in the bot container\n"
                 "/kshell [kc_name] <command> - Run command with a decrypted kubeconfig (/kshell alone to list)\n"
-                "/claude <prompt> - Run a one-shot turn on the enterprise model\n"
+                "/claude <prompt> - Run a one-shot turn on the enterprise model (reads images)\n"
                 "/grant <user_id> <permission> - Request permission for user\n"
                 "/revoke <user_id> <permission> - Revoke user permission\n"
                 "/user_permissions <user_id> - View user's permissions\n"
@@ -137,7 +138,7 @@ class CommandHandler:
                 "\n**Admin Commands:**\n"
                 "/shell <command> - Execute a shell command in the bot container\n"
                 "/kshell [kc_name] <command> - Run command with a decrypted kubeconfig (/kshell alone to list)\n"
-                "/claude <prompt> - Run a one-shot turn on the enterprise model\n"
+                "/claude <prompt> - Run a one-shot turn on the enterprise model (reads images)\n"
                 "/grant <user_id> <permission> - Request a permission for a user\n"
                 "/revoke <user_id> <permission> - Revoke a user's permission\n"
                 "/user_permissions <user_id> - View another user's permissions\n"
@@ -994,6 +995,48 @@ class CommandHandler:
         except Exception:
             pass
 
+    @staticmethod
+    def _claude_prompt(message, context) -> str:
+        """Prompt text for /claude, from message.text or the file caption.
+
+        An image attached with `/claude` as its caption arrives as
+        `message.caption` with `message.text=None` (see handle_claude_upload),
+        so the command args are empty there and the caption is the only source.
+        """
+        args = " ".join(context.args).strip() if getattr(context, "args", None) else ""
+        if args:
+            return args
+        caption = (getattr(message, "caption", None) or "").strip()
+        if not caption:
+            return ""
+        # Drop the leading "/claude" or "/claude@BotName" token.
+        parts = caption.split(maxsplit=1)
+        if parts and parts[0].lower().startswith("/claude"):
+            return parts[1].strip() if len(parts) > 1 else ""
+        return caption
+
+    @staticmethod
+    def _claude_has_image(message) -> bool:
+        """True when the message (or the one it replies to) carries an image."""
+        from src.bot.utils.telegram_helpers import _image_target_from_message
+        return (
+            _image_target_from_message(message) is not None
+            or _image_target_from_message(getattr(message, "reply_to_message", None)) is not None
+        )
+
+    @admin_only
+    @rate_limit
+    async def claude_upload_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Entry point for an image whose caption starts with `/claude`.
+
+        PTB's CommandHandler only matches `message.text`, and Telegram sets
+        `text=None` / `caption="/claude ..."` for a photo or image document.
+        Without this handler such an upload would fall through to
+        MessageHandler.handle_file and be answered by the default model, which
+        is not what /claude asks for. Mirrors AddMemoryCommand.handle_upload.
+        """
+        await self.claude_command(update, context)
+
     @admin_only
     @rate_limit
     async def claude_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1005,6 +1048,11 @@ class CommandHandler:
         prompt and reply are appended to the same topic conversation as normal
         turns, so follow-up plain messages on the default model still see
         this turn in history.
+
+        Images are read natively by the enterprise model: attach a screenshot
+        with `/claude` as its caption, or reply to an image with `/claude ...`.
+        The bytes go straight into the message as image_url blocks — no OCR.
+        Set ENTERPRISE_MODEL_SUPPORTS_IMAGES=false for a text-only endpoint.
         """
         if not update.message:
             return
@@ -1026,20 +1074,28 @@ class CommandHandler:
             )
             return
 
-        if not context.args:
+        if not context.args and not self._claude_has_image(update.message):
             await update.message.reply_text(
-                "Usage: /claude <prompt>\nExample: /claude summarize the latest pod logs",
+                "Usage: /claude <prompt>\n"
+                "Example: /claude summarize the latest pod logs\n"
+                "Images: attach a screenshot with the caption `/claude <prompt>`, "
+                "or reply to an image with `/claude <prompt>`.",
                 message_thread_id=topic_id or None,
             )
             return
 
-        prompt = " ".join(context.args).strip()
+        prompt = self._claude_prompt(update.message, context)
         if not prompt:
-            await update.message.reply_text(
-                "❌ Empty prompt.",
-                message_thread_id=topic_id or None,
-            )
-            return
+            if self._claude_has_image(update.message):
+                # Image-only turn (`/claude` as the caption, no text): the model
+                # sees the image itself, so a neutral instruction is enough.
+                prompt = "(_image uploaded — please inspect it)"
+            else:
+                await update.message.reply_text(
+                    "❌ Empty prompt.",
+                    message_thread_id=topic_id or None,
+                )
+                return
 
         if self.holmes is None:
             await update.message.reply_text(
@@ -1088,6 +1144,27 @@ class CommandHandler:
             parse_mode="Markdown",
         )
 
+        # Native image reading: attach the screenshot's bytes to the message so
+        # the enterprise model sees it as an image_url block (no OCR). The
+        # `images` kwarg on chat_enterprise persists them in message metadata,
+        # so history replay rehydrates the same multimodal content array.
+        images = None
+        if getattr(config, "enterprise_model_supports_images", True):
+            try:
+                images = await collect_vision_images(context.bot, update.message)
+            except Exception as e:
+                logger.warning("/claude image attach failed", user_id=user.id, error=str(e))
+                images = None
+            if images:
+                try:
+                    await ack.edit_text(
+                        f"🧭 Routing to enterprise model with {len(images)} image(s)...\n\n"
+                        f"📝 Prompt:\n`{prompt[:200]}`",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+
         # Streaming via enterprise LLM, but deliver only final text (matches
         # /ping-capable regular-response flow).
         _set_investigation_status(chat_id, topic_id, "🧭 Enterprise model...")
@@ -1104,6 +1181,7 @@ class CommandHandler:
                 chat_id=chat_id,
                 topic_id=topic_id,
                 cancel_event=cancel_event,
+                images=images,
             )
             async for event in async_gen:
                 event_type = event.get("type", "unknown")
