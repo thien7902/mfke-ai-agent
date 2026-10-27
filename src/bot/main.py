@@ -25,7 +25,9 @@ from src.bot.services.memory_service import MemoryService
 from src.bot.handlers.message_handler import MessageHandler
 from src.bot.handlers.command_handler import CommandHandler as BotCommandHandler
 from src.bot.commands.add_memory import AddMemoryCommand
+from src.bot.commands.send_file import SendFileCommand
 from src.bot.handlers.privilege_handler import PrivilegeHandler
+from src.bot.utils import file_sender
 
 # Configure structlog
 structlog.configure(
@@ -154,6 +156,22 @@ class TelegramBot:
             .build()
         )
 
+        # Register the live bot + loop for outbound document delivery. The
+        # chat_send_file tool runs on a Holmes worker thread and bridges back
+        # here via asyncio.run_coroutine_threadsafe (src/bot/utils/file_sender.py).
+        file_sender.configure_file_sender(
+            self.application.bot, asyncio.get_running_loop()
+        )
+        try:
+            outbox = file_sender.ensure_outbox_dir()
+            file_sender.prune_outbox()
+            logger.info("Outbound file outbox ready", path=str(outbox))
+        except Exception as e:
+            # A read-only or missing /root/.holmes is a misconfiguration, not a
+            # startup blocker: sending files fails with a clear message and the
+            # rest of the bot keeps working.
+            logger.error("Failed to prepare outbound file outbox", error=str(e))
+
         # Initialize handlers
         msg_handler = MessageHandler(
             self.holmes_service,
@@ -165,6 +183,7 @@ class TelegramBot:
         )
         priv_handler = PrivilegeHandler(self.permission_service)
         add_memory_handler = AddMemoryCommand(self.memory_service, self.permission_service)
+        send_file_handler = SendFileCommand()
 
         # Register command handlers
         self.application.add_handler(TelegramCommandHandler("start", cmd_handler.start_command))
@@ -184,6 +203,11 @@ class TelegramBot:
         # /addmemory — admin only; ingests replied message text or attached file
         # content as a knowledge episode into Graphiti (see src/bot/commands/add_memory.py)
         self.application.add_handler(TelegramCommandHandler("addmemory", add_memory_handler.handle))
+
+        # /sendfile — deliver a file from the outbox into this topic. The
+        # assistant normally does this itself via the chat_send_file tool; the
+        # command is the manual fallback. See src/bot/commands/send_file.py.
+        self.application.add_handler(TelegramCommandHandler("sendfile", send_file_handler.handle))
 
         # Privilege commands
         self.application.add_handler(TelegramCommandHandler("grant", priv_handler.grant_command))
@@ -304,6 +328,8 @@ class TelegramBot:
         if self.holmes_service:
             await self.holmes_service.close()
             health_checker.set_holmes_ready(False)
+
+        file_sender.reset_file_sender()
 
         if self.memory_service:
             await self.memory_service.close()

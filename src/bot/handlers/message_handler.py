@@ -317,6 +317,11 @@ class MessageHandler:
         falling back to OCR. All other supported types are parsed directly.
         The extracted text is combined with the user's caption and handed to
         `_enqueue_text`, which reuses the normal batching/streaming/approval flow.
+
+        Documents are also copied into the outbox (`file_sender.stash_upload`)
+        before the temp download is deleted, so the same file can be sent back
+        to the chat later — by the model via `chat_send_file`, or by the user
+        via `/sendfile`.
         """
         if not update.message:
             return
@@ -375,6 +380,17 @@ class MessageHandler:
             tg_file = await context.bot.get_file(file_id)
             await tg_file.download_to_drive(tmp_path)
 
+            # Keep a copy in the outbox before the tmp file is deleted below,
+            # so this upload can be sent back later ("send me that xlsx
+            # again"). Best-effort: a None result just means the file isn't
+            # re-sendable, and the turn continues normally. Documents only —
+            # photos already stream fine in chat and would just bloat the
+            # outbox (and its 24h prune list).
+            from src.bot.utils import file_sender as _file_sender
+            stashed = None
+            if doc is not None:
+                stashed = await asyncio.to_thread(_file_sender.stash_upload, tmp_path, filename)
+
             from pathlib import Path as _Path
 
             # Fast path: if the main Holmes LLM accepts image_url content
@@ -429,7 +445,14 @@ class MessageHandler:
                 )
                 return
 
-            combined = f"{caption}\n\n--- File: {filename} ---\n{extracted}".strip() if caption else f"--- File: {filename} ---\n{extracted}"
+            # Tell the model where the original lives when we kept a copy, so
+            # "send that file back to me" works without a list_chat_files round
+            # trip. The note names the path only — the extracted text below is
+            # still the primary content of this turn.
+            reattach_note = (
+                f"\n[Original file kept for re-sending: {stashed}]" if stashed else ""
+            )
+            combined = f"{caption}\n\n--- File: {filename} ---\n{extracted}{reattach_note}".strip() if caption else f"--- File: {filename} ---\n{extracted}{reattach_note}"
             # File uploads skip the debounce quiet window — extracted text is
             # already a complete turn; no benefit to waiting for more messages
             # to batch together.
@@ -1214,6 +1237,8 @@ class MessageHandler:
             'bash': 'Running shell command',
             'read_file': 'Reading file',
             'write_file': 'Writing file',
+            'chat_send_file': 'Sending file',
+            'list_chat_files': 'Listing sendable files',
         }
         return friendly_names.get(tool_name, tool_name.replace('_', ' ').title())
 

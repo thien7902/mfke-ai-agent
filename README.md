@@ -101,6 +101,8 @@ python -m src.bot.main
 | `/clear` | Clear conversation history in this topic |
 | `/stop` | Stop a pending batch or in-flight request in this topic |
 | `/ping` | Show the current agent status in this topic |
+| `/sendfile` | List the files the bot can send |
+| `/sendfile <name>` | Send a generated file back into this topic |
 | `/reconcile <shoot_name>` | Trigger Gardener reconcile for a shoot across all kubeconfigs in `/root/.holmes/kubeconfig-only-admin-can-run` |
 | `/approve <request_id>` | Approve a permission request |
 | `/deny <request_id>` | Deny a permission request |
@@ -120,6 +122,33 @@ python -m src.bot.main
 #### `/reconcile <shoot_name>` details
 
 Traverses every kubeconfig in `/root/.holmes/kubeconfig-only-admin-can-run/`, looks up the shoot's namespace via `kubectl get shoot <name> -A`, then annotates it with `gardenercloud.com/operation=reconcile --overwrite`. Reports per-kubeconfig results, or `No shoot matched <name>` if none found.
+
+### Sending files to the user
+
+The assistant delivers files itself when asked for one — "make me an xlsx of the
+shoots", "export the pod list as csv", "write that to a script" — using the
+`chat_send_file` Holmes tool, which uploads the file as a Telegram document into
+the topic the conversation is in. A `CHAT FILE OUTPUT RULE` appended to the
+system prompt (`HolmesService._file_output_rule`) tells the model to write the
+deliverable to the outbox and send it rather than pasting its contents.
+
+The outbox (`FILE_SEND_OUTBOX_DIR`, default `/root/.holmes/outbox`) is the only
+directory files may be sent from. That containment is the security boundary: the
+bot runs as root next to encrypted kubeconfigs and API keys, so an unrestricted
+"send this path" tool would be an exfiltration primitive. Paths are resolved
+before the check (symlinks cannot escape), credential-shaped names (`.enc`,
+`.pem`, `id_rsa`, `.env`, …) are always refused, and uploads are capped at
+Telegram's 50 MB bot limit. `FILE_SEND_OUTBOX_TTL_HOURS` prunes old
+deliverables.
+
+`/sendfile` is the manual path: bare `/sendfile` lists the outbox, `/sendfile
+<name>` sends one. Useful when the model produced a file without sending it, or
+for re-sending an earlier deliverable.
+
+Documents a user uploads are copied into `<outbox>/received/` before their temp
+download is deleted (`FILE_SEND_KEEP_UPLOADS`, on by default), so "send me that
+xlsx again" works mid-conversation. Photos are not stashed — they already render
+in chat.
 
 ### Available Permissions
 

@@ -71,6 +71,7 @@ class CommandHandler:
             "/clear - Clear conversation history\n"
             "/stop - Stop a pending batch or in-flight request in this topic\n"
             "/ping - Show the current agent status in this topic\n"
+            "/sendfile [name] - Send a generated file, or list sendable files\n"
             "/reconcile <shoot_name> - Trigger Gardener reconcile for a shoot\n\n"
             "Just send me a message to start chatting!"
         )
@@ -127,6 +128,7 @@ class CommandHandler:
             "/clear - Clear your conversation history\n"
             "/stop - Stop a pending batch or in-flight request in this topic\n"
             "/ping - Show the current agent status in this topic\n"
+            "/sendfile [name] - Send a generated file, or list the sendable files\n"
             "/reconcile <shoot_name> - Trigger Gardener reconcile for a shoot\n"
         )
 

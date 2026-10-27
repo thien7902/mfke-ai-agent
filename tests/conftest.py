@@ -101,8 +101,14 @@ def mock_callback_query():
 
 
 @pytest.fixture(autouse=True)
-def mock_config():
-    """Mock configuration for tests."""
+def mock_config(tmp_path_factory):
+    """Mock configuration for tests.
+
+    The outbox lives in its own temp dir, not under the per-test `tmp_path`
+    some tests reuse as `file_upload_tmp_dir` — those tests assert that dir is
+    left empty, and a stashed upload would otherwise look like a leak.
+    """
+    outbox_dir = tmp_path_factory.mktemp("bot_outbox")
     with patch("src.bot.utils.config.config") as mock, \
          patch("src.bot.utils.decorators.config", mock), \
          patch("src.bot.handlers.message_handler.config", mock), \
@@ -124,6 +130,10 @@ def mock_config():
         mock.file_upload_tmp_dir = "/tmp/bot_uploads_test"
         mock.vision_model = None
         mock.main_model_supports_images = False
+        mock.file_send_outbox_dir = str(outbox_dir)
+        mock.file_send_max_bytes = 50 * 1024 * 1024
+        mock.file_send_outbox_ttl_hours = 24
+        mock.file_send_keep_uploads = True
         mock.graphiti_memory_enabled = False
         mock.graphiti_db_path = "data/graphiti_test.db"
         mock.graphiti_falkor_mode = "embedded"

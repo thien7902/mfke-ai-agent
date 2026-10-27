@@ -1,5 +1,6 @@
 """Tests for MessageHandler.handle_file — document/photo upload flow."""
 import asyncio
+import importlib
 import os
 import pathlib
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -9,15 +10,21 @@ import pytest
 from src.bot.handlers.message_handler import MessageHandler
 from src.bot.utils.file_extractor import IMAGE_SENTINEL
 
+# `src/bot/utils/__init__.py` re-exports the `config` instance, shadowing the
+# submodule of the same name — import the module explicitly to read settings.
+config_module = importlib.import_module("src.bot.utils.config")
+
 
 @pytest.fixture(autouse=True)
 def _clear_caches():
     """Clear in-message dedup caches between tests so message_id=1 doesn't
     collide across tests in the same module."""
     from src.bot.handlers import message_handler as mh
+    from src.bot.utils import file_sender
     mh._processed_messages.clear()
     mh._topic_batches.clear()
     mh._topic_locks.clear()
+    file_sender.reset_file_sender()
     yield
 
 
@@ -116,6 +123,68 @@ async def test_handle_file_text_upload_enqueues_text(msg_handler, tmp_path, monk
     # Tmp file cleaned up
     leftover = list(pathlib.Path(str(tmp_path)).glob("*"))
     assert leftover == []
+
+
+@pytest.mark.asyncio
+async def test_handle_file_stashes_upload_and_notes_resend_path(msg_handler, tmp_path, monkeypatch):
+    """A document upload is copied into the outbox and the turn tells the model
+    where the original lives, so it can be sent back later."""
+    monkeypatch.setattr("src.bot.handlers.message_handler.config.file_upload_tmp_dir", str(tmp_path))
+    from src.bot.utils import file_sender
+    outbox = pathlib.Path(config_module.config.file_send_outbox_dir)
+
+    update = _file_update(filename="note.txt", mime="text/plain")
+    context = _mock_context(tmp_path)
+
+    enqueued = []
+    async def fake_enqueue_text(upd, ctx, text, **kwargs):
+        enqueued.append(text)
+    msg_handler._enqueue_text = fake_enqueue_text
+
+    await msg_handler.handle_file(update, context)
+
+    stored = outbox / "received" / "note.txt"
+    assert stored.is_file()
+    assert stored.read_text() == "hello world, this is extracted text"
+    assert f"[Original file kept for re-sending: {stored}]" in enqueued[0]
+    # The stashed copy is what makes the re-send possible.
+    assert file_sender.resolve_sendable_path("received/note.txt") == stored.resolve()
+
+
+@pytest.mark.asyncio
+async def test_handle_file_does_not_stash_photos(msg_handler, tmp_path, monkeypatch):
+    """Photos already render in chat; stashing them would only bloat the outbox."""
+    monkeypatch.setattr("src.bot.handlers.message_handler.config.file_upload_tmp_dir", str(tmp_path))
+    from src.bot.utils import file_sender
+    outbox = pathlib.Path(config_module.config.file_send_outbox_dir)
+
+    async def _get_file(file_id):
+        class FakeFile:
+            async def download_to_drive(self, dest):
+                p = pathlib.Path(dest)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(b"\x89PNG\r\n\x1a\n")
+        return FakeFile()
+
+    photo = MagicMock()
+    photo.file_id = "p1"
+    photo.file_unique_id = "u1"
+    photo.file_size = 10
+    update = _file_update(filename=None, photo=[photo], caption="look")
+    context = MagicMock()
+    context.bot = MagicMock()
+    context.bot.get_file = AsyncMock(side_effect=_get_file)
+
+    enqueued = []
+    async def fake_enqueue_text(upd, ctx, text, **kwargs):
+        enqueued.append(text)
+    msg_handler._enqueue_text = fake_enqueue_text
+
+    with patch("src.bot.handlers.message_handler.extract_text_from_image", return_value="ocr"):
+        await msg_handler.handle_file(update, context)
+
+    assert not (outbox / "received").exists()
+    assert "Original file kept" not in enqueued[0]
 
 
 @pytest.mark.asyncio

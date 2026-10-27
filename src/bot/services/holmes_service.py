@@ -25,6 +25,7 @@ from src.bot.models.conversation import Conversation, Message
 from src.bot.models.user import UserPermission
 from src.bot.services.memory_service import MemoryService
 from src.bot.tools.search_memory_tool import SearchMemoryTool
+from src.bot.tools.send_file_tool import SendFileTool, ListChatFilesTool
 from src.bot.tools.loop_guard import wrap_tools_with_loop_guard
 
 logger = structlog.get_logger(__name__)
@@ -106,6 +107,23 @@ def _patch_bash_kill_process_group():
 
 # Request context for CLI-like usage
 _CLI_REQUEST_CONTEXT = {"user_id": DEFAULT_CLI_USER}
+
+
+def _request_context(user_id: int, chat_id: int = 0, topic_id: int = 0) -> Dict[str, Any]:
+    """Per-turn request context handed to Holmes and on to every tool.
+
+    `chat_id` / `topic_id` are what lets the `chat_send_file` tool deliver a
+    generated file back into the conversation the turn came from (see
+    src/bot/tools/send_file_tool.py). They are absent for CLI-ish paths
+    (`execute_agent`), where the tool refuses instead of guessing a chat.
+    """
+    ctx: Dict[str, Any] = {**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)}
+    if chat_id:
+        ctx["chat_id"] = str(chat_id)
+    if topic_id:
+        ctx["topic_id"] = str(topic_id)
+    return ctx
+
 
 # Hard cap on bash tool timeout. Holmes' bash tool documents 30s as the default
 # but honors any timeout the LLM passes in the tool call — so the model can and
@@ -280,6 +298,7 @@ class HolmesService:
             self._wrap_todo_write_tool()
             self._wrap_bash_tool_timeout()
             self._register_search_memory_tool()
+            self._register_file_tools()
             wrap_tools_with_loop_guard(self._tool_executor)
 
             self._initialized = True
@@ -429,6 +448,21 @@ class HolmesService:
         te.tools_by_name[tool.name] = tool
         logger.info("Registered search_memory tool")
 
+    def _register_file_tools(self, tool_executor=None):
+        """Register the outbound-file tools (`chat_send_file`, `list_chat_files`).
+
+        Registered unconditionally: the send policy (outbox containment, name
+        and size checks) is enforced by src/bot/utils/file_sender, not by tool
+        availability. Without a configured Telegram sender the tool returns an
+        error instead of raising, so a mis-wired deployment never breaks a turn.
+        """
+        te = tool_executor if tool_executor is not None else self._tool_executor
+        if not te:
+            return
+        for tool in (SendFileTool(), ListChatFilesTool()):
+            te.tools_by_name[tool.name] = tool
+        logger.info("Registered chat_send_file and list_chat_files tools")
+
     def get_latest_investigation_tasks(self) -> List[Dict[str, Any]]:
         """Get the latest investigation tasks captured from TodoWrite."""
         return getattr(self, '_last_investigation_tasks', [])
@@ -506,6 +540,7 @@ class HolmesService:
             self._wrap_todo_write_tool(tcll.tool_executor)
             self._wrap_bash_tool_timeout(tcll.tool_executor)
             self._register_search_memory_tool(tcll.tool_executor)
+            self._register_file_tools(tcll.tool_executor)
             wrap_tools_with_loop_guard(tcll.tool_executor)
 
             self._enterprise_tcll = tcll
@@ -1110,6 +1145,9 @@ class HolmesService:
         # preserved (the rule goes after, not replacing them).
         if getattr(bot_config, "graphiti_memory_enabled", False):
             additions = (additions + self._MEMORY_TOOL_RULE).strip()
+        # The file rule is always on: without it the model answers "give me an
+        # xlsx" by pasting rows into the chat, which is what this feature fixes.
+        additions = (additions + self._file_output_rule()).strip()
         # Use Holmes' native message builder for proper formatting
         return build_initial_ask_messages(
             initial_user_prompt="",  # We'll override with actual messages
@@ -1118,6 +1156,33 @@ class HolmesService:
             skills=self._config.get_skill_catalog() if self._config else None,
             system_prompt_additions=additions or None,
         ) + messages
+
+    def _file_output_rule(self) -> str:
+        """System-prompt rule for producing deliverables as chat attachments.
+
+        Interpolates the configured outbox path so the model writes to the one
+        directory `chat_send_file` will actually accept.
+        """
+        from src.bot.utils import file_sender
+        outbox = file_sender.outbox_dir()
+        return (
+            "\n\n--- CHAT FILE OUTPUT RULE ---\n"
+            "When the user asks for a file (txt, csv, xlsx, json, yaml, pdf, zip, "
+            "script, report, log extract ...), create it as a real file and send it "
+            "with the chat_send_file tool instead of pasting the whole content into "
+            "the reply. Do not ask whether they want a file — just send it.\n"
+            f"1. Write the file to {outbox}/ . That is the only directory "
+            "chat_send_file will accept; anything outside it is rejected.\n"
+            "2. Call chat_send_file with the file path and a one-line caption "
+            "describing what it contains.\n"
+            "3. Only refer to the file in your reply text (e.g. 'sent shoots.xlsx'); "
+            "do not repeat its full contents.\n"
+            "Use list_chat_files if you need the exact path or a list of what is "
+            "already there. A short inline excerpt is still fine when the user asks "
+            "for a quick look rather than a download.\n"
+            "Security: never copy credentials, kubeconfigs, API keys or keys into the "
+            "outbox, and never try to send files from other directories."
+        )
 
     async def _non_stream_chat(
         self, messages: List[Dict[str, Any]], features: Dict[str, bool], user_id: int
@@ -1170,7 +1235,7 @@ class HolmesService:
                     _holmes_executor,
                     lambda: llm.call(
                         messages=messages,
-                        request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
+                        request_context=_request_context(user_id, chat_id, topic_id),
                         approval_callback=approval_callback,
                         cancel_event=cancel_event,
                     ),
@@ -1187,7 +1252,7 @@ class HolmesService:
                     _holmes_executor,
                     lambda: llm.call(
                         messages=messages,
-                        request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
+                        request_context=_request_context(user_id, chat_id, topic_id),
                         cancel_event=cancel_event,
                     ),
                 )
@@ -1335,7 +1400,7 @@ class HolmesService:
             logger.warning("Stream generator", enable_approval=enable_approval, has_tool_decisions=tool_decisions is not None)
             return llm.call_stream(
                 msgs=messages,
-                request_context={**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)},
+                request_context=_request_context(user_id, chat_id, topic_id),
                 enable_tool_approval=enable_approval,
                 tool_decisions=tool_decisions,
                 cancel_event=cancel_event,

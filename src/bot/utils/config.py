@@ -58,6 +58,23 @@ class Config:
     # images go through vision_service → OCR fallback into plain text.
     main_model_supports_images: bool = False
 
+    # Outbound files (bot → user). The `chat_send_file` Holmes tool and the
+    # /sendfile command may only send files from this directory — it is the
+    # model's workspace, kept separate so a generated file cannot be aimed at
+    # /root/.holmes/kubeconfig-only-admin-can-run or any other secret on disk.
+    # Default lives under /root/.holmes, which docker-compose already mounts as
+    # a persistent volume, so generated files survive container restarts.
+    file_send_outbox_dir: str = "/root/.holmes/outbox"
+    # Upper bound on a single upload; clamped to Telegram's 50 MB bot limit.
+    file_send_max_bytes: int = 50 * 1024 * 1024
+    # Deliverables older than this are pruned before each send. 0 disables.
+    file_send_outbox_ttl_hours: int = 24
+    # Keep a copy of each user upload under <outbox>/received/ so the
+    # conversation can send the same file back ("send that xlsx to me again").
+    # Set False to stop persisting uploads — they are then only readable
+    # during the turn that received them.
+    file_send_keep_uploads: bool = True
+
     # Graph memory (Graphiti). Enabled by default — MemoryService.init is
     # wrapped in try/except in main.py, so a FalkorDB/embedder failure only
     # disables memory, not the whole bot.
@@ -107,6 +124,10 @@ def load_config() -> Config:
         file_upload_tmp_dir=os.getenv("FILE_UPLOAD_TMP_DIR", "/tmp/bot_uploads"),
         vision_model=os.getenv("VISION_MODEL") or "Qwen3.8-27B",
         main_model_supports_images=os.getenv("MAIN_MODEL_SUPPORTS_IMAGES", "").lower() in ("1", "true", "yes", "on"),
+        file_send_outbox_dir=os.getenv("FILE_SEND_OUTBOX_DIR", "/root/.holmes/outbox"),
+        file_send_max_bytes=int(os.getenv("FILE_SEND_MAX_BYTES", str(50 * 1024 * 1024))),
+        file_send_outbox_ttl_hours=int(os.getenv("FILE_SEND_OUTBOX_TTL_HOURS", "24")),
+        file_send_keep_uploads=os.getenv("FILE_SEND_KEEP_UPLOADS", "true").lower() in ("1", "true", "yes", "on"),
         graphiti_memory_enabled=os.getenv("GRAPHITI_MEMORY_ENABLED", "true").lower() in ("1", "true", "yes", "on"),
         graphiti_db_path=os.getenv("GRAPHITI_DB_PATH", "/root/.holmes/graphiti.db"),
         graphiti_falkor_mode=os.getenv("GRAPHITI_FALKOR_MODE", "embedded"),
