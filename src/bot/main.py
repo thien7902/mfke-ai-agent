@@ -67,13 +67,36 @@ FATAL_POLLING_ERRORS = (
     'tls handshake',
 )
 
+# Pool-wedge signatures: PTB logs these when getUpdates can't acquire a pooled
+# httpx connection — meaning every slot is stuck holding a dead request.
+# PTB's polling loop swallows these and retries silently, so without this
+# detector the bot looks alive but never reads messages. Unlike the TLS
+# errors above, a single occurrence can be transient (one slow request), so
+# we count hits within a window before deciding the pool is truly wedged.
+POOL_WEDGE_ERRORS = (
+    'pool timeout',
+    'pooltimeout',
+    'all connections in the connection pool are occupied',
+)
+# Exit after this many pool-wedge log lines within this many seconds.
+POOL_WEDGE_THRESHOLD = 3
+POOL_WEDGE_WINDOW_SECONDS = 60.0
+
 
 class FatalPollingDetector(logging.Handler):
-    """Exit the process when PTB logs a fatal TLS/certificate error.
+    """Exit the process when PTB logs a fatal polling error.
 
-    A missing CA cert or broken TLS handshake is not transient — a fresh
-    container is the only useful recovery.
+    Two failure classes:
+      - TLS/certificate errors (FATAL_POLLING_ERRORS): never transient, exit
+        on first match.
+      - httpx pool wedge (POOL_WEDGE_ERRORS): transient blips happen, so exit
+        only after N matches in a 60s window — a wedged pool logs repeatedly
+        while PTB retries, a one-off slow request does not.
     """
+
+    def __init__(self):
+        super().__init__()
+        self._wedge_hits: list[float] = []
 
     def emit(self, record):
         try:
@@ -87,6 +110,20 @@ class FatalPollingDetector(logging.Handler):
             )
             health_checker.set_bot_alive(False)
             os._exit(1)
+        if any(sig in msg for sig in POOL_WEDGE_ERRORS):
+            import time
+            now = time.time()
+            self._wedge_hits = [t for t in self._wedge_hits if now - t <= POOL_WEDGE_WINDOW_SECONDS]
+            self._wedge_hits.append(now)
+            if len(self._wedge_hits) >= POOL_WEDGE_THRESHOLD:
+                logger.error(
+                    "httpx pool wedge detected - exiting for container restart",
+                    hits=len(self._wedge_hits),
+                    window_seconds=POOL_WEDGE_WINDOW_SECONDS,
+                    last_error=record.getMessage(),
+                )
+                health_checker.set_bot_alive(False)
+                os._exit(1)
 
 
 class TelegramBot:

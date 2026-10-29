@@ -14,6 +14,8 @@ import pytest
 # main_mod` (it binds to the function, not the module). importlib sidesteps it.
 main_mod = importlib.import_module("src.bot.main")
 FATAL_POLLING_ERRORS = main_mod.FATAL_POLLING_ERRORS
+POOL_WEDGE_ERRORS = main_mod.POOL_WEDGE_ERRORS
+POOL_WEDGE_THRESHOLD = main_mod.POOL_WEDGE_THRESHOLD
 FatalPollingDetector = main_mod.FatalPollingDetector
 
 
@@ -102,7 +104,40 @@ def test_exc_info_in_record_safe():
         mock_os._exit.assert_called_once_with(1)
 
 
-def test_handler_attached_in_main():
+@pytest.mark.parametrize("token", POOL_WEDGE_ERRORS)
+def test_each_pool_wedge_token_triggers_exit(token):
+    """Every token in POOL_WEDGE_ERRORS should trigger exit after threshold hits."""
+    detector = FatalPollingDetector()
+    with patch.object(main_mod, "os") as mock_os, \
+         patch.object(main_mod, "health_checker"):
+        for _ in range(POOL_WEDGE_THRESHOLD - 1):
+            detector.emit(make_record(f"error: {token}"))
+        mock_os._exit.assert_not_called()
+        detector.emit(make_record(f"error: {token}"))
+        mock_os._exit.assert_called_once_with(1)
+
+
+def test_pool_wedge_single_hit_does_not_exit():
+    """A single transient PoolTimeout should NOT exit — PTB retries transient ones."""
+    detector = FatalPollingDetector()
+    with patch.object(main_mod, "os") as mock_os, \
+         patch.object(main_mod, "health_checker") as mock_hc:
+        detector.emit(make_record("httpx.PoolTimeout while polling for updates"))
+        mock_os._exit.assert_not_called()
+        mock_hc.set_bot_alive.assert_not_called()
+
+
+def test_pool_wedge_resets_after_window():
+    """Hits older than the window should not count toward the threshold."""
+    import time as _time
+    detector = FatalPollingDetector()
+    with patch.object(main_mod, "os") as mock_os, \
+         patch.object(main_mod, "health_checker"):
+        # Seed hits older than the window so the next single hit shouldn't trigger.
+        old = _time.time() - (main_mod.POOL_WEDGE_WINDOW_SECONDS + 5)
+        detector._wedge_hits = [old, old + 0.1]
+        detector.emit(make_record("httpx.PoolTimeout"))
+        mock_os._exit.assert_not_called()
     """main() should attach a FatalPollingDetector to telegram.ext.Updater logger.
 
     This is the critical wiring — without it, PTB polling errors go to that
