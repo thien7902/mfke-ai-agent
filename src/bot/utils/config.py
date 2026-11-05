@@ -105,6 +105,18 @@ class Config:
     graphiti_embedding_model: str = "Vietnamese_Embedding"
     graphiti_embedding_dim: int = 1024
 
+    # Cluster health probe. When enabled, the bot spawns a background
+    # asyncio task that probes every kubeconfig in `cluster_probe_kubeconfig_dir`
+    # once per minute via `kubectl get --raw=/readyz` (5s timeout) and posts a
+    # status table to the forum chat's "general" topic. Each tick sends a fresh
+    # message at the bottom of the topic and deletes the previous probe, so the
+    # latest status is always visible without flooding the topic.
+    cluster_probe_enabled: bool = False
+    cluster_probe_kubeconfig_dir: str = "/root/kubeconfig"
+    cluster_probe_chat_id: Optional[int] = None
+    # Telegram forum "general" topic is id 1 by convention.
+    cluster_probe_topic_id: int = 1
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -145,6 +157,10 @@ def load_config() -> Config:
         graphiti_group_id=os.getenv("GRAPHITI_GROUP_ID", "global"),
         graphiti_embedding_model=os.getenv("GRAPHITI_EMBEDDING_MODEL", "Vietnamese_Embedding"),
         graphiti_embedding_dim=int(os.getenv("GRAPHITI_EMBEDDING_DIM", "1024")),
+        cluster_probe_enabled=os.getenv("CLUSTER_PROBE_ENABLED", "").lower() in ("1", "true", "yes", "on"),
+        cluster_probe_kubeconfig_dir=os.getenv("CLUSTER_PROBE_KUBECONFIG_DIR", "/root/kubeconfig"),
+        cluster_probe_chat_id=int(os.getenv("CLUSTER_PROBE_CHAT_ID")) if os.getenv("CLUSTER_PROBE_CHAT_ID") else None,
+        cluster_probe_topic_id=int(os.getenv("CLUSTER_PROBE_TOPIC_ID", "1")),
     )
 
 

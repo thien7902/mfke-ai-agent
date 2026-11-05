@@ -22,6 +22,7 @@ from src.bot.services.holmes_service import HolmesService, _holmes_executor
 from src.bot.services.conversation_service import ConversationService
 from src.bot.services.permission_service import PermissionService
 from src.bot.services.memory_service import MemoryService
+from src.bot.services.cluster_probe_service import ClusterProbeService
 from src.bot.handlers.message_handler import MessageHandler
 from src.bot.handlers.command_handler import CommandHandler as BotCommandHandler
 from src.bot.commands.add_memory import AddMemoryCommand
@@ -135,6 +136,7 @@ class TelegramBot:
         self.conversation_service: ConversationService = None
         self.permission_service: PermissionService = None
         self.memory_service: MemoryService = None
+        self.cluster_probe_service: ClusterProbeService = ClusterProbeService()
         self.last_update_time: float = 0  # Track last received update
         self.polling_restarts: int = 0    # Consecutive in-place restarts with no updates since
 
@@ -367,6 +369,26 @@ class TelegramBot:
         health_checker.set_bot_alive(True)
         logger.info("Bot started successfully")
 
+        # Start the cluster probe background task. Best-effort: a probe start
+        # failure never kills the bot (mirrors the MemoryService init pattern at
+        # L156-169). Only starts when CLUSTER_PROBE_ENABLED=true AND
+        # CLUSTER_PROBE_CHAT_ID is set — otherwise the service stays idle.
+        if config.cluster_probe_enabled and config.cluster_probe_chat_id:
+            try:
+                await self.cluster_probe_service.start(self.application.bot)
+            except Exception as e:
+                logger.error(
+                    "cluster_probe_start_failed_bot_continues",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+        else:
+            logger.info(
+                "cluster_probe_disabled",
+                enabled=config.cluster_probe_enabled,
+                chat_id_set=bool(config.cluster_probe_chat_id),
+            )
+
     async def stop(self):
         """Stop the bot gracefully."""
         logger.info("Stopping bot...")
@@ -385,6 +407,15 @@ class TelegramBot:
 
         if self.memory_service:
             await self.memory_service.close()
+
+        # Stop the cluster probe task before the Holmes executor shuts down
+        # so the probe's subprocesses don't outlive the executor they were
+        # spawned alongside.
+        if getattr(self, "cluster_probe_service", None):
+            try:
+                await self.cluster_probe_service.stop()
+            except Exception as e:
+                logger.warning("cluster_probe_stop_failed", error=str(e))
 
         # Shutdown the Holmes thread pool executor
         _holmes_executor.shutdown(wait=True)
