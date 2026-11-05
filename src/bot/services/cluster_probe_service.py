@@ -43,13 +43,39 @@ class ClusterProbeService:
 
     async def start(self, bot) -> None:
         self._bot = bot
+        # Recover the previous probe's message_id from the forum topic's
+        # pinned message so a bot restart doesn't orphan the last probe.
+        # If there's no pinned message (or it's not from us), the first
+        # tick just sends fresh without deleting — same as the no-prior case.
+        self._prev_message_id = await self._recover_prev_message_id()
         self._task = asyncio.create_task(self._probe_loop())
         logger.info(
             "cluster_probe_started",
             dir=config.cluster_probe_kubeconfig_dir,
             chat_id=config.cluster_probe_chat_id,
             topic_id=config.cluster_probe_topic_id,
+            recovered_prev_message_id=self._prev_message_id,
         )
+
+    async def _recover_prev_message_id(self) -> Optional[int]:
+        """Read the forum chat's pinned message — that's where we left the
+        last probe before restart. Returns its message_id, or None on any
+        failure (no pin, wrong chat, network error — treat all as "no prior").
+        """
+        try:
+            chat = await self._bot.get_chat(chat_id=config.cluster_probe_chat_id)
+            pinned = getattr(chat, "pinned_message", None)
+            if pinned is None:
+                return None
+            # Sanity: only adopt the pin if the message text looks like one
+            # of our probes — otherwise it's an unrelated pin by an admin.
+            text = getattr(pinned, "text", None) or ""
+            if "Cluster Probe" not in text:
+                return None
+            return getattr(pinned, "message_id", None)
+        except Exception as e:
+            logger.warning("cluster_probe_recover_prev_failed", error=str(e))
+            return None
 
     async def stop(self) -> None:
         if self._task is None:
@@ -177,6 +203,19 @@ class ClusterProbeService:
         if sent:
             first = sent[0] if isinstance(sent, list) else sent
             new_message_id = getattr(first, "message_id", None)
+
+        # Pin the new probe so restart can recover it via get_chat. Pinning
+        # is silent (disable_notification=True) — purely a state-marshalling
+        # side-channel, not a user-visible alert.
+        if new_message_id is not None:
+            try:
+                await self._bot.pin_chat_message(
+                    chat_id=config.cluster_probe_chat_id,
+                    message_id=new_message_id,
+                    disable_notification=True,
+                )
+            except Exception as e:
+                logger.debug("cluster_probe_pin_failed", error=str(e))
 
         # Delete the previous probe now that the new one is up.
         if self._prev_message_id is not None:

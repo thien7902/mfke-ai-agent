@@ -8,7 +8,7 @@ no network, no real kubectl. pytest-asyncio auto mode (pytest.ini).
 import asyncio
 from pathlib import Path
 from typing import List
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -256,6 +256,88 @@ async def test_send_delete_failure_does_not_raise():
     with _patch_send_rich_message(message_id=200):
         await svc._send_and_delete_old("markdown")
     assert svc._prev_message_id == 200
+
+
+# ---------- _recover_prev_message_id on start ----------
+
+class _FakeChat:
+    def __init__(self, pinned_message=None):
+        self.pinned_message = pinned_message
+
+
+class _FakePinnedMessage:
+    def __init__(self, message_id: int, text: str = "🛰 Cluster Probe — ..."):
+        self.message_id = message_id
+        self.text = text
+
+
+async def test_recover_prev_message_id_from_pinned_message():
+    svc = ClusterProbeService()
+    bot = _FakeBot()
+    bot.get_chat = AsyncMock(return_value=_FakeChat(
+        pinned_message=_FakePinnedMessage(message_id=999)
+    ))
+    svc._bot = bot
+    mid = await svc._recover_prev_message_id()
+    assert mid == 999
+
+
+async def test_recover_prev_message_id_none_when_no_pin():
+    svc = ClusterProbeService()
+    bot = _FakeBot()
+    bot.get_chat = AsyncMock(return_value=_FakeChat(pinned_message=None))
+    svc._bot = bot
+    assert await svc._recover_prev_message_id() is None
+
+
+async def test_recover_prev_message_id_rejects_unrelated_pin():
+    """A pin by an admin that isn't one of our probes must NOT be adopted —
+    otherwise the next tick would delete the admin's pin."""
+    svc = ClusterProbeService()
+    bot = _FakeBot()
+    bot.get_chat = AsyncMock(return_value=_FakeChat(
+        pinned_message=_FakePinnedMessage(
+            message_id=555, text="Important admin announcement"
+        )
+    ))
+    svc._bot = bot
+    assert await svc._recover_prev_message_id() is None
+
+
+async def test_recover_prev_message_id_swallows_get_chat_failure():
+    """If get_chat raises (chat not found, network error), start() must
+    still proceed — _probe_loop runs without a recovered prev."""
+    svc = ClusterProbeService()
+    bot = _FakeBot()
+
+    async def _failing_get_chat(**kwargs):
+        raise RuntimeError("chat not found")
+
+    bot.get_chat = _failing_get_chat
+    svc._bot = bot
+    assert await svc._recover_prev_message_id() is None
+
+
+async def test_send_pins_new_message_each_tick():
+    """Each tick pins the freshly sent probe so restart can recover it."""
+    svc = ClusterProbeService()
+    svc._prev_message_id = 100
+    bot = _FakeBot()
+    pinned = {"calls": []}
+
+    async def _fake_pin(**kwargs):
+        pinned["calls"].append(kwargs)
+
+    bot.pin_chat_message = _fake_pin
+    bot.delete_message = AsyncMock(return_value=True)
+    svc._bot = bot
+
+    with _patch_send_rich_message(message_id=200):
+        await svc._send_and_delete_old("🛰 Cluster Probe — ...\n| Col | ... |")
+
+    assert len(pinned["calls"]) == 1
+    assert pinned["calls"][0]["message_id"] == 200
+    assert pinned["calls"][0]["disable_notification"] is True
 
 
 # ---------- _probe_loop lifecycle ----------
