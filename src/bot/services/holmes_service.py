@@ -1011,6 +1011,7 @@ class HolmesService:
             user_id,
             is_admin=is_admin,
             user_display_name=user_display_name,
+            conversation=conversation,
         )
 
         # Get feature flags from permissions
@@ -1091,6 +1092,7 @@ class HolmesService:
             user_id,
             is_admin=is_admin,
             user_display_name=None,
+            conversation=conversation,
         )
         features = self._get_user_permissions(user_permissions)
 
@@ -1160,6 +1162,7 @@ class HolmesService:
         user_id: int,
         is_admin: bool = False,
         user_display_name: Optional[str] = None,
+        conversation: Optional[Conversation] = None,
     ) -> List[Dict[str, Any]]:
         """Build Holmes-compatible messages with proper system prompt and tool formatting.
 
@@ -1173,6 +1176,12 @@ class HolmesService:
         appended. Non-admins get the rule with `admin: no`; admins get
         `admin: yes`. The rule tells the LLM to pivot to read-only investigation
         on block (not retry the mutation) — see src/bot/tools/admin_gate.py.
+
+        Prior-stop note: when `conversation` is provided and the most recent
+        assistant message has `metadata.stopped_by_user=True`, a note
+        describing the prior interrupted request is appended — so the LLM
+        treats a re-issued similar request as a deliberate retry and focuses on
+        the original intent.
         """
         additions = bot_config.holmes_system_prompt_additions or ""
         # Append the search_memory tool-use rule when memory is enabled so
@@ -1187,6 +1196,12 @@ class HolmesService:
         # for handling admin-gate blocks so the LLM pivots to read-only
         # investigation rather than retrying the blocked mutation.
         additions = (additions + self._admin_gate_rule(is_admin, user_display_name)).strip()
+        # Prior-stop note — only if `conversation` provided and a recent
+        # assistant message was marked stopped_by_user.
+        if conversation is not None:
+            note = self._prior_stop_note(conversation)
+            if note:
+                additions = (additions + note).strip()
         # Use Holmes' native message builder for proper formatting
         return build_initial_ask_messages(
             initial_user_prompt="",  # We'll override with actual messages
@@ -1195,6 +1210,40 @@ class HolmesService:
             skills=self._config.get_skill_catalog() if self._config else None,
             system_prompt_additions=additions or None,
         ) + messages
+
+    @staticmethod
+    def _prior_stop_note(conversation: Conversation) -> str:
+        """Build a `--- PRIOR REQUEST INTERRUPTED ---` note if the most recent
+        assistant message in `conversation` was marked stopped_by_user.
+
+        Scans the last 5 messages; stops at the first assistant message with
+        `metadata.stopped_by_user=True`. Returns "" if no such message is
+        found within the window.
+        """
+        if not conversation or not conversation.messages:
+            return ""
+        for msg in reversed(conversation.messages[-5:]):
+            if msg.role != "assistant":
+                continue
+            if not msg.metadata or not msg.metadata.get("stopped_by_user"):
+                continue
+            original = (msg.metadata.get("original_user_request") or "").strip()
+            if not original:
+                return ""
+            preview = original if len(original) <= 400 else original[:400] + "…"
+            return (
+                "\n\n--- PRIOR REQUEST INTERRUPTED ---\n"
+                "The user's previous request was stopped before completion. "
+                f"Their original request was:\n\"{preview}\"\n\n"
+                "Tool calls executed in that prior turn are in the conversation "
+                "history. If the user now re-issues the same or a similar "
+                "request, treat it as a deliberate retry — focus on the "
+                "original intent, reuse prior tool results if still valid "
+                "(don't re-run identical kubectl get/describe/logs that "
+                "already have answers in history), and complete the "
+                "investigation."
+            )
+        return ""
 
     def _admin_gate_rule(self, is_admin: bool, user_display_name: Optional[str]) -> str:
         """Per-turn system-prompt block describing the current user and the
@@ -1351,109 +1400,133 @@ class HolmesService:
         """Streaming chat with Holmes, yielding structured events including task updates and handling tool approval.
 
         Accumulates assistant response and tool results so they can be persisted
-        to conversation history after the stream completes.
+        to conversation history after the stream completes. On interruption or
+        error, partial accumulated state is still persisted via a `finally`
+        block — so /stop or LLM failure no longer drops the tool calls that
+        already ran. The persisted assistant message is stamped with
+        `metadata.stopped_by_user=True` and `metadata.original_user_request`
+        so the next turn can inject a prior-stop note into the system prompt.
         """
         task_state = {"last_tasks": []}
         accumulated_content = ""
         tool_calls_accumulated = []
         tool_results_accumulated = []
+        stopped = False
 
-        async for evt in self._run_holmes_stream(
-            messages, None, features, user_id, conversation, telegram_context, chat_id, topic_id, task_state,
-            cancel_event=cancel_event, tcll=tcll,
-        ):
-            event_type = evt.get("type")
+        try:
+            async for evt in self._run_holmes_stream(
+                messages, None, features, user_id, conversation, telegram_context, chat_id, topic_id, task_state,
+                cancel_event=cancel_event, tcll=tcll,
+            ):
+                event_type = evt.get("type")
 
-            # Accumulate content and tool call/result data for conversation persistence
-            if event_type == "content":
-                accumulated_content += evt.get("content", "")
-            elif event_type == "tool_call":
-                # Store tool call metadata (we'll reconstruct it later)
-                tool_calls_accumulated.append(evt)
-            elif event_type == "tool_result":
-                # Store tool result for persistence
-                tool_results_accumulated.append(evt)
+                # Accumulate content and tool call/result data for conversation persistence
+                if event_type == "content":
+                    accumulated_content += evt.get("content", "")
+                elif event_type == "tool_call":
+                    # Store tool call metadata (we'll reconstruct it later)
+                    tool_calls_accumulated.append(evt)
+                elif event_type == "tool_result":
+                    # Store tool result for persistence
+                    tool_results_accumulated.append(evt)
 
-            yield evt
+                yield evt
+        except LLMInterruptedError:
+            stopped = True
+            logger.info("Stream chat interrupted by user, persisting partial state", user_id=user_id)
+            raise
+        finally:
+            # Persist whatever we accumulated — even on interrupt or error.
+            # Without this, /stop drops all tool results that already ran.
+            persist_ok = (
+                conversation is not None
+                and bool(accumulated_content or tool_calls_accumulated or tool_results_accumulated)
+            )
+            if persist_ok:
+                try:
+                    # Build assistant message with tool_calls array (OpenAI format).
+                    # tool_call_id must come from the real Holmes-assigned id (emitted
+                    # in START_TOOL events); fabricating ids produces
+                    # "missing field tool_call_id" / mismatched-id errors from the
+                    # LLM API on the next turn when history is replayed.
+                    assistant_tool_calls = []
+                    for tc_evt in tool_calls_accumulated:
+                        tool_call_id = tc_evt.get("tool_call_id") or tc_evt.get("id") or ""
+                        if not tool_call_id:
+                            # No real id available (older Holmes or unexpected event
+                            # shape) — skip persisting this tool_call rather than
+                            # fabricate one so the next turn doesn't break.
+                            continue
+                        assistant_tool_calls.append({
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": tc_evt.get("tool_name", "unknown"),
+                                "arguments": "{}",  # Params not easily available in stream events
+                            }
+                        })
 
-        # After stream ends, persist assistant message and tool results to conversation
-        if conversation:
-            try:
-                # Build assistant message with tool_calls array (OpenAI format).
-                # tool_call_id must come from the real Holmes-assigned id (emitted
-                # in START_TOOL events); fabricating ids produces
-                # "missing field tool_call_id" / mismatched-id errors from the
-                # LLM API on the next turn when history is replayed.
-                assistant_tool_calls = []
-                for tc_evt in tool_calls_accumulated:
-                    tool_call_id = tc_evt.get("tool_call_id") or tc_evt.get("id") or ""
-                    if not tool_call_id:
-                        # No real id available (older Holmes or unexpected event
-                        # shape) — skip persisting this tool_call rather than
-                        # fabricate one so the next turn doesn't break.
-                        continue
-                    assistant_tool_calls.append({
-                        "id": tool_call_id,
-                        "type": "function",
-                        "function": {
-                            "name": tc_evt.get("tool_name", "unknown"),
-                            "arguments": "{}",  # Params not easily available in stream events
-                        }
-                    })
+                    # Find the original user request for the next-turn note. The
+                    # last user message in conversation.messages is the live turn's
+                    # request — it was added by chat() before _stream_chat ran.
+                    original_request = ""
+                    for msg in reversed(conversation.messages):
+                        if msg.role == "user":
+                            original_request = msg.content or ""
+                            break
 
-                assistant_msg = Message(
-                    role="assistant",
-                    content=accumulated_content,
-                    tool_calls=assistant_tool_calls if assistant_tool_calls else [],
-                )
-                conversation.add_message(assistant_msg)
-
-                # Add tool result messages. tool_call_id comes from
-                # ToolCallResult.to_client_dict() (real Holmes id).
-                for tr_evt in tool_results_accumulated:
-                    result_data = tr_evt.get("result", "")
-                    tool_name = tr_evt.get("tool_name", "unknown")
-                    tool_call_id = tr_evt.get("tool_call_id") or tr_evt.get("id") or ""
-
-                    # Extract content from result structure
-                    content = "(no output)"
-                    if isinstance(result_data, dict):
-                        data = result_data.get("data", "")
-                        error = result_data.get("error")
-                        if error:
-                            content = f"Error: {error}"
-                        elif data:
-                            content = str(data) if not isinstance(data, str) else data
-                    elif result_data:
-                        content = str(result_data)
-
-                    if not tool_call_id:
-                        # Try matching by tool_name to a START_TOOL id we saw.
-                        for tc in tool_calls_accumulated:
-                            if tc.get("tool_name") == tool_name:
-                                tool_call_id = tc.get("tool_call_id") or tc.get("id") or ""
-                                if tool_call_id:
-                                    break
-
-                    if not tool_call_id:
-                        # Skip persisting orphan tool results — sending a
-                        # tool-role message without tool_call_id causes LLM API
-                        # "missing field tool_call_id" errors on the next turn.
-                        continue
-
-                    tool_msg = Message(
-                        role="tool",
-                        content=content,
-                        tool_call_id=tool_call_id,
-                        name=tool_name,
+                    assistant_msg = Message(
+                        role="assistant",
+                        content=accumulated_content,
+                        tool_calls=assistant_tool_calls if assistant_tool_calls else [],
                     )
-                    conversation.add_message(tool_msg)
+                    if stopped:
+                        assistant_msg.metadata["stopped_by_user"] = True
+                        assistant_msg.metadata["original_user_request"] = original_request
+                    conversation.add_message(assistant_msg)
 
-            except Exception as e:
-                logger.warning("Failed to persist streaming tool calls to conversation", error=str(e))
-                # Fallback: at least save the text response
-                if accumulated_content and not any(m.role == "assistant" and m.content == accumulated_content for m in conversation.messages[-3:]):
-                    conversation.add_message(Message(role="assistant", content=accumulated_content))
+                    # Add tool result messages. tool_call_id comes from
+                    # ToolCallResult.to_client_dict() (real Holmes id).
+                    for tr_evt in tool_results_accumulated:
+                        result_data = tr_evt.get("result", "")
+                        tool_name = tr_evt.get("tool_name", "unknown")
+                        tool_call_id = tr_evt.get("tool_call_id") or tr_evt.get("id") or ""
+
+                        # Extract content from result structure
+                        content = "(no output)"
+                        if isinstance(result_data, dict):
+                            data = result_data.get("data", "")
+                            error = result_data.get("error")
+                            if error:
+                                content = f"Error: {error}"
+                            elif data:
+                                content = str(data) if not isinstance(data, str) else data
+                        elif result_data:
+                            content = str(result_data)
+
+                        if not tool_call_id:
+                            # Try matching by tool_name to a START_TOOL id we saw.
+                            for tc in tool_calls_accumulated:
+                                if tc.get("tool_name") == tool_name:
+                                    tool_call_id = tc.get("tool_call_id") or tc.get("id") or ""
+                                    if tool_call_id:
+                                        break
+
+                        if not tool_call_id:
+                            # Skip persisting orphan tool results — sending a
+                            # tool-role message without tool_call_id causes LLM API
+                            # "missing field tool_call_id" errors on the next turn.
+                            continue
+
+                        tool_msg = Message(
+                            role="tool",
+                            content=content,
+                            tool_call_id=tool_call_id,
+                            name=tool_name,
+                        )
+                        conversation.add_message(tool_msg)
+                except Exception as persist_err:
+                    logger.warning("Failed to persist partial stream state", error=str(persist_err))
 
     async def _run_holmes_stream(
         self,
@@ -1738,6 +1811,7 @@ class HolmesService:
             user_id,
             is_admin=is_admin,
             user_display_name=None,
+            conversation=conversation,
         )
         features = self._get_user_permissions(user_permissions)
 
