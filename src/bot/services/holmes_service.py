@@ -1026,6 +1026,7 @@ class HolmesService:
                 return self._stream_chat(
                     holmes_messages, features, user_id, conversation,
                     telegram_context, chat_id, topic_id, cancel_event=cancel_event,
+                    original_request=user_message,
                 )
             else:
                 # Pass telegram context for approval callback
@@ -1102,6 +1103,7 @@ class HolmesService:
                     holmes_messages, features, user_id, conversation,
                     telegram_context, chat_id, topic_id, cancel_event=cancel_event,
                     tcll=enterprise_tcll,
+                    original_request=user_message,
                 )
             else:
                 response_text, llm_result = await self._non_stream_chat_with_memory(
@@ -1177,11 +1179,11 @@ class HolmesService:
         `admin: yes`. The rule tells the LLM to pivot to read-only investigation
         on block (not retry the mutation) — see src/bot/tools/admin_gate.py.
 
-        Prior-stop note: when `conversation` is provided and the most recent
-        assistant message has `metadata.stopped_by_user=True`, a note
-        describing the prior interrupted request is appended — so the LLM
-        treats a re-issued similar request as a deliberate retry and focuses on
-        the original intent.
+        `conversation` is accepted for API compatibility but no longer read
+        here. The prior-stop signal is now an inline `role="system"` Message
+        appended to conversation.messages at the point of interruption (see
+        `_stream_chat`'s finally block), so it flows through normal history
+        replay instead of stacking into the system prompt.
         """
         additions = bot_config.holmes_system_prompt_additions or ""
         # Append the search_memory tool-use rule when memory is enabled so
@@ -1196,12 +1198,6 @@ class HolmesService:
         # for handling admin-gate blocks so the LLM pivots to read-only
         # investigation rather than retrying the blocked mutation.
         additions = (additions + self._admin_gate_rule(is_admin, user_display_name)).strip()
-        # Prior-stop note — only if `conversation` provided and a recent
-        # assistant message was marked stopped_by_user.
-        if conversation is not None:
-            note = self._prior_stop_note(conversation)
-            if note:
-                additions = (additions + note).strip()
         # Use Holmes' native message builder for proper formatting
         return build_initial_ask_messages(
             initial_user_prompt="",  # We'll override with actual messages
@@ -1210,40 +1206,6 @@ class HolmesService:
             skills=self._config.get_skill_catalog() if self._config else None,
             system_prompt_additions=additions or None,
         ) + messages
-
-    @staticmethod
-    def _prior_stop_note(conversation: Conversation) -> str:
-        """Build a `--- PRIOR REQUEST INTERRUPTED ---` note if the most recent
-        assistant message in `conversation` was marked stopped_by_user.
-
-        Scans the last 5 messages; stops at the first assistant message with
-        `metadata.stopped_by_user=True`. Returns "" if no such message is
-        found within the window.
-        """
-        if not conversation or not conversation.messages:
-            return ""
-        for msg in reversed(conversation.messages[-5:]):
-            if msg.role != "assistant":
-                continue
-            if not msg.metadata or not msg.metadata.get("stopped_by_user"):
-                continue
-            original = (msg.metadata.get("original_user_request") or "").strip()
-            if not original:
-                return ""
-            preview = original if len(original) <= 400 else original[:400] + "…"
-            return (
-                "\n\n--- PRIOR REQUEST INTERRUPTED ---\n"
-                "The user's previous request was stopped before completion. "
-                f"Their original request was:\n\"{preview}\"\n\n"
-                "Tool calls executed in that prior turn are in the conversation "
-                "history. If the user now re-issues the same or a similar "
-                "request, treat it as a deliberate retry — focus on the "
-                "original intent, reuse prior tool results if still valid "
-                "(don't re-run identical kubectl get/describe/logs that "
-                "already have answers in history), and complete the "
-                "investigation."
-            )
-        return ""
 
     def _admin_gate_rule(self, is_admin: bool, user_display_name: Optional[str]) -> str:
         """Per-turn system-prompt block describing the current user and the
@@ -1396,6 +1358,7 @@ class HolmesService:
         telegram_context: Any = None, chat_id: int = 0, topic_id: int = 0,
         cancel_event: Optional[threading.Event] = None,
         tcll: Optional[ToolCallingLLM] = None,
+        original_request: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Streaming chat with Holmes, yielding structured events including task updates and handling tool approval.
 
@@ -1466,14 +1429,17 @@ class HolmesService:
                             }
                         })
 
-                    # Find the original user request for the next-turn note. The
-                    # last user message in conversation.messages is the live turn's
-                    # request — it was added by chat() before _stream_chat ran.
-                    original_request = ""
-                    for msg in reversed(conversation.messages):
-                        if msg.role == "user":
-                            original_request = msg.content or ""
-                            break
+                    # Find the original user request for the next-turn note.
+                    # Prefer an explicit `original_request` arg passed by
+                    # the caller (which can carry the exact pre-routing
+                    # user text); fall back to the last user message in
+                    # conversation.messages — that's the live turn's
+                    # request, added by chat() before _stream_chat ran.
+                    if not original_request:
+                        for msg in reversed(conversation.messages):
+                            if msg.role == "user":
+                                original_request = msg.content or ""
+                                break
 
                     assistant_msg = Message(
                         role="assistant",
@@ -1525,6 +1491,27 @@ class HolmesService:
                             name=tool_name,
                         )
                         conversation.add_message(tool_msg)
+
+                    # On stop, append an inline system-role note right after
+                    # the persisted tool messages. This mirrors how Claude
+                    # Code surfaces turn interruptions — as an in-stream
+                    # marker, not by modifying the global system prompt
+                    # (which would stack with admin-gate / memory rules).
+                    # The next turn's history replay includes this marker
+                    # at the exact position the stop happened, so the LLM
+                    # sees "previous turn was cut off — original request
+                    # was X" without bloating every future system prompt.
+                    if stopped and original_request:
+                        note = (
+                            f"[Previous turn was interrupted. The user's "
+                            f"original request was: \"{original_request}\". "
+                            f"If the user now re-issues the same or a "
+                            f"similar request, treat it as a deliberate "
+                            f"retry — focus on the original intent, reuse "
+                            f"prior tool results in history if still valid, "
+                            f"and complete the investigation.]"
+                        )
+                        conversation.add_message(Message(role="system", content=note))
                 except Exception as persist_err:
                     logger.warning("Failed to persist partial stream state", error=str(persist_err))
 

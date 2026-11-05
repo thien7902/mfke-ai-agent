@@ -1,14 +1,21 @@
-"""Tests for partial tool-call persistence on /stop and the prior-stop
-system-prompt note injected on the next turn.
+"""Tests for partial tool-call persistence on /stop and the inline
+`role="system"` note appended to conversation history at the interruption
+point (Claude-Code-style inline marker, not a system-prompt injection).
 
 Covers:
-- `_stream_chat` `finally` block persists tool_calls + tool_results accumulated
-  before an `LLMInterruptedError` mid-stream.
-- The persisted assistant message is stamped with `metadata.stopped_by_user`
-  and `metadata.original_user_request`.
-- `_build_holmes_messages` injects the `--- PRIOR REQUEST INTERRUPTED ---`
-  note when the most recent assistant message has `stopped_by_user=True`.
-- No note when no such marker exists, or when the marker is too old.
+- `_stream_chat` `finally` block persists tool_calls + tool_results
+  accumulated before an `LLMInterruptedError` mid-stream.
+- The persisted assistant message is stamped with
+  `metadata.stopped_by_user=True` and `metadata.original_user_request`.
+- `_stream_chat` `finally` block appends an inline
+  `Message(role="system", content="[Previous turn was interrupted...]")`
+  to `conversation.messages` when stopped AND `original_request` is
+  non-empty.
+- No inline note on the success path.
+- No inline note when `original_request` is missing (empty/None).
+- `_build_holmes_messages` does NOT inject a prior-stop note into
+  system_prompt_additions (the v2.3.8 system-prompt approach was
+  removed in v2.3.9).
 """
 import asyncio
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -26,61 +33,28 @@ def _make_service_stub() -> HolmesService:
     return HolmesService.__new__(HolmesService)
 
 
-# ------------ _prior_stop_note ------------
+# ------------ _build_holmes_messages: no prior-stop injection ------------
 
-def test_prior_stop_note_injects_when_stopped_recent():
-    svc = _make_service_stub()
-    conv = Conversation(chat_id=1, user_id=100)
-    conv.add_message(Message(role="user", content="investigate pod X crash"))
-    asst = Message(role="assistant", content="partial...",
-                   tool_calls=[{"id": "x", "type": "function",
-                                "function": {"name": "bash", "arguments": "{}"}}])
-    asst.metadata["stopped_by_user"] = True
-    asst.metadata["original_user_request"] = "investigate pod X crash"
-    conv.add_message(asst)
-    note = svc._prior_stop_note(conv)
-    assert "--- PRIOR REQUEST INTERRUPTED ---" in note
-    assert "investigate pod X crash" in note
-    assert "deliberate retry" in note.lower() or "deliberately" in note.lower() or "retry" in note.lower()
+def test_build_holmes_messages_no_prior_stop_injection():
+    """v2.3.9: prior-stop signal is an inline `role="system"` Message in
+    conversation.history, NOT a system_prompt_additions injection.
 
+    We assert this at the source level — `_build_holmes_messages` (and
+    helpers it calls) must NOT emit a `--- PRIOR REQUEST INTERRUPTED ---`
+    header. The v2.3.8 `_prior_stop_note` method was removed in v2.3.9.
+    """
+    import inspect
+    from src.bot.services import holmes_service as mod
 
-def test_prior_stop_note_no_stopped_message_returns_empty():
-    svc = _make_service_stub()
-    conv = Conversation(chat_id=1, user_id=100)
-    conv.add_message(Message(role="user", content="hi"))
-    conv.add_message(Message(role="assistant", content="hello"))
-    assert svc._prior_stop_note(conv) == ""
-
-
-def test_prior_stop_note_no_conversation_returns_empty():
-    svc = _make_service_stub()
-    assert svc._prior_stop_note(None) == ""
-
-
-def test_prior_stop_note_empty_original_returns_empty():
-    svc = _make_service_stub()
-    conv = Conversation(chat_id=1, user_id=100)
-    asst = Message(role="assistant", content="partial")
-    asst.metadata["stopped_by_user"] = True
-    asst.metadata["original_user_request"] = ""  # empty
-    conv.add_message(asst)
-    assert svc._prior_stop_note(conv) == ""
-
-
-def test_prior_stop_note_too_old_returns_empty():
-    """An old stopped message (more than 5 messages back) should NOT trigger
-    a note — the user has moved on."""
-    svc = _make_service_stub()
-    conv = Conversation(chat_id=1, user_id=100)
-    asst_stopped = Message(role="assistant", content="part")
-    asst_stopped.metadata["stopped_by_user"] = True
-    asst_stopped.metadata["original_user_request"] = "old request"
-    conv.add_message(asst_stopped)
-    # 5 fresh messages pushing the stopped one out of the window.
-    for i in range(5):
-        conv.add_message(Message(role="user", content=f"new request {i}"))
-        conv.add_message(Message(role="assistant", content=f"new reply {i}"))
-    assert svc._prior_stop_note(conv) == ""
+    # The helper from v2.3.8 must no longer exist.
+    assert not hasattr(HolmesService, "_prior_stop_note"), (
+        "_prior_stop_note was removed in v2.3.9 — inline system Message "
+        "in conversation.history replaces it."
+    )
+    # And no PRIOR REQUEST INTERRUPTED header anywhere in the module.
+    src = inspect.getsource(mod)
+    assert "--- PRIOR REQUEST INTERRUPTED ---" not in src
+    assert "PRIOR REQUEST INTERRUPTED" not in src
 
 
 # ------------ _stream_chat partial-persistence on interrupt ------------
@@ -89,7 +63,8 @@ def test_prior_stop_note_too_old_returns_empty():
 async def test_stream_chat_persists_partial_on_interrupt():
     """When _run_holmes_stream yields tool_call + tool_result events then
     raises LLMInterruptedError, _stream_chat should still persist the
-    accumulated tool_calls + tool_results to the conversation."""
+    accumulated tool_calls + tool_results to the conversation and stamp
+    the assistant message with stopped_by_user metadata."""
     svc = _make_service_stub()
 
     conv = Conversation(chat_id=1, user_id=100)
@@ -137,9 +112,72 @@ async def test_stream_chat_persists_partial_on_interrupt():
 
 
 @pytest.mark.asyncio
+async def test_stream_chat_appends_inline_system_note_on_stop():
+    """v2.3.9: On interrupt with `original_request` non-empty, _stream_chat
+    should append a `role="system"` Message describing the interrupted
+    turn to the conversation history (Claude-Code-style inline marker)."""
+    svc = _make_service_stub()
+    conv = Conversation(chat_id=1, user_id=100)
+    conv.add_message(Message(role="user", content="investigate pod X"))
+
+    original_request = "investigate pod X"
+
+    async def fake_stream(*args, **kwargs):
+        yield {"type": "tool_call", "tool_name": "bash",
+                "tool_call_id": "call-a", "params": {"command": "kubectl get pods"}}
+        raise LLMInterruptedError("user stopped")
+
+    svc._run_holmes_stream = fake_stream
+
+    try:
+        async for _ in svc._stream_chat(
+            messages=[], features={"tool_approval": False}, user_id=100,
+            conversation=conv, telegram_context=None, chat_id=1, topic_id=0,
+            cancel_event=None, original_request=original_request,
+        ):
+            pass
+    except LLMInterruptedError:
+        pass
+
+    system_msgs = [m for m in conv.messages if m.role == "system"]
+    assert len(system_msgs) >= 1
+    last_sys = system_msgs[-1]
+    assert "interrupted" in last_sys.content.lower()
+    assert original_request in last_sys.content
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_no_note_when_original_request_missing():
+    """If `original_request` is empty/None, no inline system note is
+    appended even on interrupt — we have nothing meaningful to put in
+    the note."""
+    svc = _make_service_stub()
+    conv = Conversation(chat_id=1, user_id=100)
+    conv.add_message(Message(role="user", content="hi"))
+
+    async def fake_stream(*args, **kwargs):
+        raise LLMInterruptedError("instant stop")
+        yield  # unreachable; makes this a generator
+
+    svc._run_holmes_stream = fake_stream
+
+    try:
+        async for _ in svc._stream_chat(
+            messages=[], features={"tool_approval": False}, user_id=100,
+            conversation=conv, cancel_event=None,
+        ):
+            pass
+    except LLMInterruptedError:
+        pass
+
+    system_msgs = [m for m in conv.messages if m.role == "system"]
+    assert system_msgs == []
+
+
+@pytest.mark.asyncio
 async def test_stream_chat_no_persist_when_nothing_accumulated():
-    """If the stream raises immediately without yielding anything, _stream_chat
-    should NOT add an empty assistant message."""
+    """If the stream raises immediately without yielding anything,
+    _stream_chat should NOT add an empty assistant message."""
     svc = _make_service_stub()
     conv = Conversation(chat_id=1, user_id=100)
     conv.add_message(Message(role="user", content="hello"))
@@ -164,9 +202,9 @@ async def test_stream_chat_no_persist_when_nothing_accumulated():
 
 
 @pytest.mark.asyncio
-async def test_stream_chat_success_path_still_persists():
-    """Without interrupt, _stream_chat should persist assistant content and
-    tool calls exactly as before (no regression on the happy path)."""
+async def test_stream_chat_success_path_no_note():
+    """On the happy path (no interrupt), no inline `role="system"` note
+    should be appended and `stopped_by_user` should be False/absent."""
     svc = _make_service_stub()
     conv = Conversation(chat_id=1, user_id=100)
     conv.add_message(Message(role="user", content="ask"))
@@ -191,3 +229,6 @@ async def test_stream_chat_success_path_still_persists():
     assert asst.content == "Answer: yes"
     assert asst.tool_calls and asst.tool_calls[0]["id"] == "call-b"
     assert not asst.metadata.get("stopped_by_user")
+    # No inline system note on success path.
+    system_msgs = [m for m in conv.messages if m.role == "system"]
+    assert system_msgs == []
