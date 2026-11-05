@@ -354,14 +354,14 @@ async def send_rich_message(
             msg = await bot.send_message(**kwargs)
             sent.append(msg)
         except Exception as e:
-            logger.warning("HTML fallback send_message failed", error=str(e))
+            logger.warning("HTML fallback send_message failed: %s", str(e))
             # Last resort — plain text.
             try:
                 kwargs.pop("parse_mode", None)
                 msg = await bot.send_message(**kwargs)
                 sent.append(msg)
             except Exception as e2:
-                logger.error("Plain text fallback failed too", error=str(e2))
+                logger.error("Plain text fallback failed too: %s", str(e2))
     return sent
 
 
@@ -438,7 +438,7 @@ async def edit_or_send_rich(
         try:
             await message.delete()
         except Exception as del_err:
-            logger.warning("Failed to delete streaming message", error=str(del_err))
+            logger.warning("Failed to delete streaming message: %s", str(del_err))
         sent.extend(await send_rich_message(
             bot, chat_id=chat_id, text=text,
             message_thread_id=message_thread_id,
