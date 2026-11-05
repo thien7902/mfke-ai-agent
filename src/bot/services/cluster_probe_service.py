@@ -38,6 +38,14 @@ STATE_COLLECTION = "cluster_probe_state"
 STATE_DOC_ID = "prev_message_id"  # single-doc collection, _id is fixed
 
 
+def _escape_html(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 class ClusterProbeService:
     """Per-minute probe of every kubeconfig in `cluster_probe_kubeconfig_dir`."""
 
@@ -106,8 +114,8 @@ class ClusterProbeService:
         while True:
             try:
                 results = await self._probe_all()
-                markdown = self._render(results)
-                await self._send_and_delete_old(markdown)
+                html, _plain = self._render(results)
+                await self._send_and_delete_old(html)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -180,39 +188,63 @@ class ClusterProbeService:
                 except Exception:
                     pass
 
-    def _render(self, results: List[dict]) -> str:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-        footer = (
-            "\n_If this message is older than 1 minute, the agent is down. "
-            "Contact Le Minh Thien._"
-        )
-        if not results:
-            return (
-                f"🛰 Cluster Probe — {ts}\n\n"
-                f"No kubeconfigs in {config.cluster_probe_kubeconfig_dir}."
-                + footer
-            )
-        # Plain-text list view (not GFM table). Sent via sendMessage without
-        # parse_mode — Telegram renders raw markdown chars literally, so we
-        # avoid "*", "|", and "_" that would otherwise show as garbage if the
-        # client doesn't interpret them.
-        lines = [f"🛰 Cluster Probe — {ts}", ""]
-        for r in sorted(results, key=lambda x: (x["ok"], x["name"])):
-            status = "OK" if r["ok"] else "FAIL"
-            reason = r["reason"].replace("\n", " ")[:120]
-            lines.append(f"{status}  {r['name']}  —  {reason}")
-        lines.append("")
-        lines.append("Updated every 60s." + footer)
-        return "\n".join(lines)
+    def _render(self, results: List[dict]) -> tuple:
+        """Return (html, plain_text_fallback).
 
-    async def _send_and_delete_old(self, text: str) -> None:
-        # Plain-text send. No parse_mode (so Telegram renders the body
-        # literally — no markdown interpretation, no HTML). Probe is short
-        # and pure-ASCII enough that formatting is unnecessary; avoids the
-        # sendRichMessage timeouts and HTML-tag-bleed issues.
+        html: Telegram subset HTML, sent with parse_mode="HTML". Uses <pre>
+        monospace so the status table aligns regardless of cluster-name length.
+        plain_text_fallback: same content without HTML tags, used if the bot's
+        send_message rejects parse_mode (rare — kept for safety).
+        """
+        ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+        footer_md = (
+            "If this message is older than 1 minute, the agent is down. "
+            "Contact Le Minh Thien."
+        )
+
+        if not results:
+            html = (
+                f"🛰 Cluster Probe — {ts}\n\n"
+                f"No kubeconfigs in {config.cluster_probe_kubeconfig_dir}.\n\n"
+                f"<i>{_escape_html(footer_md)}</i>"
+            )
+            return html, html
+
+        # Build a monospace grid: aligned columns via padding. <pre> keeps
+        # the alignment on the Telegram client.
+        # Columns: ICON (3 chars wide), STATUS (4), CLUSTER (varies), REASON
+        # Pad cluster name to max width so reasons line up.
+        body = sorted(results, key=lambda x: (x["ok"], x["name"]))
+        max_name = max(len(r["name"]) for r in body)
+        max_name = max(max_name, 4)  # at least as wide as header "NAME"
+
+        lines = [f"🛰 Cluster Probe — {ts}", ""]
+        # Header row
+        lines.append(f"{'':<{2}}  ST  {'NAME':<{max_name}}  REASON")
+        lines.append(f"  --  {'-' * max_name}  ------")
+        for r in body:
+            icon = "✅" if r["ok"] else "❌"
+            st = "ok  " if r["ok"] else "fail"
+            name = r["name"].ljust(max_name)
+            reason = _escape_html(r["reason"].replace("\n", " ")[:100])
+            lines.append(f"{icon}  {st}  {name}  {reason}")
+        lines.append("")
+        lines.append("Updated every 60s.")
+        lines.append(f"<i>{_escape_html(footer_md)}</i>")
+        html_body = "\n".join(lines)
+        return f"<pre>{html_body}</pre>", html_body
+
+
+    async def _send_and_delete_old(self, html: str) -> None:
+        # HTML send. parse_mode="HTML" so <pre>/<i> render. <pre> gives us
+        # monospace alignment for the status grid; <i> italicizes the footer.
+        # Falls back to plain text (no parse_mode) if HTML parsing fails —
+        # rare but the body still contains the same data, just without the
+        # grid alignment.
         kwargs = {
             "chat_id": config.cluster_probe_chat_id,
-            "text": text,
+            "text": html,
+            "parse_mode": "HTML",
             "disable_notification": True,
         }
         if config.cluster_probe_topic_id:
@@ -220,11 +252,24 @@ class ClusterProbeService:
         try:
             sent = await self._bot.send_message(**kwargs)
         except Exception as e:
-            logger.warning("cluster_probe_send_failed", error=str(e))
-            # Send failed — keep _prev_message_id as-is so the next tick
-            # can still try to delete the prior probe (it's still in the
-            # topic, assuming Telegram didn't lose it).
-            return
+            logger.warning("cluster_probe_send_failed_html", error=str(e))
+            # Retry as plain text (drop parse_mode). Body is still readable;
+            # only the <pre>/<i> tags won't render — they'll show literally,
+            # so strip them first.
+            plain = (
+                html.replace("<pre>", "").replace("</pre>", "")
+                    .replace("<i>", "").replace("</i>", "")
+            )
+            kwargs2 = dict(kwargs)
+            kwargs2.pop("parse_mode", None)
+            kwargs2["text"] = plain
+            try:
+                sent = await self._bot.send_message(**kwargs2)
+            except Exception as e2:
+                logger.warning("cluster_probe_send_failed_plain", error=str(e2))
+                # Send failed entirely — keep _prev_message_id as-is so the
+                # next tick can still try to delete the prior probe.
+                return
         new_message_id: Optional[int] = getattr(sent, "message_id", None)
 
         # Delete the previous probe now that the new one is up.

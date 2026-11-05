@@ -154,24 +154,54 @@ async def test_probe_one_decrypt_failure_returns_fail():
 
 def test_render_empty_results_shows_no_kubeconfigs_message():
     svc = ClusterProbeService()
-    out = svc._render([])
-    assert "No kubeconfigs" in out
-    assert "| Cluster |" not in out
+    html, _plain = svc._render([])
+    assert "No kubeconfigs" in html
 
 
 def test_render_includes_agent_down_warning():
     """Footer warning must appear in both empty and populated renders so
     a stale probe always tells the user who to contact."""
     svc = ClusterProbeService()
-    empty = svc._render([])
-    populated = svc._render([
+    empty_html, _ = svc._render([])
+    populated_html, _ = svc._render([
         {"name": "prod", "ok": True, "reason": "ready"},
     ])
     warning = "Contact Le Minh Thien"
-    assert warning in empty, "empty render must show agent-down warning"
-    assert warning in populated, "populated render must show agent-down warning"
-    assert "older than 1 minute" in empty
-    assert "older than 1 minute" in populated
+    assert warning in empty_html
+    assert warning in populated_html
+    assert "older than 1 minute" in empty_html
+    assert "older than 1 minute" in populated_html
+
+
+def test_render_html_uses_pre_block():
+    """Populated render wraps status table in <pre> for monospace alignment."""
+    svc = ClusterProbeService()
+    html, _ = svc._render([
+        {"name": "prod", "ok": True, "reason": "ready"},
+    ])
+    assert html.startswith("<pre>")
+    assert html.endswith("</pre>")
+
+
+def test_render_html_escapes_lt_gt_in_reason():
+    """kubectl errors with `<` or `>` (rare) must be HTML-escaped so they
+    don't break Telegram's HTML parsing."""
+    svc = ClusterProbeService()
+    html, _ = svc._render([
+        {"name": "bad", "ok": False, "reason": "got <tag>"},
+    ])
+    assert "&lt;tag&gt;" in html
+
+
+def test_render_uses_emoji_status_icons():
+    """✅ for ok, ❌ for fail — visually obvious status."""
+    svc = ClusterProbeService()
+    html, _ = svc._render([
+        {"name": "good", "ok": True, "reason": "ready"},
+        {"name": "bad", "ok": False, "reason": "timeout"},
+    ])
+    assert "✅" in html
+    assert "❌" in html
 
 
 def test_render_sorts_failures_first():
@@ -181,23 +211,30 @@ def test_render_sorts_failures_first():
         {"name": "aaa-fail", "ok": False, "reason": "timeout"},
         {"name": "mmm-fail", "ok": False, "reason": "exit 1"},
     ]
-    out = svc._render(results)
-    # Plain-text list view. Lines look like "OK  name — reason" or "FAIL  name — reason".
-    body_lines = [l for l in out.splitlines() if l.startswith(("OK", "FAIL"))]
-    names_in_order = [l.split("  ")[1].split("  —  ")[0].strip() for l in body_lines]
-    assert names_in_order == ["aaa-fail", "mmm-fail", "zzz-ok"]
+    html, _ = svc._render(results)
+    body_lines = [
+        l for l in html.splitlines()
+        if l.startswith(("✅", "❌"))
+    ]
+    assert len(body_lines) == 3
+    assert body_lines[0].startswith("❌") and "aaa-fail" in body_lines[0]
+    assert body_lines[1].startswith("❌") and "mmm-fail" in body_lines[1]
+    assert body_lines[2].startswith("✅") and "zzz-ok" in body_lines[2]
 
 
-def test_render_plain_text_no_markdown_or_html_specials():
-    """Probe is sent as plain text (no parse_mode). Render must not produce
-    markdown emphasis or HTML tags that the client would render as garbage."""
+def test_render_aligns_columns_by_padding_names():
+    """Short names padded so the REASON column lines up in <pre> monospace."""
     svc = ClusterProbeService()
-    out = svc._render([
-        {"name": "prod", "ok": True, "reason": "ready"},
-        {"name": "bad", "ok": False, "reason": "exit 1: x"},
+    html, _ = svc._render([
+        {"name": "short", "ok": True, "reason": "ready"},
+        {"name": "very-long-cluster-name", "ok": True, "reason": "ready"},
     ])
-    assert "<b>" not in out and "<pre>" not in out
-    assert "**" not in out
+    body_lines = [l for l in html.splitlines() if l.startswith("✅")]
+    assert len(body_lines) == 2
+    # "ready" appears at the same column on both lines.
+    pos0 = body_lines[0].find(" ready")
+    pos1 = body_lines[1].find(" ready")
+    assert pos0 == pos1, f"reason column misaligned: short={pos0} long={pos1}"
 
 
 # ---------- _send_and_delete_old ----------
@@ -296,8 +333,9 @@ async def test_send_passes_thread_id_when_set():
     bot = _make_bot_with_send(message_id=100)
     svc._bot = bot
     with patch.object(cps.config, "cluster_probe_topic_id", 42):
-        await svc._send_and_delete_old("text")
+        await svc._send_and_delete_old("<pre>x</pre>")
     assert bot.sends[0]["message_thread_id"] == 42
+    assert bot.sends[0]["parse_mode"] == "HTML"
 
 
 async def test_send_omits_thread_id_when_zero():
@@ -307,8 +345,33 @@ async def test_send_omits_thread_id_when_zero():
     bot = _make_bot_with_send(message_id=100)
     svc._bot = bot
     with patch.object(cps.config, "cluster_probe_topic_id", 0):
-        await svc._send_and_delete_old("text")
+        await svc._send_and_delete_old("<pre>x</pre>")
     assert "message_thread_id" not in bot.sends[0]
+
+
+async def test_send_html_failure_retries_as_plain_text():
+    """If send_message with parse_mode=HTML throws (Telegram rejected HTML),
+    retry without parse_mode, stripping <pre>/<i> tags from the body."""
+    svc = ClusterProbeService()
+    bot = _FakeBot()
+    sends = {"calls": []}
+
+    async def _flaking_send(**kwargs):
+        sends["calls"].append(kwargs)
+        if len(sends["calls"]) == 1:
+            raise RuntimeError("can't parse entities")
+        return _FakeSentMessage(200)
+
+    bot.send_message = _flaking_send
+    svc._bot = bot
+    await svc._send_and_delete_old("<pre>hello <i>world</i></pre>")
+    # Second call: no parse_mode, tags stripped from text.
+    assert len(sends["calls"]) == 2
+    assert "parse_mode" not in sends["calls"][1]
+    assert "<pre>" not in sends["calls"][1]["text"]
+    assert "<i>" not in sends["calls"][1]["text"]
+    assert "hello world" in sends["calls"][1]["text"]
+    assert svc._prev_message_id == 200
 
 
 # ---------- _recover_prev_message_id on start (MongoDB-backed) ----------
