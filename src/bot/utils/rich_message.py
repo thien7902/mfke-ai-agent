@@ -390,3 +390,56 @@ async def send_rich_reply(
         prefer_rich=prefer_rich,
         disable_notification=disable_notification,
     )
+
+
+async def edit_or_send_rich(
+    bot,
+    chat_id: int,
+    message,
+    text: str,
+    message_thread_id: Optional[int] = None,
+    prefer_rich: Optional[bool] = None,
+) -> List:
+    """Edit an existing streaming message in place with HTML formatting;
+    if the edit fails (too long, bad chars, can't parse), delete the
+    streaming message and send a fresh rich-reply instead.
+
+    Avoids the duplicate-message bug where the streaming-edit shows raw
+    markdown AND a fallback rich-reply shows the formatted version —
+    we now either edit-in-place OR replace-via-delete, never both.
+
+    `message` is the python-telegram-bot Message object to edit.
+    """
+    if not text:
+        return []
+    html = markdown_to_html(text)
+    sent: List = []
+    try:
+        # Telegram's edit_message_text splits internally — if the body
+        # is > 4096 chars, the edit throws. Use the first chunk for the
+        # edit and send remaining chunks as new rich messages.
+        chunks = _split_html(html) if len(html) > TELEGRAM_MESSAGE_LIMIT else [html]
+        await message.edit_text(chunks[0], parse_mode="HTML")
+        sent.append(message)
+        for chunk in chunks[1:]:
+            sent.extend(await send_rich_message(
+                bot, chat_id=chat_id, text=chunk,
+                message_thread_id=message_thread_id,
+                prefer_rich=prefer_rich,
+            ))
+    except Exception as e:
+        logger.warning(
+            "edit_text failed, replacing streaming message with rich reply: "
+            "error=%s error_type=%s",
+            str(e), type(e).__name__,
+        )
+        try:
+            await message.delete()
+        except Exception as del_err:
+            logger.warning("Failed to delete streaming message", error=str(del_err))
+        sent.extend(await send_rich_message(
+            bot, chat_id=chat_id, text=text,
+            message_thread_id=message_thread_id,
+            prefer_rich=prefer_rich if prefer_rich is not None else has_rich_table(text),
+        ))
+    return sent

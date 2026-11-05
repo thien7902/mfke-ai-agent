@@ -211,3 +211,70 @@ def test_send_rich_message_empty_text():
     sent = asyncio.run(rich_message.send_rich_message(bot, chat_id=1, text=""))
     assert sent == []
     assert bot.calls == []
+
+
+# ---------- edit_or_send_rich (dedup contract) ----------
+
+class FakeMessage:
+    """Fake python-telegram-bot Message. Records edit_text/delete calls."""
+    def __init__(self, edit_should_fail: bool = False):
+        self.edit_should_fail = edit_should_fail
+        self.edits: List[Any] = []
+        self.deleted = False
+
+    async def edit_text(self, text, parse_mode=None, **kw):
+        self.edits.append({"text": text, "parse_mode": parse_mode})
+        if self.edit_should_fail:
+            raise RuntimeError("message is too long")
+        return self
+
+    async def delete(self, **kw):
+        self.deleted = True
+
+
+def test_edit_or_send_rich_edits_in_place_on_success():
+    """Happy path: edit_text succeeds → message edited in place, no new
+    message sent. parse_mode is HTML (formatted)."""
+    bot = FakeBot(rich_should_fail=False)
+    msg = FakeMessage(edit_should_fail=False)
+    asyncio.run(rich_message.edit_or_send_rich(
+        bot, chat_id=1, message=msg,
+        text="**bold** and *italic*", message_thread_id=None,
+    ))
+    assert len(msg.edits) == 1
+    assert msg.edits[0]["parse_mode"] == "HTML"
+    assert "<b>bold</b>" in msg.edits[0]["text"]
+    assert msg.deleted is False
+    assert bot.calls == [], "no new message sent on happy path"
+
+
+def test_edit_or_send_rich_deletes_and_resends_on_edit_failure():
+    """Bug: previously, edit_text threw and the code sent a NEW rich
+    message WITHOUT deleting the original, so user saw two copies of
+    the same content (raw markdown on the edited one, formatted on
+    the new one). Fix: on edit failure, delete the streaming message
+    THEN send the rich reply."""
+    bot = FakeBot(rich_should_fail=False)
+    msg = FakeMessage(edit_should_fail=True)
+    asyncio.run(rich_message.edit_or_send_rich(
+        bot, chat_id=1, message=msg,
+        text="**bold** reply", message_thread_id=None,
+    ))
+    assert msg.deleted is True, "streaming message must be deleted on edit failure"
+    methods = [c[0] for c in bot.calls]
+    assert "send_message" in methods, "a fresh rich message must be sent after delete"
+    # The new message must be HTML-formatted (not raw markdown).
+    send_call = [c for c in bot.calls if c[0] == "send_message"][0]
+    assert send_call[1].get("parse_mode") == "HTML"
+    assert "<b>bold</b>" in send_call[1]["text"]
+
+
+def test_edit_or_send_rich_empty_text_noop():
+    bot = FakeBot()
+    msg = FakeMessage()
+    asyncio.run(rich_message.edit_or_send_rich(
+        bot, chat_id=1, message=msg, text="", message_thread_id=None,
+    ))
+    assert msg.edits == []
+    assert msg.deleted is False
+    assert bot.calls == []

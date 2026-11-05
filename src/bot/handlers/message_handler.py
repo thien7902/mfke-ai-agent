@@ -19,7 +19,7 @@ from src.bot.models.user import UserPermission
 from src.bot.models.conversation import Conversation
 from src.bot.utils.config import config
 from src.bot.utils.telegram_helpers import send_long_message, edit_or_send_long_message
-from src.bot.utils.rich_message import send_rich_reply
+from src.bot.utils.rich_message import send_rich_reply, edit_or_send_rich
 from src.bot.utils.file_extractor import (
     extract_text_from_file,
     extract_text_from_image,
@@ -1176,21 +1176,16 @@ class MessageHandler:
                 if cancel_event is not None and cancel_event.is_set() and _STOPPED_FOOTER not in full_response:
                     full_response += _STOPPED_FOOTER
                 try:
-                    await message.edit_text(full_response)
-                except Exception as e:
-                    logger.warning("Failed to edit final message", error=str(e))
-                    # Too long / unparseable via edit — send as a fresh rich
-                    # message (table-aware, HTML fallback).
-                    try:
-                        await send_rich_reply(
-                            context.bot,
-                            chat_id=chat_id,
-                            text=full_response,
-                            message_thread_id=topic_id or None,
-                        )
-                    except Exception as e2:
-                        logger.warning("Failed to deliver streamed response", user_id=update.effective_user.id, error=str(e2))
-                        await self._notify_delivery_failure(context.bot, chat_id, topic_id)
+                    await edit_or_send_rich(
+                        context.bot,
+                        chat_id=chat_id,
+                        message=message,
+                        text=full_response,
+                        message_thread_id=topic_id or None,
+                    )
+                except Exception as e2:
+                    logger.warning("Failed to deliver streamed response", user_id=update.effective_user.id, error=str(e2))
+                    await self._notify_delivery_failure(context.bot, chat_id, topic_id)
 
             # Final status
             if stream_completed and not (cancel_event is not None and cancel_event.is_set()):
@@ -1560,21 +1555,16 @@ class MessageHandler:
             # Final edit of main response
             if full_response:
                 try:
-                    await message.edit_text(full_response)
-                except Exception as e:
-                    logger.warning("Failed to edit final message", error=str(e))
-                    # Too long / unparseable via edit — send as a fresh rich
-                    # message (table-aware, HTML fallback).
-                    try:
-                        await send_rich_reply(
-                            context.bot,
-                            chat_id=chat_id,
-                            text=full_response,
-                            message_thread_id=topic_id or None,
-                        )
-                    except Exception as e2:
-                        logger.warning("Failed to deliver streamed response in topic", user_id=user_id, error=str(e2))
-                        await self._notify_delivery_failure(context.bot, chat_id, topic_id)
+                    await edit_or_send_rich(
+                        context.bot,
+                        chat_id=chat_id,
+                        message=message,
+                        text=full_response,
+                        message_thread_id=topic_id or None,
+                    )
+                except Exception as e2:
+                    logger.warning("Failed to deliver streamed response in topic", user_id=user_id, error=str(e2))
+                    await self._notify_delivery_failure(context.bot, chat_id, topic_id)
 
             # Final status
             if stream_completed:
