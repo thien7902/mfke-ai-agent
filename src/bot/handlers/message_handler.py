@@ -19,6 +19,7 @@ from src.bot.models.user import UserPermission
 from src.bot.models.conversation import Conversation
 from src.bot.utils.config import config
 from src.bot.utils.telegram_helpers import send_long_message, edit_or_send_long_message
+from src.bot.utils.rich_message import send_rich_reply
 from src.bot.utils.file_extractor import (
     extract_text_from_file,
     extract_text_from_image,
@@ -1014,13 +1015,14 @@ class MessageHandler:
         # Save conversation
         await self.conversations.save_conversation(conversation)
 
-        # Send response (split if too long)
+        # Send response (split if too long). Routes through sendRichMessage
+        # when the response contains a GFM table, else HTML fallback.
         try:
-            await send_long_message(
+            await send_rich_reply(
                 context.bot,
-                chat_id,
-                response,
-                message_thread_id=topic_id or None
+                chat_id=chat_id,
+                text=response,
+                message_thread_id=topic_id or None,
             )
         except Exception as e:
             logger.warning("Failed to deliver response", user_id=update.effective_user.id, error=str(e))
@@ -1177,13 +1179,14 @@ class MessageHandler:
                     await message.edit_text(full_response)
                 except Exception as e:
                     logger.warning("Failed to edit final message", error=str(e))
-                    # Too long — split into multiple messages
+                    # Too long / unparseable via edit — send as a fresh rich
+                    # message (table-aware, HTML fallback).
                     try:
-                        await send_long_message(
+                        await send_rich_reply(
                             context.bot,
-                            chat_id,
-                            full_response,
-                            message_thread_id=topic_id or None
+                            chat_id=chat_id,
+                            text=full_response,
+                            message_thread_id=topic_id or None,
                         )
                     except Exception as e2:
                         logger.warning("Failed to deliver streamed response", user_id=update.effective_user.id, error=str(e2))
@@ -1400,13 +1403,14 @@ class MessageHandler:
         # Save conversation
         await self.conversations.save_conversation(conversation)
 
-        # Send response in the topic (split if too long)
+        # Send response in the topic. Routes through sendRichMessage when
+        # the response contains a GFM table, else HTML fallback.
         try:
-            await send_long_message(
+            await send_rich_reply(
                 context.bot,
-                chat_id,
-                response,
-                message_thread_id=topic_id
+                chat_id=chat_id,
+                text=response,
+                message_thread_id=topic_id or None,
             )
         except Exception as e:
             logger.warning("Failed to deliver response in topic", user_id=user_id, error=str(e))
@@ -1559,13 +1563,14 @@ class MessageHandler:
                     await message.edit_text(full_response)
                 except Exception as e:
                     logger.warning("Failed to edit final message", error=str(e))
-                    # Too long — split into multiple messages
+                    # Too long / unparseable via edit — send as a fresh rich
+                    # message (table-aware, HTML fallback).
                     try:
-                        await send_long_message(
+                        await send_rich_reply(
                             context.bot,
-                            chat_id,
-                            full_response,
-                            message_thread_id=topic_id
+                            chat_id=chat_id,
+                            text=full_response,
+                            message_thread_id=topic_id or None,
                         )
                     except Exception as e2:
                         logger.warning("Failed to deliver streamed response in topic", user_id=user_id, error=str(e2))

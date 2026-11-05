@@ -27,6 +27,11 @@ from src.bot.services.memory_service import MemoryService
 from src.bot.tools.search_memory_tool import SearchMemoryTool
 from src.bot.tools.send_file_tool import SendFileTool, ListChatFilesTool
 from src.bot.tools.loop_guard import wrap_tools_with_loop_guard
+from src.bot.tools.admin_gate import (
+    wrap_tools_with_admin_gate,
+    set_admin_check_loop,
+    is_admin_sync,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -300,6 +305,7 @@ class HolmesService:
             self._register_search_memory_tool()
             self._register_file_tools()
             wrap_tools_with_loop_guard(self._tool_executor)
+            wrap_tools_with_admin_gate(self._tool_executor)
 
             self._initialized = True
             # Patch bash tool to kill the whole process group on timeout, so
@@ -542,6 +548,7 @@ class HolmesService:
             self._register_search_memory_tool(tcll.tool_executor)
             self._register_file_tools(tcll.tool_executor)
             wrap_tools_with_loop_guard(tcll.tool_executor)
+            wrap_tools_with_admin_gate(tcll.tool_executor)
 
             self._enterprise_tcll = tcll
             logger.info("Enterprise ToolCallingLLM initialized", model=model_key)
@@ -945,6 +952,16 @@ class HolmesService:
         """
         await self.initialize()
 
+        # Register the bot loop with admin_gate so its sync slow-path admin
+        # lookup (PermissionService.get_user) can hop back here from Holmes'
+        # worker thread. Fast path (user_id in config.admin_user_ids) never
+        # touches the loop.
+        set_admin_check_loop(asyncio.get_running_loop())
+
+        # Compute admin status once per turn. Used both for the system-prompt
+        # injection and the From: prefix on the live user message.
+        is_admin = is_admin_sync(str(user_id))
+
         # Add user message to conversation. Images are persisted on
         # metadata["images"] so history replay rehydrates the multimodal
         # content array (see _convert_messages_to_holmes_format).
@@ -966,14 +983,17 @@ class HolmesService:
         # history replay). Only the most recent user message gets the prefix
         # — earlier history already had it when it was the live turn.
         holmes_messages_src = self._convert_messages_to_holmes_format(conversation.messages)
+        admin_tag = "yes" if is_admin else "no"
         if user_display_name and holmes_messages_src:
             # Prefix the last user message (the one just added above) so the
-            # LLM sees "User: <name>\n<text>" for the current turn only.
+            # LLM sees "From: <name> (admin: yes/no)\n<text>" for the current
+            # turn only. The (admin: ...) tag is duplicated in the system prompt
+            # below for redundancy at compaction boundaries.
             for i in range(len(holmes_messages_src) - 1, -1, -1):
                 if holmes_messages_src[i].get("role") == "user":
                     content = holmes_messages_src[i].get("content", "")
                     if isinstance(content, str):
-                        prefixed = f"From: {user_display_name}\n{content}"
+                        prefixed = f"From: {user_display_name} (admin: {admin_tag})\n{content}"
                         holmes_messages_src[i] = {
                             **holmes_messages_src[i],
                             "content": prefixed,
@@ -982,12 +1002,15 @@ class HolmesService:
                             "holmes_user_display_name_prefixed",
                             user_id=user_id,
                             display_name=user_display_name,
+                            is_admin=is_admin,
                             content_preview=prefixed[:120],
                         )
                     break
         holmes_messages = self._build_holmes_messages(
             holmes_messages_src,
             user_id,
+            is_admin=is_admin,
+            user_display_name=user_display_name,
         )
 
         # Get feature flags from permissions
@@ -1055,6 +1078,8 @@ class HolmesService:
         in history.
         """
         enterprise_tcll = await self._get_enterprise_tcll()
+        set_admin_check_loop(asyncio.get_running_loop())
+        is_admin = is_admin_sync(str(user_id))
 
         user_msg = Message(role="user", content=user_message)
         if images:
@@ -1064,6 +1089,8 @@ class HolmesService:
         holmes_messages = self._build_holmes_messages(
             self._convert_messages_to_holmes_format(conversation.messages),
             user_id,
+            is_admin=is_admin,
+            user_display_name=None,
         )
         features = self._get_user_permissions(user_permissions)
 
@@ -1131,6 +1158,8 @@ class HolmesService:
         self,
         messages: List[Dict[str, Any]],
         user_id: int,
+        is_admin: bool = False,
+        user_display_name: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Build Holmes-compatible messages with proper system prompt and tool formatting.
 
@@ -1138,6 +1167,12 @@ class HolmesService:
         exposed as the `search_memory` Holmes tool (see
         src/bot/tools/search_memory_tool.py), governed by a rule appended
         to HOLMES_SYSTEM_PROMPT_ADDITIONS when graphiti_memory_enabled is True.
+
+        Per-turn admin-gate rule: when `is_admin` is provided, a rule block
+        describing who the user is and how to handle admin-gate errors is
+        appended. Non-admins get the rule with `admin: no`; admins get
+        `admin: yes`. The rule tells the LLM to pivot to read-only investigation
+        on block (not retry the mutation) — see src/bot/tools/admin_gate.py.
         """
         additions = bot_config.holmes_system_prompt_additions or ""
         # Append the search_memory tool-use rule when memory is enabled so
@@ -1148,6 +1183,10 @@ class HolmesService:
         # The file rule is always on: without it the model answers "give me an
         # xlsx" by pasting rows into the chat, which is what this feature fixes.
         additions = (additions + self._file_output_rule()).strip()
+        # Per-turn admin-gate rule. User identity + admin status + instructions
+        # for handling admin-gate blocks so the LLM pivots to read-only
+        # investigation rather than retrying the blocked mutation.
+        additions = (additions + self._admin_gate_rule(is_admin, user_display_name)).strip()
         # Use Holmes' native message builder for proper formatting
         return build_initial_ask_messages(
             initial_user_prompt="",  # We'll override with actual messages
@@ -1156,6 +1195,47 @@ class HolmesService:
             skills=self._config.get_skill_catalog() if self._config else None,
             system_prompt_additions=additions or None,
         ) + messages
+
+    def _admin_gate_rule(self, is_admin: bool, user_display_name: Optional[str]) -> str:
+        """Per-turn system-prompt block describing the current user and the
+        admin-gate policy. Sent every turn so compaction can't drop it."""
+        name = user_display_name or "unknown"
+        admin_tag = "yes" if is_admin else "no"
+        role_line = f"\n\n--- CURRENT USER ---\nCurrent user: {name} (admin: {admin_tag})."
+        if is_admin:
+            rule_line = (
+                "\nYou are authorized to run mutating Kubernetes/Helm commands. "
+                "Holmes' built-in approval prompt is bypassed for you — apply, "
+                "delete, scale, helm upgrade etc. run directly. Use this power "
+                "deliberately: confirm the target before destructive commands."
+            )
+        else:
+            rule_line = (
+                "\nMutating Kubernetes commands (kubectl apply/delete/edit/patch/"
+                "scale/replace/rollout/exec/cp/create/label/annotate/taint/cordon/"
+                "uncordon/drain, helm install/upgrade/uninstall/rollback/delete/"
+                "repo add/remove) require admin permission. Three rules:\n"
+                "1. If the user's request is purely a mutation (no investigation "
+                "needed) — e.g. 'scale X', 'delete Y', 'apply Z', 'restart pod W', "
+                "'upgrade helm chart' — DO NOT call any tool. Reply immediately: "
+                "\"I only accept mutation commands from admins. Please ask an admin "
+                "to run this.\" Do not investigate, do not explain what would happen, "
+                "do not propose alternative commands.\n"
+                "2. If the request mixes investigation + mutation (e.g. 'check why "
+                "pod X is crashing then restart it', 'show me the deployment then "
+                "scale it to 4'), run the read-only investigation, report findings, "
+                "and stop before the mutation — tell the user an admin is needed for "
+                "the mutation step.\n"
+                "3. Follow-up selection: if in a prior turn you proposed fix options "
+                "and the user now picks one (e.g. 'dùng option A', 'option 2 đi', "
+                "'scale lên 4 như bạn vừa nói'), treat it as rule 1 — DO NOT call "
+                "any tool. Reply immediately that an admin must execute the chosen "
+                "mutation. You may restate the exact command an admin should run.\n"
+                "If a mutation tool returns an 'Admin access required' error "
+                "(non-admin somehow reached the tool anyway), do NOT retry the "
+                "mutation. Tell the user an admin is needed."
+            )
+        return role_line + rule_line
 
     def _file_output_rule(self) -> str:
         """System-prompt rule for producing deliverables as chat attachments.
@@ -1643,6 +1723,7 @@ class HolmesService:
             Agent execution result
         """
         await self.initialize()
+        set_admin_check_loop(asyncio.get_running_loop())
 
         if UserPermission.AGENT_EXECUTION not in user_permissions:
             raise PermissionError("User does not have agent execution permission")
@@ -1651,9 +1732,12 @@ class HolmesService:
         user_msg = Message(role="user", content=f"[Agent Task: {agent_name}] {task}")
         conversation.add_message(user_msg)
 
+        is_admin = is_admin_sync(str(user_id))
         holmes_messages = self._build_holmes_messages(
             self._convert_messages_to_holmes_format(conversation.messages),
-            user_id
+            user_id,
+            is_admin=is_admin,
+            user_display_name=None,
         )
         features = self._get_user_permissions(user_permissions)
 

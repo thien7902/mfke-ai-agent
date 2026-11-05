@@ -170,7 +170,7 @@ async def test_chat_enterprise_persists_images_in_metadata():
         return
         yield  # pragma: no cover - makes this an async generator
 
-    svc._build_holmes_messages = lambda msgs, uid: msgs
+    svc._build_holmes_messages = lambda msgs, uid, **kw: msgs
     svc._get_user_permissions = lambda perms: {}
     svc._stream_chat = fake_stream
     svc._get_enterprise_tcll = AsyncMock(return_value="enterprise-llm")
