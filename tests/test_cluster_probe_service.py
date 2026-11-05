@@ -8,7 +8,7 @@ no network, no real kubectl. pytest-asyncio auto mode (pytest.ini).
 import asyncio
 from pathlib import Path
 from typing import List
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -258,86 +258,82 @@ async def test_send_delete_failure_does_not_raise():
     assert svc._prev_message_id == 200
 
 
-# ---------- _recover_prev_message_id on start ----------
-
-class _FakeChat:
-    def __init__(self, pinned_message=None):
-        self.pinned_message = pinned_message
+# ---------- _recover_prev_message_id on start (MongoDB-backed) ----------
 
 
-class _FakePinnedMessage:
-    def __init__(self, message_id: int, text: str = "🛰 Cluster Probe — ..."):
-        self.message_id = message_id
-        self.text = text
-
-
-async def test_recover_prev_message_id_from_pinned_message():
+async def test_recover_prev_message_id_from_mongodb():
     svc = ClusterProbeService()
-    bot = _FakeBot()
-    bot.get_chat = AsyncMock(return_value=_FakeChat(
-        pinned_message=_FakePinnedMessage(message_id=999)
-    ))
-    svc._bot = bot
-    mid = await svc._recover_prev_message_id()
+    fake_col = MagicMock()
+    fake_col.find_one = MagicMock(return_value={"_id": "prev_message_id",
+                                                "message_id": 999})
+    with patch.object(cps.MongoDB, "get_collection", return_value=fake_col):
+        mid = svc._recover_prev_message_id()
     assert mid == 999
 
 
-async def test_recover_prev_message_id_none_when_no_pin():
+async def test_recover_prev_message_id_none_when_no_doc():
     svc = ClusterProbeService()
-    bot = _FakeBot()
-    bot.get_chat = AsyncMock(return_value=_FakeChat(pinned_message=None))
-    svc._bot = bot
-    assert await svc._recover_prev_message_id() is None
+    fake_col = MagicMock()
+    fake_col.find_one = MagicMock(return_value=None)
+    with patch.object(cps.MongoDB, "get_collection", return_value=fake_col):
+        assert svc._recover_prev_message_id() is None
 
 
-async def test_recover_prev_message_id_rejects_unrelated_pin():
-    """A pin by an admin that isn't one of our probes must NOT be adopted —
-    otherwise the next tick would delete the admin's pin."""
+async def test_recover_prev_message_id_none_when_field_missing():
     svc = ClusterProbeService()
-    bot = _FakeBot()
-    bot.get_chat = AsyncMock(return_value=_FakeChat(
-        pinned_message=_FakePinnedMessage(
-            message_id=555, text="Important admin announcement"
-        )
-    ))
-    svc._bot = bot
-    assert await svc._recover_prev_message_id() is None
+    fake_col = MagicMock()
+    fake_col.find_one = MagicMock(return_value={"_id": "prev_message_id"})
+    with patch.object(cps.MongoDB, "get_collection", return_value=fake_col):
+        assert svc._recover_prev_message_id() is None
 
 
-async def test_recover_prev_message_id_swallows_get_chat_failure():
-    """If get_chat raises (chat not found, network error), start() must
-    still proceed — _probe_loop runs without a recovered prev."""
+async def test_recover_prev_message_id_swallows_mongo_failure():
     svc = ClusterProbeService()
-    bot = _FakeBot()
-
-    async def _failing_get_chat(**kwargs):
-        raise RuntimeError("chat not found")
-
-    bot.get_chat = _failing_get_chat
-    svc._bot = bot
-    assert await svc._recover_prev_message_id() is None
+    fake_col = MagicMock()
+    fake_col.find_one = MagicMock(side_effect=RuntimeError("mongo down"))
+    with patch.object(cps.MongoDB, "get_collection", return_value=fake_col):
+        assert svc._recover_prev_message_id() is None
 
 
-async def test_send_pins_new_message_each_tick():
-    """Each tick pins the freshly sent probe so restart can recover it."""
+async def test_persist_prev_message_id_upserts_state_doc():
+    svc = ClusterProbeService()
+    fake_col = MagicMock()
+    fake_col.update_one = MagicMock()
+    with patch.object(cps.MongoDB, "get_collection", return_value=fake_col):
+        svc._persist_prev_message_id(123)
+    assert fake_col.update_one.called
+    call_args = fake_col.update_one.call_args
+    assert call_args.args[0] == {"_id": cps.STATE_DOC_ID}
+    assert call_args.args[1]["$set"]["message_id"] == 123
+    assert call_args.kwargs.get("upsert") is True
+
+
+async def test_persist_prev_message_id_swallows_mongo_failure():
+    svc = ClusterProbeService()
+    fake_col = MagicMock()
+    fake_col.update_one = MagicMock(side_effect=RuntimeError("mongo down"))
+    with patch.object(cps.MongoDB, "get_collection", return_value=fake_col):
+        # Must not raise.
+        svc._persist_prev_message_id(123)
+
+
+async def test_send_persists_new_message_id_to_mongodb():
+    """Each tick persists new message_id so a crash mid-send still lets the
+    next process delete the orphan."""
     svc = ClusterProbeService()
     svc._prev_message_id = 100
     bot = _FakeBot()
-    pinned = {"calls": []}
-
-    async def _fake_pin(**kwargs):
-        pinned["calls"].append(kwargs)
-
-    bot.pin_chat_message = _fake_pin
     bot.delete_message = AsyncMock(return_value=True)
     svc._bot = bot
-
-    with _patch_send_rich_message(message_id=200):
-        await svc._send_and_delete_old("🛰 Cluster Probe — ...\n| Col | ... |")
-
-    assert len(pinned["calls"]) == 1
-    assert pinned["calls"][0]["message_id"] == 200
-    assert pinned["calls"][0]["disable_notification"] is True
+    fake_col = MagicMock()
+    fake_col.update_one = MagicMock()
+    with _patch_send_rich_message(message_id=200), \
+         patch.object(cps.MongoDB, "get_collection", return_value=fake_col):
+        await svc._send_and_delete_old("🛰 Cluster Probe")
+    assert svc._prev_message_id == 200
+    # Persisted with new id (not old).
+    set_doc = fake_col.update_one.call_args.args[1]["$set"]
+    assert set_doc["message_id"] == 200
 
 
 # ---------- _probe_loop lifecycle ----------
