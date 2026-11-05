@@ -320,12 +320,14 @@ async def send_rich_message(
             # PTB's private _post hook is the standard way to call any Bot
             # API method. Returns the raw API response dict.
             resp = await bot._post("sendRichMessage", data=data)
-            # The API returns the sent Message under different keys depending
-            # on the method; for sendRichMessage it should be "result".
-            msg = resp.get("result") if isinstance(resp, dict) else resp
-            if msg is not None:
-                sent.append(msg)
-                return sent
+            # If we got here without raising, the endpoint accepted the
+            # request — do NOT fall through to the HTML path. (Earlier
+            # code checked `if msg is not None`, but the API can return
+            # `result: null` on success and that sent a duplicate raw
+            # message via the HTML fallback — bug: "bot trả về 2 tin
+            # nhắn nội dung y hệt nhau, 1 đẹp 1 xấu".)
+            sent.append(resp)
+            return sent
         except Exception as e:
             logger.warning(
                 "sendRichMessage failed, falling back to HTML: "

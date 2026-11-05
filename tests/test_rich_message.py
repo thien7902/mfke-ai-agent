@@ -213,6 +213,38 @@ def test_send_rich_message_empty_text():
     assert bot.calls == []
 
 
+def test_send_rich_no_duplicate_when_api_returns_null_result():
+    """Regression: previously, when sendRichMessage succeeded but the API
+    returned `result: null` (which can happen on some Bot API server
+    builds), the code fell through to the HTML fallback and sent a
+    SECOND raw-markdown message — so the user saw two copies of the
+    same content, one rendered (tables) and one as raw markdown.
+
+    Fix: any non-raising response from sendRichMessage ends delivery.
+    """
+    class NullResultBot:
+        def __init__(self):
+            self.calls: List[Any] = []
+
+        async def _post(self, method, data=None):
+            self.calls.append((method, data))
+            return {"result": None}  # accepted but null payload
+
+        async def send_message(self, **kwargs):
+            self.calls.append(("send_message", kwargs))
+            return {"message_id": 9, "text": kwargs.get("text", "")}
+
+    bot = NullResultBot()
+    text = "| H |\n| --- |\n| data |"
+    asyncio.run(rich_message.send_rich_message(
+        bot, chat_id=1, text=text, message_thread_id=None
+    ))
+    # ONLY the rich call should have been made — no HTML fallback
+    # (which is what produced the duplicate raw-markdown message).
+    assert len(bot.calls) == 1
+    assert bot.calls[0][0] == "sendRichMessage"
+
+
 # ---------- edit_or_send_rich (dedup contract) ----------
 
 class FakeMessage:
