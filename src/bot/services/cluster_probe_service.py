@@ -29,7 +29,6 @@ from src.bot.utils.kubeconfig_crypto import (
     is_encrypted,
 )
 from src.bot.utils.mongodb import MongoDB
-from src.bot.utils.rich_message import send_rich_message
 
 logger = structlog.get_logger(__name__)
 
@@ -183,39 +182,50 @@ class ClusterProbeService:
 
     def _render(self, results: List[dict]) -> str:
         ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+        footer = (
+            "\n_If this message is older than 1 minute, the agent is down. "
+            "Contact Le Minh Thien._"
+        )
         if not results:
             return (
                 f"🛰 Cluster Probe — {ts}\n\n"
-                f"_No kubeconfigs in {config.cluster_probe_kubeconfig_dir}._\n\n"
-                f"_If this message is older than 1 minute, the agent is down. "
-                f"Contact Le Minh Thien._"
+                f"No kubeconfigs in {config.cluster_probe_kubeconfig_dir}."
+                + footer
             )
-        rows = ["| Cluster | Status | Reason |", "| --- | --- | --- |"]
+        # Plain-text list view (not GFM table). Sent via sendMessage without
+        # parse_mode — Telegram renders raw markdown chars literally, so we
+        # avoid "*", "|", and "_" that would otherwise show as garbage if the
+        # client doesn't interpret them.
+        lines = [f"🛰 Cluster Probe — {ts}", ""]
         for r in sorted(results, key=lambda x: (x["ok"], x["name"])):
-            status = "✅ ok" if r["ok"] else "❌ fail"
-            reason = r["reason"].replace("|", "\\|").replace("\n", " ")[:120]
-            rows.append(f"| {r['name']} | {status} | {reason} |")
-        return (
-            f"🛰 Cluster Probe — {ts}\n\n"
-            + "\n".join(rows)
-            + "\n\nUpdated every 60s."
-            + "\n_If this message is older than 1 minute, the agent is down. "
-            "Contact Le Minh Thien._"
-        )
+            status = "OK" if r["ok"] else "FAIL"
+            reason = r["reason"].replace("\n", " ")[:120]
+            lines.append(f"{status}  {r['name']}  —  {reason}")
+        lines.append("")
+        lines.append("Updated every 60s." + footer)
+        return "\n".join(lines)
 
-    async def _send_and_delete_old(self, markdown: str) -> None:
-        # Send fresh message FIRST so there's always one visible (no gap).
-        sent = await send_rich_message(
-            self._bot,
-            chat_id=config.cluster_probe_chat_id,
-            text=markdown,
-            message_thread_id=config.cluster_probe_topic_id,
-            prefer_rich=False,
-        )
-        new_message_id: Optional[int] = None
-        if sent:
-            first = sent[0] if isinstance(sent, list) else sent
-            new_message_id = getattr(first, "message_id", None)
+    async def _send_and_delete_old(self, text: str) -> None:
+        # Plain-text send. No parse_mode (so Telegram renders the body
+        # literally — no markdown interpretation, no HTML). Probe is short
+        # and pure-ASCII enough that formatting is unnecessary; avoids the
+        # sendRichMessage timeouts and HTML-tag-bleed issues.
+        kwargs = {
+            "chat_id": config.cluster_probe_chat_id,
+            "text": text,
+            "disable_notification": True,
+        }
+        if config.cluster_probe_topic_id:
+            kwargs["message_thread_id"] = config.cluster_probe_topic_id
+        try:
+            sent = await self._bot.send_message(**kwargs)
+        except Exception as e:
+            logger.warning("cluster_probe_send_failed", error=str(e))
+            # Send failed — keep _prev_message_id as-is so the next tick
+            # can still try to delete the prior probe (it's still in the
+            # topic, assuming Telegram didn't lose it).
+            return
+        new_message_id: Optional[int] = getattr(sent, "message_id", None)
 
         # Delete the previous probe now that the new one is up.
         if self._prev_message_id is not None:

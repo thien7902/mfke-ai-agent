@@ -182,19 +182,22 @@ def test_render_sorts_failures_first():
         {"name": "mmm-fail", "ok": False, "reason": "exit 1"},
     ]
     out = svc._render(results)
-    data_rows = [
-        l for l in out.splitlines()
-        if l.startswith("| ") and "---" not in l and "Cluster" not in l
-    ]
-    names_in_order = [l.split("|")[1].strip() for l in data_rows]
+    # Plain-text list view. Lines look like "OK  name — reason" or "FAIL  name — reason".
+    body_lines = [l for l in out.splitlines() if l.startswith(("OK", "FAIL"))]
+    names_in_order = [l.split("  ")[1].split("  —  ")[0].strip() for l in body_lines]
     assert names_in_order == ["aaa-fail", "mmm-fail", "zzz-ok"]
 
 
-def test_render_escapes_pipe_in_reason():
+def test_render_plain_text_no_markdown_or_html_specials():
+    """Probe is sent as plain text (no parse_mode). Render must not produce
+    markdown emphasis or HTML tags that the client would render as garbage."""
     svc = ClusterProbeService()
-    results = [{"name": "x", "ok": False, "reason": "a|b|c"}]
-    out = svc._render(results)
-    assert "a\\|b\\|c" in out
+    out = svc._render([
+        {"name": "prod", "ok": True, "reason": "ready"},
+        {"name": "bad", "ok": False, "reason": "exit 1: x"},
+    ])
+    assert "<b>" not in out and "<pre>" not in out
+    assert "**" not in out
 
 
 # ---------- _send_and_delete_old ----------
@@ -207,24 +210,34 @@ class _FakeSentMessage:
 class _FakeBot:
     def __init__(self):
         self.deletes: List[dict] = []
+        self.sends: List[dict] = []
+        self._send_id_seq = 100
+
+    async def send_message(self, **kwargs):
+        self.sends.append(kwargs)
+        msg = _FakeSentMessage(self._send_id_seq)
+        self._send_id_seq += 100
+        return msg
 
     async def delete_message(self, **kwargs):
         self.deletes.append(kwargs)
         return True
 
 
-def _patch_send_rich_message(message_id: int):
-    async def _fake_send(*args, **kwargs):
-        return [_FakeSentMessage(message_id)]
-    return patch.object(cps, "send_rich_message", new=_fake_send)
+def _make_bot_with_send(message_id: int):
+    bot = _FakeBot()
+    async def _send(**kwargs):
+        bot.sends.append(kwargs)
+        return _FakeSentMessage(message_id)
+    bot.send_message = _send
+    return bot
 
 
 async def test_send_first_call_does_not_delete():
     svc = ClusterProbeService()
-    bot = _FakeBot()
+    bot = _make_bot_with_send(message_id=100)
     svc._bot = bot
-    with _patch_send_rich_message(message_id=100):
-        await svc._send_and_delete_old("markdown")
+    await svc._send_and_delete_old("text")
     assert svc._prev_message_id == 100
     assert bot.deletes == [], "no delete on first send (no previous)"
 
@@ -232,10 +245,9 @@ async def test_send_first_call_does_not_delete():
 async def test_send_second_call_deletes_previous_message_id():
     svc = ClusterProbeService()
     svc._prev_message_id = 100
-    bot = _FakeBot()
+    bot = _make_bot_with_send(message_id=200)
     svc._bot = bot
-    with _patch_send_rich_message(message_id=200):
-        await svc._send_and_delete_old("markdown")
+    await svc._send_and_delete_old("text")
     assert svc._prev_message_id == 200
     assert len(bot.deletes) == 1
     assert bot.deletes[0]["message_id"] == 100
@@ -245,17 +257,58 @@ async def test_send_delete_failure_does_not_raise():
     """If delete_message throws (user deleted it manually), the tick survives."""
     svc = ClusterProbeService()
     svc._prev_message_id = 100
-    bot = _FakeBot()
+    bot = _make_bot_with_send(message_id=200)
 
     async def _failing_delete(**kwargs):
         raise RuntimeError("message to delete not found")
 
     bot.delete_message = _failing_delete
     svc._bot = bot
-
-    with _patch_send_rich_message(message_id=200):
-        await svc._send_and_delete_old("markdown")
+    await svc._send_and_delete_old("text")
     assert svc._prev_message_id == 200
+
+
+async def test_send_send_failure_does_not_raise_or_set_prev():
+    """If send_message throws (rate-limit, chat not found), tick must survive
+    and must NOT update prev_message_id (otherwise the next tick would
+    delete a Wrong/None message)."""
+    svc = ClusterProbeService()
+    svc._prev_message_id = 100
+    bot = _FakeBot()
+
+    async def _failing_send(**kwargs):
+        raise RuntimeError("timed out")
+
+    bot.send_message = _failing_send
+    svc._bot = bot
+    # Suppress persistence so it doesn't pollute other tests.
+    with patch.object(svc, "_persist_prev_message_id"):
+        await svc._send_and_delete_old("text")
+    # Prev message_id unchanged — we did NOT receive a new message.
+    assert svc._prev_message_id == 100
+    # Did not delete (because send failed first).
+    assert bot.deletes == []
+
+
+async def test_send_passes_thread_id_when_set():
+    """When CLUSTER_PROBE_TOPIC_ID != 0, send_message includes message_thread_id."""
+    svc = ClusterProbeService()
+    bot = _make_bot_with_send(message_id=100)
+    svc._bot = bot
+    with patch.object(cps.config, "cluster_probe_topic_id", 42):
+        await svc._send_and_delete_old("text")
+    assert bot.sends[0]["message_thread_id"] == 42
+
+
+async def test_send_omits_thread_id_when_zero():
+    """When CLUSTER_PROBE_TOPIC_ID == 0 (general topic), send_message omits
+    message_thread_id so Telegram routes to General topic."""
+    svc = ClusterProbeService()
+    bot = _make_bot_with_send(message_id=100)
+    svc._bot = bot
+    with patch.object(cps.config, "cluster_probe_topic_id", 0):
+        await svc._send_and_delete_old("text")
+    assert "message_thread_id" not in bot.sends[0]
 
 
 # ---------- _recover_prev_message_id on start (MongoDB-backed) ----------
@@ -322,14 +375,12 @@ async def test_send_persists_new_message_id_to_mongodb():
     next process delete the orphan."""
     svc = ClusterProbeService()
     svc._prev_message_id = 100
-    bot = _FakeBot()
-    bot.delete_message = AsyncMock(return_value=True)
+    bot = _make_bot_with_send(message_id=200)
     svc._bot = bot
     fake_col = MagicMock()
     fake_col.update_one = MagicMock()
-    with _patch_send_rich_message(message_id=200), \
-         patch.object(cps.MongoDB, "get_collection", return_value=fake_col):
-        await svc._send_and_delete_old("🛰 Cluster Probe")
+    with patch.object(cps.MongoDB, "get_collection", return_value=fake_col):
+        await svc._send_and_delete_old("text")
     assert svc._prev_message_id == 200
     # Persisted with new id (not old).
     set_doc = fake_col.update_one.call_args.args[1]["$set"]
