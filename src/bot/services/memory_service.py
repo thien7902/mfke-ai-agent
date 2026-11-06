@@ -60,6 +60,16 @@ def _import_graphiti():
     return _graphiti
 
 
+def _has_key(r, key):
+    """FalkorDB records may behave like a dict OR have .keys()/.get().
+    Both `key in r` and `r['fact']` should work for dict-like records."""
+    try:
+        return key in r
+    except TypeError:
+        # Fallback: record is an object — try attribute access
+        return hasattr(r, key)
+
+
 class MemoryService:
     """Singleton-ish service wrapping Graphiti.
 
@@ -357,32 +367,28 @@ class MemoryService:
         try:
             # EntityEdge.get_by_group_ids on FalkorDB clones the driver to
             # database=group_ids[0], but our deployment stores all edges on
-            # the configured default database with group_id set to
-            # bot_config.graphiti_group_id. The cloned driver queries an
-            # empty per-group database and raises GroupsEdgesNotFoundError.
+            # the configured default database. The cloned driver queries
+            # an empty per-group database. Bypass it.
             #
-            # Bypass: query the driver's configured (default) database
-            # directly. We only need the `fact` text — skip Graphiti's
-            # entity_edge_from_record parser entirely (it expects a specific
-            # record structure that FalkorDB doesn't always return). Query
-            # just the fact column, return facts straight from records.
+            # Also: v2.3.21 returned 0 facts because we filtered
+            # `e.group_id IN $group_ids` — but search_memory (which works)
+            # may use a different filter path. v2.3.23 drops the explicit
+            # group_id filter and returns all RELATES_TO facts. The bot
+            # uses a single group_id anyway (graphiti_group_id='global'),
+            # so there's no practical leakage.
             match_query = """
                 MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
-                WHERE e.group_id IN $group_ids
                 RETURN e.fact AS fact
                 ORDER BY e.uuid DESC
             """
             records, _, _ = await self._graphiti.driver.execute_query(
                 match_query,
-                group_ids=[bot_config.graphiti_group_id],
                 routing_="r",
             )
             facts = []
             for r in records:
-                # FalkorDB returns records that behave like dicts. Both
-                # r['fact'] and r.get('fact') work; be defensive.
                 try:
-                    fact = r["fact"] if hasattr(r, "__getitem__") else getattr(r, "fact", None)
+                    fact = r["fact"] if _has_key(r, "fact") else None
                 except (KeyError, TypeError):
                     fact = None
                 if fact:
