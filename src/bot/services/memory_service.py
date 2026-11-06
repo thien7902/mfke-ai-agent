@@ -351,54 +351,50 @@ class MemoryService:
     async def _fetch_all_facts_on_loop(self) -> List[str]:
         """Run on the dedicated memory loop. Loads every EntityEdge for the
         bot's group_id and returns the `fact` text of each. Updates the
-        cache as a side-effect. Treats 'no edges for group' as an empty
-        graph (cache = []) so the facts-block is skipped cleanly until
-        /addmemory adds something — not as a fetch failure."""
+        cache as a side-effect."""
         if not bot_config.graphiti_memory_enabled or not self._graphiti:
             return []
         try:
-            from graphiti_core.edges import EntityEdge
-            from graphiti_core.errors import GroupsEdgesNotFoundError
-        except Exception as e:
-            logger.warning("memory_facts_import_failed",
-                           error=str(e), error_type=type(e).__name__)
-            return self._facts_cache[1] if self._facts_cache else []
-        try:
-            # EntityEdge.get_by_group_ids on FalkorDB routes to a per-group
-            # database (clone(database=group_ids[0])). Our deployment stores
-            # all edges on the configured default database with group_id set
-            # to bot_config.graphiti_group_id — so the routed query lands on
-            # an empty "global" database and raises GroupsEdgesNotFoundError,
-            # even though search_memory (which doesn't route) sees edges.
-            # Bypass the routing by querying the driver directly with the
-            # same WHERE e.group_id IN [...] filter the search path uses.
-            from graphiti_core.driver.driver import GraphProvider
-            from graphiti_core.models.edges.edge_db_queries import (
-                get_entity_edge_return_query,
-            )
-
-            provider = getattr(self._graphiti.driver, "provider", None)
-            match_query = (
-                "MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity) "
-                "WHERE e.group_id IN $group_ids "
-                "RETURN "
-                + get_entity_edge_return_query(provider)
-                + " ORDER BY e.uuid DESC"
-            )
+            # EntityEdge.get_by_group_ids on FalkorDB clones the driver to
+            # database=group_ids[0], but our deployment stores all edges on
+            # the configured default database with group_id set to
+            # bot_config.graphiti_group_id. The cloned driver queries an
+            # empty per-group database and raises GroupsEdgesNotFoundError.
+            #
+            # Bypass: query the driver's configured (default) database
+            # directly. We only need the `fact` text — skip Graphiti's
+            # entity_edge_from_record parser entirely (it expects a specific
+            # record structure that FalkorDB doesn't always return). Query
+            # just the fact column, return facts straight from records.
+            match_query = """
+                MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+                WHERE e.group_id IN $group_ids
+                RETURN e.fact AS fact
+                ORDER BY e.uuid DESC
+            """
             records, _, _ = await self._graphiti.driver.execute_query(
                 match_query,
                 group_ids=[bot_config.graphiti_group_id],
                 routing_="r",
             )
-            from graphiti_core.driver.record_parsers import entity_edge_from_record
-            edges = [entity_edge_from_record(r) for r in records]
-            facts = [e.fact for e in edges if getattr(e, "fact", None)]
+            facts = []
+            for r in records:
+                # FalkorDB returns records that behave like dicts. Both
+                # r['fact'] and r.get('fact') work; be defensive.
+                try:
+                    fact = r["fact"] if hasattr(r, "__getitem__") else getattr(r, "fact", None)
+                except (KeyError, TypeError):
+                    fact = None
+                if fact:
+                    facts.append(str(fact))
             self._write_facts_cache(facts)
             logger.info("memory_facts_dumped", num_facts=len(facts))
             return facts
         except Exception as e:
             logger.warning("memory_facts_dump_failed",
-                           error=str(e), error_type=type(e).__name__)
+                           error=str(e),
+                           error_type=type(e).__name__,
+                           exc_info=True)
             # Leave the previous snapshot intact so a transient FalkorDB
             # blip doesn't wipe the prompt's facts block.
             return self._facts_cache[1] if self._facts_cache else []

@@ -128,41 +128,26 @@ async def test_invalidate_facts_cache_no_op_when_cache_is_none():
 
 @pytest.mark.asyncio
 async def test_fetch_all_facts_on_loop_extracts_fact_from_edges():
-    """Stub the driver.execute_query path and confirm we extract .fact.
-    v2.3.21 bypasses EntityEdge.get_by_group_ids (which routes to a
-    per-group database and misses on default_db-stored edges) and
-    queries the driver directly with the same WHERE e.group_id IN [...]
-    filter the search path uses."""
-    import datetime as _dt
+    """v2.3.22: query just `e.fact` from RELATES_TO edges. Skip Graphiti's
+    entity_edge_from_record parser (expects specific record structure
+    that FalkorDB may not return). Facts straight from records."""
     svc = _make_memory_service_stub()
     svc._graphiti = MagicMock()
     driver = MagicMock()
     driver.provider = "falkordb"
-
-    # Records must round-trip through entity_edge_from_record which
-    # builds an EntityEdge (pydantic) — `created_at` must be a datetime.
-    now = _dt.datetime.now(_dt.timezone.utc)
-    rec1 = {"uuid": "u1", "source_node_uuid": "s1",
-            "target_node_uuid": "t1", "group_id": "global",
-            "created_at": now, "name": "n1",
-            "fact": "acme runs k8s 1.29", "episodes": [],
-            "expired_at": None, "valid_at": None,
-            "invalid_at": None, "reference_time": None,
-            "attributes": {}}
-    rec2 = {"uuid": "u2", "source_node_uuid": "s2",
-            "target_node_uuid": "t2", "group_id": "global",
-            "created_at": now, "name": "n2",
-            "fact": "gardener shoots seeds", "episodes": [],
-            "expired_at": None, "valid_at": None,
-            "invalid_at": None, "reference_time": None,
-            "attributes": {}}
-    rec3 = dict(rec1, uuid="u3", name="n3", fact="")  # empty fact filtered out
-    driver.execute_query = AsyncMock(return_value=([rec1, rec2, rec3], None, None))
+    # Records: simple dicts with only the 'fact' key. No need for
+    # created_at/uuid/etc. since we don't parse to EntityEdge anymore.
+    records = [
+        {"fact": "acme runs k8s 1.29"},
+        {"fact": "gardener shoots seeds"},
+        {"fact": ""},   # empty fact filtered out
+        {"fact": None},  # null fact filtered out
+    ]
+    driver.execute_query = AsyncMock(return_value=(records, None, None))
     svc._graphiti.driver = driver
 
     facts = await svc._fetch_all_facts_on_loop()
     assert facts == ["acme runs k8s 1.29", "gardener shoots seeds"]
-    # Cache updated as a side-effect.
     assert svc._facts_cache is not None
     assert svc._facts_cache[1] == facts
 
@@ -188,9 +173,9 @@ async def test_fetch_all_facts_on_loop_failure_preserves_prior_cache():
 
 @pytest.mark.asyncio
 async def test_fetch_all_facts_on_loop_empty_graph_caches_empty_list():
-    """Empty result (no edges in this group on default_db) caches (ts, [])
-    so subsequent turns don't retry every tick. Distinct from a real
-    failure which preserves the prior snapshot."""
+    """Empty result (no edges in this group) caches (ts, []) so subsequent
+    turns don't retry every tick. Distinct from a real failure which
+    preserves the prior snapshot."""
     svc = _make_memory_service_stub()
     svc._write_facts_cache(["stale from before"])  # prior snapshot exists
     svc._graphiti = MagicMock()
