@@ -10,7 +10,7 @@ for the HolmesService injection tests.
 """
 import asyncio
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
 
@@ -128,24 +128,39 @@ async def test_invalidate_facts_cache_no_op_when_cache_is_none():
 
 @pytest.mark.asyncio
 async def test_fetch_all_facts_on_loop_extracts_fact_from_edges():
-    """Stub EntityEdge.get_by_group_ids and confirm we extract .fact."""
+    """Stub the driver.execute_query path and confirm we extract .fact.
+    v2.3.21 bypasses EntityEdge.get_by_group_ids (which routes to a
+    per-group database and misses on default_db-stored edges) and
+    queries the driver directly with the same WHERE e.group_id IN [...]
+    filter the search path uses."""
+    import datetime as _dt
     svc = _make_memory_service_stub()
     svc._graphiti = MagicMock()
-    svc._graphiti.driver = MagicMock()
+    driver = MagicMock()
+    driver.provider = "falkordb"
 
-    class _FakeEdge:
-        def __init__(self, fact):
-            self.fact = fact
+    # Records must round-trip through entity_edge_from_record which
+    # builds an EntityEdge (pydantic) — `created_at` must be a datetime.
+    now = _dt.datetime.now(_dt.timezone.utc)
+    rec1 = {"uuid": "u1", "source_node_uuid": "s1",
+            "target_node_uuid": "t1", "group_id": "global",
+            "created_at": now, "name": "n1",
+            "fact": "acme runs k8s 1.29", "episodes": [],
+            "expired_at": None, "valid_at": None,
+            "invalid_at": None, "reference_time": None,
+            "attributes": {}}
+    rec2 = {"uuid": "u2", "source_node_uuid": "s2",
+            "target_node_uuid": "t2", "group_id": "global",
+            "created_at": now, "name": "n2",
+            "fact": "gardener shoots seeds", "episodes": [],
+            "expired_at": None, "valid_at": None,
+            "invalid_at": None, "reference_time": None,
+            "attributes": {}}
+    rec3 = dict(rec1, uuid="u3", name="n3", fact="")  # empty fact filtered out
+    driver.execute_query = AsyncMock(return_value=([rec1, rec2, rec3], None, None))
+    svc._graphiti.driver = driver
 
-    fake_edges = [_FakeEdge("acme runs k8s 1.29"), _FakeEdge("gardener shoots seeds"),
-                  _FakeEdge(None), _FakeEdge("")]
-
-    with patch("graphiti_core.edges.EntityEdge") as EntityEdge:
-        from unittest.mock import AsyncMock
-        EntityEdge.get_by_group_ids = AsyncMock(return_value=fake_edges)
-        # Run directly on this loop (no dedicated loop) — the production
-        # path uses _run_async, but the method itself is just a coroutine.
-        facts = await svc._fetch_all_facts_on_loop()
+    facts = await svc._fetch_all_facts_on_loop()
     assert facts == ["acme runs k8s 1.29", "gardener shoots seeds"]
     # Cache updated as a side-effect.
     assert svc._facts_cache is not None
@@ -159,12 +174,12 @@ async def test_fetch_all_facts_on_loop_failure_preserves_prior_cache():
     svc = _make_memory_service_stub()
     svc._write_facts_cache(["previously cached"])
     svc._graphiti = MagicMock()
-    svc._graphiti.driver = MagicMock()
+    driver = MagicMock()
+    driver.provider = "falkordb"
+    driver.execute_query = AsyncMock(side_effect=RuntimeError("falkordb down"))
+    svc._graphiti.driver = driver
 
-    with patch("graphiti_core.edges.EntityEdge") as EntityEdge:
-        from unittest.mock import AsyncMock
-        EntityEdge.get_by_group_ids = AsyncMock(side_effect=RuntimeError("falkordb down"))
-        result = await svc._fetch_all_facts_on_loop()
+    result = await svc._fetch_all_facts_on_loop()
     assert result == ["previously cached"], "failure must return prior snapshot"
     with svc._facts_lock:
         ts, facts = svc._facts_cache
@@ -173,23 +188,18 @@ async def test_fetch_all_facts_on_loop_failure_preserves_prior_cache():
 
 @pytest.mark.asyncio
 async def test_fetch_all_facts_on_loop_empty_graph_caches_empty_list():
-    """GroupsEdgesNotFoundError (empty graph) is treated as a valid empty
-    state — cache becomes (ts, []) so subsequent turns don't retry every
-    tick. Distinct from a real failure which preserves the prior snapshot."""
-    from graphiti_core.errors import GroupsEdgesNotFoundError
+    """Empty result (no edges in this group on default_db) caches (ts, [])
+    so subsequent turns don't retry every tick. Distinct from a real
+    failure which preserves the prior snapshot."""
     svc = _make_memory_service_stub()
     svc._write_facts_cache(["stale from before"])  # prior snapshot exists
     svc._graphiti = MagicMock()
-    svc._graphiti.driver = MagicMock()
+    driver = MagicMock()
+    driver.provider = "falkordb"
+    driver.execute_query = AsyncMock(return_value=([], None, None))
+    svc._graphiti.driver = driver
 
-    with patch("graphiti_core.edges.EntityEdge") as EntityEdge, \
-         patch("graphiti_core.errors.GroupsEdgesNotFoundError",
-               GroupsEdgesNotFoundError):
-        from unittest.mock import AsyncMock
-        EntityEdge.get_by_group_ids = AsyncMock(
-            side_effect=GroupsEdgesNotFoundError("no edges")
-        )
-        result = await svc._fetch_all_facts_on_loop()
+    result = await svc._fetch_all_facts_on_loop()
     assert result == []
     with svc._facts_lock:
         ts, facts = svc._facts_cache

@@ -364,23 +364,38 @@ class MemoryService:
                            error=str(e), error_type=type(e).__name__)
             return self._facts_cache[1] if self._facts_cache else []
         try:
-            edges = await EntityEdge.get_by_group_ids(
-                driver=self._graphiti.driver,
-                group_ids=[bot_config.graphiti_group_id],
+            # EntityEdge.get_by_group_ids on FalkorDB routes to a per-group
+            # database (clone(database=group_ids[0])). Our deployment stores
+            # all edges on the configured default database with group_id set
+            # to bot_config.graphiti_group_id — so the routed query lands on
+            # an empty "global" database and raises GroupsEdgesNotFoundError,
+            # even though search_memory (which doesn't route) sees edges.
+            # Bypass the routing by querying the driver directly with the
+            # same WHERE e.group_id IN [...] filter the search path uses.
+            from graphiti_core.driver.driver import GraphProvider
+            from graphiti_core.models.edges.edge_db_queries import (
+                get_entity_edge_return_query,
             )
+
+            provider = getattr(self._graphiti.driver, "provider", None)
+            match_query = (
+                "MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity) "
+                "WHERE e.group_id IN $group_ids "
+                "RETURN "
+                + get_entity_edge_return_query(provider)
+                + " ORDER BY e.uuid DESC"
+            )
+            records, _, _ = await self._graphiti.driver.execute_query(
+                match_query,
+                group_ids=[bot_config.graphiti_group_id],
+                routing_="r",
+            )
+            from graphiti_core.driver.record_parsers import entity_edge_from_record
+            edges = [entity_edge_from_record(r) for r in records]
             facts = [e.fact for e in edges if getattr(e, "fact", None)]
             self._write_facts_cache(facts)
             logger.info("memory_facts_dumped", num_facts=len(facts))
             return facts
-        except GroupsEdgesNotFoundError:
-            # Empty graph (no edges in this group yet). Cache an empty
-            # list so the next TTL window doesn't keep retrying every
-            # turn — and so /addmemory's invalidation can flip the
-            # cache to "has facts" cleanly once edges exist.
-            self._write_facts_cache([])
-            logger.info("memory_facts_empty_graph",
-                        group_id=bot_config.graphiti_group_id)
-            return []
         except Exception as e:
             logger.warning("memory_facts_dump_failed",
                            error=str(e), error_type=type(e).__name__)
