@@ -387,11 +387,12 @@ class MemoryService:
                 EDGE_HYBRID_SEARCH_RRF,
             )
             config = SearchConfig(**EDGE_HYBRID_SEARCH_RRF.model_dump())
-            config.limit = 500  # cap to keep prompt manageable
+            limit = int(getattr(bot_config, "graphiti_memory_facts_limit", 1000))
+            config.limit = limit  # cap to keep prompt manageable
             edges = await self._graphiti.search(
                 query="*",
                 group_ids=[bot_config.graphiti_group_id],
-                num_results=500,
+                num_results=limit,
             )
             facts = [e.fact for e in edges if getattr(e, "fact", None)]
             self._write_facts_cache(facts)
