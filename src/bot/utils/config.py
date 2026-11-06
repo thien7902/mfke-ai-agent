@@ -117,6 +117,31 @@ class Config:
     # Telegram forum "general" topic is id 1 by convention.
     cluster_probe_topic_id: int = 1
 
+    # Background consolidator. After a forum topic is idle for
+    # `consolidator_idle_seconds` after the last assistant response, the bot
+    # runs a separate LLM call (cheap model, `consolidator_model`) over the
+    # recent transcript and distills reusable facts. Facts are stored in a
+    # dedicated MongoDB collection `distilled_facts` (NOT Graphiti) and
+    # injected whole into Holmes' system prompt at every turn so the LLM
+    # sees them with high priority. Graphiti / `/addmemory` /
+    # `search_memory` tool remain unchanged for admin-curated knowledge.
+    consolidator_enabled: bool = False
+    consolidator_idle_seconds: int = 300
+    consolidator_model: Optional[str] = None
+    # Skip consolidation if the reloaded conversation has fewer than this
+    # many messages (chats too short to extract anything useful).
+    consolidator_min_turns: int = 4
+    # Cap the number of recent messages passed to the consolidator LLM.
+    consolidator_max_turns: int = 20
+    # Max topics that may run the consolidator LLM concurrently. Per-topic
+    # locks still prevent two fires on the SAME topic from overlapping;
+    # this semaphore bounds cross-topic LLM call fan-out so a burst of idle
+    # topics doesn't slam the model endpoint all at once.
+    consolidator_max_concurrent: int = 5
+    # Wall-clock cap on a single consolidator LLM call. A hung model call
+    # would otherwise hold the cross-topic semaphore indefinitely.
+    consolidator_llm_timeout_seconds: int = 60
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -161,6 +186,13 @@ def load_config() -> Config:
         cluster_probe_kubeconfig_dir=os.getenv("CLUSTER_PROBE_KUBECONFIG_DIR", "/root/kubeconfig"),
         cluster_probe_chat_id=int(os.getenv("CLUSTER_PROBE_CHAT_ID")) if os.getenv("CLUSTER_PROBE_CHAT_ID") else None,
         cluster_probe_topic_id=int(os.getenv("CLUSTER_PROBE_TOPIC_ID", "1")),
+        consolidator_enabled=os.getenv("CONSOLIDATOR_ENABLED", "").lower() in ("1", "true", "yes", "on"),
+        consolidator_idle_seconds=int(os.getenv("CONSOLIDATOR_IDLE_SECONDS", "300")),
+        consolidator_model=os.getenv("CONSOLIDATOR_MODEL") or None,
+        consolidator_min_turns=int(os.getenv("CONSOLIDATOR_MIN_TURNS", "4")),
+        consolidator_max_turns=int(os.getenv("CONSOLIDATOR_MAX_TURNS", "20")),
+        consolidator_max_concurrent=int(os.getenv("CONSOLIDATOR_MAX_CONCURRENT", "5")),
+        consolidator_llm_timeout_seconds=int(os.getenv("CONSOLIDATOR_LLM_TIMEOUT_SECONDS", "60")),
     )
 
 

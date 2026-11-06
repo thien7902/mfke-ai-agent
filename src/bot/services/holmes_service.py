@@ -164,12 +164,16 @@ def _empty_llm_result() -> LLMResult:
 class HolmesService:
     """Service for interacting with HolmesGPT."""
 
-    def __init__(self, memory_service: Optional["MemoryService"] = None):
+    def __init__(self, memory_service: Optional["MemoryService"] = None, distilled_fact_store=None):
         self._config: Optional[Config] = None
         self._tool_executor: Optional[ToolExecutor] = None
         self._tool_calling_llm: Optional[ToolCallingLLM] = None
         self._initialized = False
         self._memory: Optional["MemoryService"] = memory_service
+        # Optional DistilledFactStore — when present, _build_holmes_messages
+        # injects the latest-run-per-topic distilled facts block at the top
+        # of the system-prompt additions (high priority, no tool call needed).
+        self._distilled_store = distilled_fact_store
         # Lazily-built second ToolCallingLLM keyed by CLAUDE_ENTERPRISE_MODEL
         # (a key in ~/.holmes/model_list.yaml). Built on first /claude call so
         # a missing or misconfigured enterprise model doesn't break startup.
@@ -1127,6 +1131,23 @@ class HolmesService:
             conversation.add_message(Message(role="assistant", content=error_msg))
             return error_msg
 
+    # Distilled-knowledge block header. Injected at the TOP of the system
+    # prompt additions (high priority) when a DistilledFactStore is wired in
+    # and yields a non-empty fact list. The body is the bulleted fact list,
+    # one fact per line. Facts here are the latest-run-per-topic set pulled
+    # from the distilled_facts MongoDB collection — newer runs replace older
+    # runs for the same topic so chat #2's facts win over chat #1's.
+    _DISTILLED_FACTS_HEADER = (
+        "\n\n--- DISTILLED KNOWLEDGE (auto-extracted from prior conversations, high priority) ---\n"
+        "The following facts were distilled by a background reviewer from past "
+        "conversations in this bot. For each conversation topic, only the latest "
+        "distillation run's facts appear here — newer extractions replace older "
+        "ones for the same topic. They are already in your context — you do NOT "
+        "need to call search_memory to access them. Trust them as authoritative "
+        "unless they conflict with live tool output. Call search_memory only for "
+        "explicit re-query or when these are insufficient.\n"
+    )
+
     # Default search_memory tool-use rule. Appended to HOLMES_SYSTEM_PROMPT_ADDITIONS
     # when graphiti_memory_enabled is True so all deployments that turn on memory
     # get the rule without each user having to write it. Users can override by
@@ -1188,6 +1209,31 @@ class HolmesService:
         replay instead of stacking into the system prompt.
         """
         additions = bot_config.holmes_system_prompt_additions or ""
+        # Inject the distilled-knowledge block at the TOP of the additions
+        # (high priority, no tool call required to surface these). Pulled
+        # from the distilled_facts MongoDB collection — one bullet per
+        # latest-run-per-topic fact. Skip-on-empty so the LLM doesn't see
+        # an empty "facts: " section confusing the prompt. Sync call here
+        # is intentional — pymongo is sync and HolmesService runs this in
+        # an async method but the call is cheap (indexed lookup).
+        if self._distilled_store is not None:
+            try:
+                distilled_facts = self._distilled_store.get_injectable_facts()
+            except Exception as e:
+                logger.warning("distilled_facts_load_failed", error=str(e))
+                distilled_facts = []
+            if distilled_facts:
+                bullet_lines = "\n".join(
+                    f"- {f.get('text', '')}".strip()
+                    for f in distilled_facts
+                    if f.get("text")
+                )
+                if bullet_lines:
+                    additions = (
+                        additions
+                        + self._DISTILLED_FACTS_HEADER
+                        + bullet_lines
+                    ).strip()
         # Append the search_memory tool-use rule when memory is enabled so
         # Holmes knows when to call the tool. User-written additions are
         # preserved (the rule goes after, not replacing them).

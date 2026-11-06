@@ -143,6 +143,14 @@ def mock_config(tmp_path_factory):
         mock.graphiti_group_id = "global"
         mock.graphiti_embedding_model = "Vietnamese_Embedding"
         mock.graphiti_embedding_dim = 1024
+        # Consolidator defaults: disabled in tests that don't opt in.
+        mock.consolidator_enabled = False
+        mock.consolidator_idle_seconds = 300
+        mock.consolidator_model = None
+        mock.consolidator_min_turns = 4
+        mock.consolidator_max_turns = 20
+        mock.consolidator_max_concurrent = 5
+        mock.consolidator_llm_timeout_seconds = 60
         yield mock
 
 

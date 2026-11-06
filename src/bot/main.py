@@ -136,6 +136,8 @@ class TelegramBot:
         self.conversation_service: ConversationService = None
         self.permission_service: PermissionService = None
         self.memory_service: MemoryService = None
+        self.distilled_fact_store = None
+        self.consolidator_service = None
         self.cluster_probe_service: ClusterProbeService = ClusterProbeService()
         self.last_update_time: float = 0  # Track last received update
         self.polling_restarts: int = 0    # Consecutive in-place restarts with no updates since
@@ -170,12 +172,49 @@ class TelegramBot:
             print(f"[MEMORY INIT FAILED] {type(e).__name__}: {e}", flush=True)
             traceback.print_exc()
 
-        self.holmes_service = HolmesService(memory_service=self.memory_service)
+        self.holmes_service = HolmesService(
+            memory_service=self.memory_service,
+            distilled_fact_store=self.distilled_fact_store,
+        )
         await self.holmes_service.initialize()
         health_checker.set_holmes_ready(True)
 
         self.conversation_service = ConversationService()
         self.permission_service = PermissionService()
+
+        # Distilled-fact store (MongoDB) — built unconditionally so
+        # HolmesService can inject the facts block when enabled. The
+        # consolidator that POPULATES this store is gated by
+        # config.consolidator_enabled below; the store itself is harmless
+        # when empty (all reads return []).
+        from src.bot.services.distilled_fact_store import DistilledFactStore
+        self.distilled_fact_store = DistilledFactStore()
+
+        # Background consolidator — populates distilled_fact_store on idle.
+        # Best-effort init: failure doesn't block the bot, mirroring the
+        # memory_service pattern above.
+        if config.consolidator_enabled:
+            from src.bot.services.consolidator_service import ConsolidatorService
+            try:
+                self.consolidator_service = ConsolidatorService(
+                    distilled_store=self.distilled_fact_store,
+                    conversation_service=self.conversation_service,
+                )
+                logger.info(
+                    "consolidator_enabled",
+                    model=config.consolidator_model,
+                    idle_seconds=config.consolidator_idle_seconds,
+                    min_turns=config.consolidator_min_turns,
+                    max_turns=config.consolidator_max_turns,
+                )
+            except Exception as e:
+                logger.error(
+                    "consolidator_init_failed_bot_continues",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    exc_info=True,
+                )
+                self.consolidator_service = None
 
         # Create Telegram application
         # Defaults (PTB HTTPXRequest) are read/write=5s, pool=1s, pool_size=1 — too tight
@@ -216,6 +255,7 @@ class TelegramBot:
             self.holmes_service,
             self.conversation_service,
             self.permission_service,
+            consolidator=self.consolidator_service,
         )
         cmd_handler = BotCommandHandler(
             self.permission_service, self.conversation_service, holmes_service=self.holmes_service
@@ -407,6 +447,13 @@ class TelegramBot:
 
         if self.memory_service:
             await self.memory_service.close()
+
+        if self.consolidator_service:
+            try:
+                await self.consolidator_service.stop()
+            except Exception as e:
+                logger.warning("consolidator_stop_failed", error=str(e))
+            self.consolidator_service = None
 
         # Stop the cluster probe task before the Holmes executor shuts down
         # so the probe's subprocesses don't outlive the executor they were

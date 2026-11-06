@@ -204,10 +204,15 @@ class MessageHandler:
         holmes_service: HolmesService,
         conversation_service: ConversationService,
         permission_service: PermissionService,
+        consolidator=None,
     ):
         self.holmes = holmes_service
         self.conversations = conversation_service
         self.permissions = permission_service
+        # Optional background consolidator. Schedule_if_idle is a no-op when
+        # None or when bot_config.consolidator_enabled is False, so callers
+        # that don't care about consolidation can omit this param safely.
+        self.consolidator = consolidator
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle incoming text message, stickers, and emojis."""
@@ -1015,6 +1020,14 @@ class MessageHandler:
         # Save conversation
         await self.conversations.save_conversation(conversation)
 
+        # Arm the consolidator idle timer — fires a distilled-fact extraction
+        # after `consolidator_idle_seconds` of inactivity in this topic.
+        if self.consolidator is not None:
+            try:
+                self.consolidator.schedule_if_idle(chat_id, topic_id)
+            except Exception as e:
+                logger.warning("consolidator_schedule_failed", error=str(e))
+
         # Send response (split if too long). Routes through sendRichMessage
         # when the response contains a GFM table, else HTML fallback.
         try:
@@ -1211,6 +1224,12 @@ class MessageHandler:
         # Save conversation
         await self.conversations.save_conversation(conversation)
 
+        if self.consolidator is not None:
+            try:
+                self.consolidator.schedule_if_idle(chat_id, topic_id)
+            except Exception as e:
+                logger.warning("consolidator_schedule_failed", error=str(e))
+
     async def _notify_delivery_failure(self, bot, chat_id: int, topic_id: int):
         """Best-effort notice when a generated response could not be delivered to Telegram."""
         try:
@@ -1397,6 +1416,12 @@ class MessageHandler:
 
         # Save conversation
         await self.conversations.save_conversation(conversation)
+
+        if self.consolidator is not None:
+            try:
+                self.consolidator.schedule_if_idle(chat_id, topic_id)
+            except Exception as e:
+                logger.warning("consolidator_schedule_failed", error=str(e))
 
         # Send response in the topic. Routes through sendRichMessage when
         # the response contains a GFM table, else HTML fallback.
@@ -1585,3 +1610,9 @@ class MessageHandler:
 
         # Save conversation
         await self.conversations.save_conversation(conversation)
+
+        if self.consolidator is not None:
+            try:
+                self.consolidator.schedule_if_idle(chat_id, topic_id)
+            except Exception as e:
+                logger.warning("consolidator_schedule_failed", error=str(e))
