@@ -1137,9 +1137,12 @@ class HolmesService:
         "search_memory retrieves facts from the bot's knowledge memory. Use it in one "
         "of two mutually-exclusive contexts:\n"
         "\n"
-        "Context A — General-knowledge question (NO active incident): call search_memory "
-        "FIRST, before any investigative tool. Apply this when the user asks about "
-        "architecture, conventions, runbooks, how something works, or any MFKE/Gardener/"
+        "Context A — General-knowledge question (NO active incident): the whole "
+        "knowledge memory is normally already in your context (see the "
+        "'KNOWLEDGE MEMORY' block above). Call search_memory FIRST only when that "
+        "block is missing (cold cache / memory disabled) OR you want a focused "
+        "subset by keyword. Apply this when the user asks about architecture, "
+        "conventions, runbooks, how something works, or any MFKE/Gardener/"
         "OpenStack/k8s topic that does not require live cluster access. If results are "
         "relevant, answer from them. If not, you may then fall back to investigative tools.\n"
         "\n"
@@ -1156,6 +1159,15 @@ class HolmesService:
         "\n"
         "Use the returned facts if relevant; ignore them if not. Cite them in your "
         "answer only if they actually contributed."
+    )
+
+    _MEMORY_FACTS_HEADER = (
+        "\n\n--- KNOWLEDGE MEMORY (whole graph dump) ---\n"
+        "The following facts are from the bot's persistent knowledge memory. "
+        "They are already in your context — you do NOT need to call "
+        "search_memory to access them. Call search_memory only if you suspect "
+        "this list is stale (a /addmemory just ran) or want a focused subset "
+        "by keyword.\n"
     )
 
     def _build_holmes_messages(
@@ -1191,6 +1203,23 @@ class HolmesService:
         # preserved (the rule goes after, not replacing them).
         if getattr(bot_config, "graphiti_memory_enabled", False):
             additions = (additions + self._MEMORY_TOOL_RULE).strip()
+            # Inject the whole knowledge graph as a facts block. The cache
+            # is refreshed on a 5-min TTL by MemoryService (background, on
+            # the dedicated memory loop). On a cold cache (just-started
+            # bot before the priming refresh completes), get_cached_facts_sync
+            # returns [] and the block is skipped so the LLM doesn't see
+            # an empty "facts: " section.
+            facts = (
+                self._memory.get_cached_facts_sync()
+                if self._memory is not None
+                else []
+            )
+            if facts:
+                additions = (
+                    additions
+                    + self._MEMORY_FACTS_HEADER
+                    + "\n".join(f"- {f}" for f in facts)
+                )
         # The file rule is always on: without it the model answers "give me an
         # xlsx" by pasting rows into the chat, which is what this feature fixes.
         additions = (additions + self._file_output_rule()).strip()

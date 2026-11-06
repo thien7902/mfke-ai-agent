@@ -21,8 +21,9 @@ import datetime
 import logging
 import os
 import threading
+import time
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import structlog
 
@@ -79,6 +80,14 @@ class MemoryService:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
         self._loop_lock = threading.Lock()
+
+        # Whole-graph facts cache: (timestamp, facts). Refreshed on a 5-min
+        # TTL, served to HolmesService._build_holmes_messages as a system
+        # prompt block. Refresh runs in a background thread (memory loop) so
+        # the sync caller never blocks on FalkorDB.
+        self._facts_cache: Optional[Tuple[float, List[str]]] = None
+        self._facts_refresh_in_flight: bool = False
+        self._facts_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # Loop management
@@ -192,6 +201,16 @@ class MemoryService:
                         mode=bot_config.graphiti_falkor_mode,
                         group_id=bot_config.graphiti_group_id)
 
+            # Prime the whole-graph facts cache so the first LLM turn after
+            # startup has facts in the system prompt instead of an empty
+            # block. Failures here are logged inside _fetch_all_facts_on_loop
+            # and don't fail initialization — the cache just stays empty
+            # and the first turn's facts block is skipped.
+            try:
+                await self._fetch_all_facts_on_loop()
+            except Exception:
+                pass
+
     def _build_embedder(self, OpenAIEmbedder, OpenAIEmbedderConfig):
         embedder_config = OpenAIEmbedderConfig(
             api_key=os.environ.get("OPENAI_API_KEY"),
@@ -294,6 +313,126 @@ class MemoryService:
 
     async def _extract_keywords(self, query: str) -> str:
         return query
+
+    # ------------------------------------------------------------------ #
+    # Whole-graph facts cache (system-prompt injection path)
+    # ------------------------------------------------------------------ #
+    #
+    # `HolmesService._build_holmes_messages` is sync and runs on the main
+    # loop thread. It needs the current fact set without blocking on a
+    # FalkorDB round-trip. `get_cached_facts_sync` is the sync entry: it
+    # returns the cached snapshot immediately and, when stale, schedules
+    # a background refresh on the dedicated memory loop. The refresh
+    # thread writes the new snapshot via `_write_facts_cache`; the next
+    # sync caller sees it.
+    #
+    # Async callers (tests, explicit re-query) use `dump_all_facts` which
+    # bypasses the cache and fetches on the dedicated loop.
+
+    async def dump_all_facts(self) -> List[str]:
+        """Bypass the cache and fetch all facts from the graph now.
+
+        Used by tests and explicit re-query paths. Runs the fetch on the
+        dedicated memory loop via `_run_async` (Graphiti's connections are
+        bound to that loop). Auto-initializes if needed; returns [] when
+        memory is disabled or the fetch fails.
+        """
+        if not bot_config.graphiti_memory_enabled:
+            return []
+        if not self._initialized:
+            try:
+                await self.initialize()
+            except Exception as e:
+                logger.warning("dump_all_facts_init_failed",
+                               error=str(e), error_type=type(e).__name__)
+                return []
+        return await self._run_async(self._fetch_all_facts_on_loop())
+
+    async def _fetch_all_facts_on_loop(self) -> List[str]:
+        """Run on the dedicated memory loop. Loads every EntityEdge for the
+        bot's group_id and returns the `fact` text of each. Updates the
+        cache as a side-effect."""
+        if not bot_config.graphiti_memory_enabled or not self._graphiti:
+            return []
+        try:
+            from graphiti_core.edges import EntityEdge
+        except Exception as e:
+            logger.warning("memory_facts_import_failed",
+                           error=str(e), error_type=type(e).__name__)
+            return self._facts_cache[1] if self._facts_cache else []
+        try:
+            edges = await EntityEdge.get_by_group_ids(
+                driver=self._graphiti.driver,
+                group_ids=[bot_config.graphiti_group_id],
+            )
+            facts = [e.fact for e in edges if getattr(e, "fact", None)]
+            self._write_facts_cache(facts)
+            logger.info("memory_facts_dumped", num_facts=len(facts))
+            return facts
+        except Exception as e:
+            logger.warning("memory_facts_dump_failed",
+                           error=str(e), error_type=type(e).__name__)
+            # Leave the previous snapshot intact so a transient FalkorDB
+            # blip doesn't wipe the prompt's facts block.
+            return self._facts_cache[1] if self._facts_cache else []
+
+    def get_cached_facts_sync(self, max_age_seconds: int = 300) -> List[str]:
+        """Return the cached fact snapshot if within TTL; otherwise kick off
+        a background refresh and return the prior snapshot (or []). Never
+        blocks on FalkorDB — the LLM turn is never delayed by the refresh.
+        """
+        if not bot_config.graphiti_memory_enabled:
+            return []
+        # If graphiti is not initialized yet (or the priming fetch hasn't
+        # completed), there's no snapshot to serve. Don't schedule a refresh
+        # here — `initialize()` primes the cache during startup.
+        if self._graphiti is None:
+            return []
+        with self._facts_lock:
+            ts: Optional[float] = None
+            facts: Optional[List[str]] = None
+            if self._facts_cache is not None:
+                ts, facts = self._facts_cache
+            refresh_due = ts is None or (time.time() - ts) > max_age_seconds
+            if refresh_due and not self._facts_refresh_in_flight:
+                self._facts_refresh_in_flight = True
+                self._schedule_facts_refresh_unlocked()
+            return list(facts) if facts else []
+
+    def _write_facts_cache(self, facts: List[str]) -> None:
+        with self._facts_lock:
+            self._facts_cache = (time.time(), list(facts))
+
+    async def invalidate_facts_cache(self) -> None:
+        """Mark the facts cache as stale without wiping the snapshot.
+
+        Called by `/addmemory` after a successful episode ingest. The next
+        `get_cached_facts_sync` will trigger a background refresh and serve
+        the previous snapshot until the new one is ready.
+        """
+        with self._facts_lock:
+            if self._facts_cache is not None:
+                self._facts_cache = (0.0, self._facts_cache[1])
+
+    def _schedule_facts_refresh_unlocked(self) -> None:
+        """Fire-and-forget refresh. Caller MUST hold `_facts_lock` and have
+        already set `_facts_refresh_in_flight=True`. Spawns a daemon thread
+        that runs the fetch on the memory loop and clears the in-flight
+        flag in finally."""
+        def _runner():
+            try:
+                self._run(self._fetch_all_facts_on_loop(), timeout=30)
+            except Exception as e:
+                logger.warning("memory_facts_refresh_failed",
+                               error=str(e), error_type=type(e).__name__)
+            finally:
+                with self._facts_lock:
+                    self._facts_refresh_in_flight = False
+        threading.Thread(
+            target=_runner,
+            name="memory-facts-refresh",
+            daemon=True,
+        ).start()
 
     async def add_episode(
         self,
@@ -404,6 +543,10 @@ class MemoryService:
                 logger.warning("graphiti_close_failed", error=str(e))
         self._graphiti = None
         self._initialized = False
+        # Drop the facts cache snapshot so the next init primes fresh.
+        with self._facts_lock:
+            self._facts_cache = None
+            self._facts_refresh_in_flight = False
         # Stop the dedicated loop
         if self._loop is not None and not self._loop.is_closed():
             try:

@@ -164,6 +164,15 @@ class AddMemoryCommand:
                 )
 
         if ok_ids:
+            # Invalidate the facts-cache snapshot so the next LLM turn sees
+            # the freshly-ingested facts. Refresh runs in the background on
+            # the memory loop — this call does not block on FalkorDB.
+            if self._memory is not None:
+                try:
+                    await self._memory.invalidate_facts_cache()
+                except Exception as e:
+                    logger.warning("addmemory_invalidate_failed",
+                                    error=str(e), error_type=type(e).__name__)
             preview = text[:80].replace("\n", " ")
             summary = (
                 f"✅ Added {len(ok_ids)}/{len(chunks)} chunk(s) to memory "
