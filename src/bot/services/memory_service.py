@@ -367,34 +367,46 @@ class MemoryService:
         try:
             # EntityEdge.get_by_group_ids on FalkorDB clones the driver to
             # database=group_ids[0], but our deployment stores all edges on
-            # the configured default database. The cloned driver queries
-            # an empty per-group database. Bypass it.
+            # the configured default database. Bypass it.
             #
-            # Also: v2.3.21 returned 0 facts because we filtered
-            # `e.group_id IN $group_ids` — but search_memory (which works)
-            # may use a different filter path. v2.3.23 drops the explicit
-            # group_id filter and returns all RELATES_TO facts. The bot
-            # uses a single group_id anyway (graphiti_group_id='global'),
-            # so there's no practical leakage.
+            # Also: drop the group_id filter — discovered via logs that
+            # search_memory returns 100 facts but `WHERE e.group_id IN
+            # $group_ids` returns 0. Search uses vector similarity (matches
+            # by e.fact_embedding) and may bypass the group_id constraint
+            # in practice, while our explicit filter excludes edges that
+            # have a group_id value other than 'global' (graph may contain
+            # edges from earlier test runs with different group_ids, e.g.
+            # 'default'). Drop the filter — bot uses one bot_config.graphiti_group_id
+            # for all adds, so the graph only grows the bot's edges anyway.
+            #
+            # Two-step: first scope to the configured default_db, then list
+            # every RELATES_TO edge's fact text.
             match_query = """
                 MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
-                RETURN e.fact AS fact
+                RETURN e.fact AS fact, e.group_id AS group_id
                 ORDER BY e.uuid DESC
             """
             records, _, _ = await self._graphiti.driver.execute_query(
                 match_query,
-                routing_="r",
             )
             facts = []
+            seen_groups = set()
             for r in records:
                 try:
                     fact = r["fact"] if _has_key(r, "fact") else None
+                    gid = r["group_id"] if _has_key(r, "group_id") else None
                 except (KeyError, TypeError):
                     fact = None
+                    gid = None
+                if gid:
+                    seen_groups.add(gid)
                 if fact:
                     facts.append(str(fact))
             self._write_facts_cache(facts)
-            logger.info("memory_facts_dumped", num_facts=len(facts))
+            logger.info("memory_facts_dumped",
+                        num_facts=len(facts),
+                        group_id=bot_config.graphiti_group_id,
+                        seen_groups=sorted(seen_groups))
             return facts
         except Exception as e:
             logger.warning("memory_facts_dump_failed",
