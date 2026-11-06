@@ -1292,19 +1292,29 @@ class CommandHandler:
             pass
 
         try:
-            await send_long_message(
+            from src.bot.utils.rich_message import send_rich_reply
+            await send_rich_reply(
                 context.bot,
-                chat_id,
-                response,
+                chat_id=chat_id,
+                text=response,
                 message_thread_id=topic_id or None,
             )
         except Exception as e:
-            logger.warning("Failed to deliver /claude response", user_id=user.id, error=str(e))
+            logger.warning("Failed to deliver /claude response rich, retrying plain", user_id=user.id, error=str(e))
             try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="⚠️ The enterprise response was generated but couldn't be delivered. Please try again.",
+                await send_long_message(
+                    context.bot,
+                    chat_id,
+                    response,
                     message_thread_id=topic_id or None,
                 )
-            except Exception:
-                pass
+            except Exception as e2:
+                logger.error("/claude response delivery failed entirely", user_id=user.id, error=str(e2))
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="⚠️ The enterprise response was generated but couldn't be delivered. Please try again.",
+                        message_thread_id=topic_id or None,
+                    )
+                except Exception:
+                    pass
