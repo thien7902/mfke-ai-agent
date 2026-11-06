@@ -351,11 +351,14 @@ class MemoryService:
     async def _fetch_all_facts_on_loop(self) -> List[str]:
         """Run on the dedicated memory loop. Loads every EntityEdge for the
         bot's group_id and returns the `fact` text of each. Updates the
-        cache as a side-effect."""
+        cache as a side-effect. Treats 'no edges for group' as an empty
+        graph (cache = []) so the facts-block is skipped cleanly until
+        /addmemory adds something — not as a fetch failure."""
         if not bot_config.graphiti_memory_enabled or not self._graphiti:
             return []
         try:
             from graphiti_core.edges import EntityEdge
+            from graphiti_core.errors import GroupsEdgesNotFoundError
         except Exception as e:
             logger.warning("memory_facts_import_failed",
                            error=str(e), error_type=type(e).__name__)
@@ -369,6 +372,15 @@ class MemoryService:
             self._write_facts_cache(facts)
             logger.info("memory_facts_dumped", num_facts=len(facts))
             return facts
+        except GroupsEdgesNotFoundError:
+            # Empty graph (no edges in this group yet). Cache an empty
+            # list so the next TTL window doesn't keep retrying every
+            # turn — and so /addmemory's invalidation can flip the
+            # cache to "has facts" cleanly once edges exist.
+            self._write_facts_cache([])
+            logger.info("memory_facts_empty_graph",
+                        group_id=bot_config.graphiti_group_id)
+            return []
         except Exception as e:
             logger.warning("memory_facts_dump_failed",
                            error=str(e), error_type=type(e).__name__)

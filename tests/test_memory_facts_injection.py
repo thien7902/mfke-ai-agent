@@ -171,6 +171,32 @@ async def test_fetch_all_facts_on_loop_failure_preserves_prior_cache():
     assert facts == ["previously cached"], "cache must NOT be wiped on failure"
 
 
+@pytest.mark.asyncio
+async def test_fetch_all_facts_on_loop_empty_graph_caches_empty_list():
+    """GroupsEdgesNotFoundError (empty graph) is treated as a valid empty
+    state — cache becomes (ts, []) so subsequent turns don't retry every
+    tick. Distinct from a real failure which preserves the prior snapshot."""
+    from graphiti_core.errors import GroupsEdgesNotFoundError
+    svc = _make_memory_service_stub()
+    svc._write_facts_cache(["stale from before"])  # prior snapshot exists
+    svc._graphiti = MagicMock()
+    svc._graphiti.driver = MagicMock()
+
+    with patch("graphiti_core.edges.EntityEdge") as EntityEdge, \
+         patch("graphiti_core.errors.GroupsEdgesNotFoundError",
+               GroupsEdgesNotFoundError):
+        from unittest.mock import AsyncMock
+        EntityEdge.get_by_group_ids = AsyncMock(
+            side_effect=GroupsEdgesNotFoundError("no edges")
+        )
+        result = await svc._fetch_all_facts_on_loop()
+    assert result == []
+    with svc._facts_lock:
+        ts, facts = svc._facts_cache
+    assert facts == [], "empty graph must overwrite prior snapshot with []"
+    assert ts > 0, "timestamp must refresh so TTL window resets"
+
+
 # ---------- HolmesService._build_holmes_messages injection ----------
 
 def _make_holmes_service_stub(memory_service=None):
