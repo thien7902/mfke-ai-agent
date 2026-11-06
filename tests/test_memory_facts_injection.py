@@ -128,24 +128,22 @@ async def test_invalidate_facts_cache_no_op_when_cache_is_none():
 
 @pytest.mark.asyncio
 async def test_fetch_all_facts_on_loop_extracts_fact_from_edges():
-    """v2.3.22: query just `e.fact` from RELATES_TO edges. Skip Graphiti's
-    entity_edge_from_record parser (expects specific record structure
-    that FalkorDB may not return). Facts straight from records."""
+    """v2.3.25: use Graphiti's own search() API (same path search_memory uses
+    successfully) instead of a direct Cypher query that bypasses the
+    RediSearch index. Bypass the cache filter by using a broad query."""
     svc = _make_memory_service_stub()
     svc._graphiti = MagicMock()
-    driver = MagicMock()
-    driver.provider = "falkordb"
-    # Records: simple dicts with only the 'fact' key. No need for
-    # created_at/uuid/etc. since we don't parse to EntityEdge anymore.
-    records = [
-        {"fact": "acme runs k8s 1.29"},
-        {"fact": "gardener shoots seeds"},
-        {"fact": ""},   # empty fact filtered out
-        {"fact": None},  # null fact filtered out
-    ]
-    driver.execute_query = AsyncMock(return_value=(records, None, None))
-    svc._graphiti.driver = driver
 
+    class _FakeEdge:
+        def __init__(self, fact):
+            self.fact = fact
+
+    fake_edges = [_FakeEdge("acme runs k8s 1.29"),
+                  _FakeEdge("gardener shoots seeds"),
+                  _FakeEdge(""),       # empty fact filtered out
+                  _FakeEdge(None)]     # null fact filtered out
+
+    svc._graphiti.search = AsyncMock(return_value=fake_edges)
     facts = await svc._fetch_all_facts_on_loop()
     assert facts == ["acme runs k8s 1.29", "gardener shoots seeds"]
     assert svc._facts_cache is not None
@@ -173,16 +171,13 @@ async def test_fetch_all_facts_on_loop_failure_preserves_prior_cache():
 
 @pytest.mark.asyncio
 async def test_fetch_all_facts_on_loop_empty_graph_caches_empty_list():
-    """Empty result (no edges in this group) caches (ts, []) so subsequent
+    """Empty result (search returns no edges) caches (ts, []) so subsequent
     turns don't retry every tick. Distinct from a real failure which
     preserves the prior snapshot."""
     svc = _make_memory_service_stub()
     svc._write_facts_cache(["stale from before"])  # prior snapshot exists
     svc._graphiti = MagicMock()
-    driver = MagicMock()
-    driver.provider = "falkordb"
-    driver.execute_query = AsyncMock(return_value=([], None, None))
-    svc._graphiti.driver = driver
+    svc._graphiti.search = AsyncMock(return_value=[])
 
     result = await svc._fetch_all_facts_on_loop()
     assert result == []

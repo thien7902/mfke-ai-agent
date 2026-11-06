@@ -369,44 +369,36 @@ class MemoryService:
             # database=group_ids[0], but our deployment stores all edges on
             # the configured default database. Bypass it.
             #
-            # Also: drop the group_id filter — discovered via logs that
-            # search_memory returns 100 facts but `WHERE e.group_id IN
-            # $group_ids` returns 0. Search uses vector similarity (matches
-            # by e.fact_embedding) and may bypass the group_id constraint
-            # in practice, while our explicit filter excludes edges that
-            # have a group_id value other than 'global' (graph may contain
-            # edges from earlier test runs with different group_ids, e.g.
-            # 'default'). Drop the filter — bot uses one bot_config.graphiti_group_id
-            # for all adds, so the graph only grows the bot's edges anyway.
+            # v2.3.24 returned 0 facts with `MATCH (n:Entity)-[e:RELATES_TO]
+            # ->(m:Entity) RETURN e.fact` — even though search_memory (using
+            # RediSearch fulltext on edges) returned 100 facts. This means
+            # the Cypher MATCH on the RELATES_TO relationship type doesn't
+            # see the same data the fulltext index sees. Either:
+            #   (a) edges are stored under a different label, or
+            #   (b) the embedded redislite file is out of sync, or
+            #   (c) the data lives in a different database.
             #
-            # Two-step: first scope to the configured default_db, then list
-            # every RELATES_TO edge's fact text.
-            match_query = """
-                MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
-                RETURN e.fact AS fact, e.group_id AS group_id
-                ORDER BY e.uuid DESC
-            """
-            records, _, _ = await self._graphiti.driver.execute_query(
-                match_query,
+            # v2.3.25 falls back to using Graphiti's own search() with a
+            # broad query ('*' or empty string) — same API that
+            # search_memory uses successfully. If this returns 0 too,
+            # the cache issue is elsewhere.
+            from graphiti_core.search.search_config import SearchConfig
+            from graphiti_core.search.search_config_recipes import (
+                EDGE_HYBRID_SEARCH_RRF,
             )
-            facts = []
-            seen_groups = set()
-            for r in records:
-                try:
-                    fact = r["fact"] if _has_key(r, "fact") else None
-                    gid = r["group_id"] if _has_key(r, "group_id") else None
-                except (KeyError, TypeError):
-                    fact = None
-                    gid = None
-                if gid:
-                    seen_groups.add(gid)
-                if fact:
-                    facts.append(str(fact))
+            config = SearchConfig(**EDGE_HYBRID_SEARCH_RRF.model_dump())
+            config.limit = 500  # cap to keep prompt manageable
+            edges = await self._graphiti.search(
+                query="*",
+                group_ids=[bot_config.graphiti_group_id],
+                num_results=500,
+            )
+            facts = [e.fact for e in edges if getattr(e, "fact", None)]
             self._write_facts_cache(facts)
             logger.info("memory_facts_dumped",
                         num_facts=len(facts),
                         group_id=bot_config.graphiti_group_id,
-                        seen_groups=sorted(seen_groups))
+                        via="search")
             return facts
         except Exception as e:
             logger.warning("memory_facts_dump_failed",
