@@ -99,11 +99,6 @@ class Config:
     # Group id used when ingesting /addmemory episodes. All global knowledge
     # shares one group so search is cross-conversation.
     graphiti_group_id: str = "global"
-    # Cap on the number of facts injected into the system prompt at every
-    # turn (KNOWLEDGE MEMORY block). Each fact averages ~80 chars so 1000
-    # facts → ~80k chars. Increase via GRAPHITI_MEMORY_FACTS_LIMIT if your
-    # graph is larger and your model has the context headroom.
-    graphiti_memory_facts_limit: int = 1000
     # Embedder: must match the model served at the OpenAI-compatible endpoint
     # configured via OPENAI_API_BASE / OPENAI_API_KEY. Vietnamese_Embedding
     # (aiteamvn/vietnamese-embedding) — produces 1024-dim vectors.
@@ -160,9 +155,6 @@ def load_config() -> Config:
         graphiti_falkor_port=int(os.getenv("GRAPHITI_FALKOR_PORT", "6379")),
         graphiti_falkor_database=os.getenv("GRAPHITI_FALKOR_DATABASE", "default_db"),
         graphiti_group_id=os.getenv("GRAPHITI_GROUP_ID", "global"),
-        graphiti_memory_facts_limit=int(
-            os.getenv("GRAPHITI_MEMORY_FACTS_LIMIT", "1000")
-        ),
         graphiti_embedding_model=os.getenv("GRAPHITI_EMBEDDING_MODEL", "Vietnamese_Embedding"),
         graphiti_embedding_dim=int(os.getenv("GRAPHITI_EMBEDDING_DIM", "1024")),
         cluster_probe_enabled=os.getenv("CLUSTER_PROBE_ENABLED", "").lower() in ("1", "true", "yes", "on"),
