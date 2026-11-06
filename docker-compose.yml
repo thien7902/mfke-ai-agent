@@ -17,6 +17,7 @@ services:
       retries: 5
 
   bot:
+    image: thienlm204608/mfke-ai-telegram-bot:${VERSION:-latest}
     build: .
     container_name: telegram-bot
     env_file:
