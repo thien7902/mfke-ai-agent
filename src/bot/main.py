@@ -183,6 +183,10 @@ class TelegramBot:
         # when empty (all reads return []).
         from src.bot.services.distilled_fact_store import DistilledFactStore
         self.distilled_fact_store = DistilledFactStore()
+        # Kick off the background dedup cache so each Holmes turn reads
+        # O(1) from memory instead of paying multi-second cosine cost.
+        # No-op when DISTILLED_DEDUP_CACHE_SECONDS=0 (config-disabled).
+        self.distilled_fact_store.start_background_refresh()
 
         # KBStore (MongoDB `kb_rules`) — distilled if-then rules from the
         # FPT Container KB. Built unconditionally: when KB_ENABLED=false
@@ -481,6 +485,10 @@ class TelegramBot:
             except Exception as e:
                 logger.warning("consolidator_stop_failed", error=str(e))
             self.consolidator_service = None
+
+        if self.distilled_fact_store:
+            self.distilled_fact_store.stop_background_refresh()
+            self.distilled_fact_store = None
 
         # Stop the cluster probe task before the Holmes executor shuts down
         # so the probe's subprocesses don't outlive the executor they were

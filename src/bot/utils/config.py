@@ -147,6 +147,12 @@ class Config:
     # system-prompt bullets. 0 disables dedup (~1.0 = only drop exact twins).
     # 0.92 is a conservative floor for BGE-m3 on Vietnamese paragraph facts.
     distilled_dedup_cosine: float = 0.92
+    # How often (seconds) the background thread rebuilds the deduplicated
+    # injectable-facts snapshot. With this on, each Holmes turn reads O(1)
+    # from an in-memory cache instead of paying O(N²×1024) cosine cost.
+    # 0 disables the background loop and falls back to "recompute per call"
+    # (legacy behavior, multi-second latency for ~1k facts).
+    distilled_dedup_cache_seconds: int = 60
 
     # Known-issues KB (FPT Container). Disabled by default. Enable after
     # running `python -m scripts.ingest_kb_docx <docx path>` once to seed
@@ -217,6 +223,7 @@ def load_config() -> Config:
         consolidator_max_concurrent=int(os.getenv("CONSOLIDATOR_MAX_CONCURRENT", "5")),
         consolidator_llm_timeout_seconds=int(os.getenv("CONSOLIDATOR_LLM_TIMEOUT_SECONDS", "60")),
         distilled_dedup_cosine=float(os.getenv("DISTILLED_DEDUP_COSINE", "0.92")),
+        distilled_dedup_cache_seconds=int(os.getenv("DISTILLED_DEDUP_CACHE_SECONDS", "60")),
         kb_enabled=os.getenv("KB_ENABLED", "").lower() in ("1", "true", "yes", "on"),
         kb_top_k=int(os.getenv("KB_TOP_K", "50")),
         kb_distill_model=os.getenv("KB_DISTILL_MODEL") or os.getenv("CONSOLIDATOR_MODEL") or None,

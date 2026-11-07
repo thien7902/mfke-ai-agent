@@ -254,3 +254,59 @@ async def test_add_continues_without_embedding_on_embed_failure():
     assert added is True
     inserted = facts.insert_one.call_args[0][0]
     assert inserted["embedding"] is None
+
+
+def test_get_injectable_facts_serves_cached_snapshot_skips_dedup():
+    """When background refresh has populated the cache, get_injectable_facts
+    reads O(1) from memory — must NOT touch Mongo's `find` or call
+    _dedup_facts_by_cosine again."""
+    facts = MagicMock()
+    runs = MagicMock()
+    runs.find.return_value = iter([])  # would yield empty list
+    store = _store_with(facts=facts, runs=runs)
+    cached = [{"text": "cached fact alpha", "source_run_id": "r1"}]
+    store._injectable_cache = list(cached)
+
+    out = store.get_injectable_facts()
+
+    assert out == cached
+    # Mongo projections weren't touched this turn — the cache served fast path.
+    runs.find.assert_not_called()
+    facts.find.assert_not_called()
+
+
+def test_record_run_pokes_refresh_event():
+    """record_run must set the refresh event after a successful update_one
+    so the background thread rebuilds the cache within seconds rather
+    than waiting for the next tick."""
+    runs = MagicMock()
+    runs.update_one.return_value = MagicMock(modified_count=1)
+    store = _store_with(runs=runs)
+    assert not store._refresh_event.is_set()
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(
+        store.record_run(chat_id=20, topic_id=10, run_id="r1", last_distilled_count=12)
+    )
+    assert store._refresh_event.is_set()
+
+
+def test_refresh_snapshot_rebuilds_cache():
+    """_refresh_snapshot calls _fetch_injectable_facts_raw and stores the
+    result into _injectable_cache under the lock."""
+    facts = MagicMock()
+    runs = MagicMock()
+    runs.find.return_value = [{"latest_run_id": "r1", "topic_id": 5}]
+    cursor = MagicMock()
+    cursor.sort.return_value = iter([
+        {"text": "fact A", "embedding": [1.0, 0.0], "source_run_id": "r1", "created_at": 1},
+    ])
+    facts.find.return_value = cursor
+    store = _store_with(facts=facts, runs=runs)
+
+    with patch.object(dfs_mod.bot_config, "distilled_dedup_cosine", 0.0):
+        store._refresh_snapshot()
+
+    assert store._injectable_cache == [
+        {"text": "fact A", "embedding": [1.0, 0.0], "source_run_id": "r1", "created_at": 1},
+    ]
+

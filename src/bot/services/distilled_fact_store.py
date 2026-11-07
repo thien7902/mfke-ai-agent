@@ -26,6 +26,8 @@ consolidator log surface gets the warning; user-visible behavior is
 """
 import datetime
 import math
+import threading
+import time
 from typing import List, Optional
 
 import structlog
@@ -137,6 +139,157 @@ class DistilledFactStore:
     def __init__(self):
         self._facts: Optional[Collection] = None
         self._runs: Optional[Collection] = None
+        # In-memory snapshot of the deduplicated injectable facts —
+        # refreshed by a background thread (see `_refresh_loop`). Each
+        # `get_injectable_facts()` call reads this snapshot in O(1) so the
+        # per-request prompt build never pays the cosine dedup cost
+        # (was O(N²×1024) Python pure — multi-second for ~1k facts).
+        self._injectable_cache: List[dict] = []
+        self._cache_lock = threading.Lock()
+        # Signaling refresh thread — `record_run` pokes this to skip the
+        # wait and rebuild the snapshot immediately after a new run lands.
+        self._refresh_event = threading.Event()
+        # Refresh interval — defaults to 60s; 0 disables the background
+        # loop and falls back to "recompute per call" (legacy behavior).
+        self._refresh_seconds: float = float(
+            getattr(bot_config, "distilled_dedup_cache_seconds", 60) or 0
+        )
+        self._refresh_thread: Optional[threading.Thread] = None
+        self._started = False
+
+    def start_background_refresh(self) -> None:
+        """Launch the background refresh thread. Idempotent. Called from
+        `main.py` after the DistilledFactStore is constructed — no-op when
+        `_refresh_seconds` is 0 (config disables background refresh).
+        First call does an immediate sync rebuild so the first user turn
+        after bot startup doesn't stall waiting on the cache."""
+        if self._started or self._refresh_seconds <= 0:
+            return
+        self._started = True
+        self._refresh_thread = threading.Thread(
+            target=self._refresh_loop,
+            name="distilled-facts-refresh",
+            daemon=True,
+        )
+        self._refresh_thread.start()
+        logger.info(
+            "distilled_facts_refresh_started",
+            refresh_seconds=self._refresh_seconds,
+        )
+
+    def stop_background_refresh(self) -> None:
+        """Signal the background thread to stop on next loop tick. Used
+        by tests / graceful shutdown — the thread is daemon so a hard
+        process exit will kill it anyway. Idempotent."""
+        self._started = False
+        self._refresh_event.set()
+
+    def _refresh_loop(self) -> None:
+        """Background dedup pass: rebuild the injectable snapshot,
+        sleep `_refresh_seconds`, repeat. Early-wake on
+        `_refresh_event.set()` triggered by `record_run` so a new
+        distillation is reflected within seconds rather than the full
+        interval. Failures during a single refresh are logged and waited
+        out — the loop must keep trying so a blip doesn't permanently
+        leave the bot with stale or empty facts.
+        """
+        # First pass — synchronous-feel so the first user turn doesn't
+        # hit an empty cache.
+        try:
+            self._refresh_snapshot()
+        except Exception as e:
+            logger.warning(
+                "distilled_facts_refresh_initial_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+        while self._started:
+            # Reset BEFORE sleeping so a record_run poke arriving during
+            # sleep wakes us promptly.
+            self._refresh_event.clear()
+            # Sleep in small slices so stop_background_refresh takes effect
+            # quickly rather than waiting for the full interval.
+            slept = 0.0
+            while self._started and slept < self._refresh_seconds:
+                if self._refresh_event.wait(timeout=1.0):
+                    break
+                slept += 1.0
+            try:
+                self._refresh_snapshot()
+            except Exception as e:
+                logger.warning(
+                    "distilled_facts_refresh_failed",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+
+    def _refresh_snapshot(self) -> None:
+        """Rebuild `_injectable_cache` from MongoDB + cosine dedup.
+        Reuses `_fetch_injectable_facts_raw` for the DB read + dedup
+        pipeline; writes the result atomically under `_cache_lock`.
+        """
+        snapshot = self._fetch_injectable_facts_raw(force_recompute=True)
+        with self._cache_lock:
+            self._injectable_cache = snapshot
+
+    def _fetch_injectable_facts_raw(self, force_recompute: bool = False) -> List[dict]:
+        """The original inject path — read latest-run facts, dedup by
+        cosine, return the list. Called either from `_refresh_snapshot`
+        (background thread, every N seconds) or from
+        `get_injectable_facts` (fallback path when background refresh
+        is disabled OR cache is empty on first call)."""
+        try:
+            latest_runs = list(
+                self.runs.find({}, {"_id": 0, "latest_run_id": 1, "topic_id": 1})
+            )
+            if not latest_runs:
+                return []
+            run_ids = [r["latest_run_id"] for r in latest_runs if r.get("latest_run_id")]
+            if not run_ids:
+                return []
+            cursor = (
+                self.facts.find(
+                    {"source_run_id": {"$in": run_ids}},
+                    {
+                        "_id": 0,
+                        "text": 1,
+                        "embedding": 1,
+                        "source_topic_id": 1,
+                        "source_run_id": 1,
+                        "created_at": 1,
+                    },
+                )
+                .sort("created_at", ASCENDING)
+            )
+            facts = list(cursor)
+        except Exception as e:
+            logger.warning(
+                "distilled_facts_get_injectable_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return []
+
+        threshold = getattr(bot_config, "distilled_dedup_cosine", 0.0) or 0.0
+        if not facts or threshold <= 0.0:
+            return facts
+        try:
+            deduped = _dedup_facts_by_cosine(facts, threshold)
+            if len(deduped) < len(facts):
+                logger.info(
+                    "distilled_facts_deduped",
+                    before=len(facts),
+                    after=len(deduped),
+                    threshold=threshold,
+                )
+            return deduped
+        except Exception as e:
+            logger.warning(
+                "distilled_facts_dedup_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return facts
 
     # ------------------------------------------------------------------ #
     # Lazy collection accessors (mirror ConversationService pattern)
@@ -342,6 +495,13 @@ class DistilledFactStore:
                 topic_id=topic_id,
                 run_id=run_id,
             )
+            return
+        # Poke the background refresh thread so a fresh distillation is
+        # reflected in the injectable cache within seconds rather than
+        # waiting for the next `_refresh_seconds` tick. No-op when the
+        # thread isn't running (the cache will refresh on its next tick
+        # OR via the cold-start path on the next request).
+        self._refresh_event.set()
 
     def get_last_distilled_count(self, chat_id: int, topic_id: int) -> int:
         """Return the persisted message-count checkpoint for this topic,
@@ -405,77 +565,35 @@ class DistilledFactStore:
         """Return facts from the latest run per topic, across all topics,
         with near-duplicate facts deduplicated by cosine similarity.
 
-        Sync — called from the sync ``_build_holmes_messages`` path so the
-        prompt is assembled without an extra thread hop. Returns ``[]`` on
-        any error so the bot keeps working without injected facts this
-        turn. Documents are projected to ``{text, source_topic_id,
-        source_run_id, created_at}`` for the caller.
-
-        Algorithm:
-          1. Read all latest-run pointers from ``distilled_runs`` (one doc
-             per topic), then fetch facts whose ``source_run_id`` is in
-             that set. Older runs' facts stay in ``distilled_facts`` but
-             are filtered out here — this is the "newer run wins per topic"
-             filter.
-          2. Optionally dedup the surviving facts via cosine similarity on
-             their text embeddings (``distilled_dedup_cosine`` threshold).
-             Two facts above the threshold are treated as duplicates; the
-             newest one (per ``created_at``) wins. Dedup failures (embed
-             API down, threshold disabled) fall back to returning the
-             un-deduplicated list — never break the prompt.
+        Sync — called from the sync ``_build_holmes_messages`` path per
+        Holmes turn. **Hot path**: reads straight from an in-memory cache
+        populated by ``_refresh_snapshot()`` (background thread every
+        ``distilled_dedup_cache_seconds``, invalidated on
+        ``record_run()``). O(1) for the caller — no DB read, no cosine
+        dedup. When the cache is empty (first call after bot startup
+        before the refresh thread has run, OR background refresh
+        disabled) it falls back to a synchronous ``_fetch_injectable_facts_raw``
+        call so the prompt is never empty if Mongo works.
         """
-        try:
-            latest_runs = list(
-                self.runs.find({}, {"_id": 0, "latest_run_id": 1, "topic_id": 1})
-            )
-            if not latest_runs:
-                return []
-            run_ids = [r["latest_run_id"] for r in latest_runs if r.get("latest_run_id")]
-            if not run_ids:
-                return []
-            cursor = (
-                self.facts.find(
-                    {"source_run_id": {"$in": run_ids}},
-                    {
-                        "_id": 0,
-                        "text": 1,
-                        "embedding": 1,
-                        "source_topic_id": 1,
-                        "source_run_id": 1,
-                        "created_at": 1,
-                    },
-                )
-                .sort("created_at", ASCENDING)
-            )
-            facts = list(cursor)
-        except Exception as e:
-            logger.warning(
-                "distilled_facts_get_injectable_failed",
-                error=str(e),
-                error_type=type(e).__name__,
-            )
-            return []
-
-        # Dedup pass — fails open (return un-deduplicated list) if the embed
-        # API is unavailable. Failing open means the prompt may carry near-
-        # duplicates for one turn; never breaks the bot.
-        threshold = getattr(bot_config, "distilled_dedup_cosine", 0.0) or 0.0
-        if not facts or threshold <= 0.0:
-            return facts
-        try:
-            deduped = _dedup_facts_by_cosine(facts, threshold)
-            if len(deduped) < len(facts):
-                logger.info(
-                    "distilled_facts_deduped",
-                    before=len(facts),
-                    after=len(deduped),
-                    threshold=threshold,
-                )
-            return deduped
-        except Exception as e:
-            logger.warning(
-                "distilled_facts_dedup_failed",
-                error=str(e),
-                error_type=type(e).__name__,
-            )
-            return facts
+        # Fast path: serve cached snapshot.
+        with self._cache_lock:
+            snapshot = self._injectable_cache
+        if snapshot:
+            return snapshot
+        # Cold start — run the dedup synchronously ONCE so the first
+        # user turn isn't empty. If background refresh is enabled, this
+        # is the same work the refresh thread is about to do; the lock-
+        # guarded write below ensures we don't race the refresh thread.
+        if self._refresh_seconds <= 0:
+            # Background refresh disabled — always compute synchronously
+            # (legacy behavior).
+            return self._fetch_injectable_facts_raw(force_recompute=False)
+        # Background refresh IS enabled but cache is empty — likely the
+        # very first turn before the refresh thread has finished its
+        # initial snapshot. Compute once and seed the cache so subsequent
+        # turns hit the fast path.
+        computed = self._fetch_injectable_facts_raw(force_recompute=False)
+        with self._cache_lock:
+            if not self._injectable_cache:
+                self._injectable_cache = computed
+        return computed
