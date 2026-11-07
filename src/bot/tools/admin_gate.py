@@ -49,7 +49,97 @@ MUTATING_PATTERNS: tuple = (
 )
 
 
+# Healthcare for cluster state: these patterns MUST be blocked regardless of
+# admin status — they destroy native K8s/Gardener resources in a way that
+# cannot be recovered (deleting a node loses the volume调度, editing a
+# protected-namespace configMap can break the control plane, apply -f can
+# re-create arbitrary state). Hard-block wins over admin-gate: even root
+# admins cannot accidentally wipe out seed cluster control plane.
+#
+# Pattern A — `kubectl apply` is globally hard-blocked for ALL arguments
+# (no -f filter): apply mutates cluster state declaratively and the file
+# may contain any resource type. Read-only alternatives (get, describe)
+# are NOT in this list.
+#
+# Pattern B — `kubectl delete <critical_resource>` is blocked regardless
+# of namespace. Critical resources: node, pv, pvc, namespace, crd,
+# clusterrole, service — singular + plural + short forms, case-insensitive.
+# Deleting pod/deploy/sts/etc is allowed (recoverable from spec) — only
+# the "unrecoverable" targets are protected here.
+#
+# Pattern C — any mutating verb (delete/edit/scale/patch/replace/drain)
+# against a protected namespace: kube-system, kube-public, kube-node-lease,
+# garden, gardener-system, extensions, or any namespace prefixed
+# `garden-` (Gardener project/secrets namespaces that hold shoot
+# control-plane wiring). Shoot namespaces (shoot--<project>--<name>) are
+# NOT blocked by user choice — only the garden-* family is.
+
+_CRITICAL_RESOURCE_RE = re.compile(
+    r"^(?:[A-Za-z][\w-]*/)?("
+    r"node|nodes|no|"
+    r"persistentvolume|persistentvolumes|pv|"
+    r"persistentvolumeclaim|persistentvolumeclaims|pvc|"
+    r"namespace|namespaces|ns|"
+    r"customresourcedefinition|customresourcedefinitions|crd|"
+    r"clusterrole|clusterroles|"
+    r"service|services|svc"
+    r")(?:/[A-Za-z][\w-]*)?$",
+    re.IGNORECASE,
+)
+
+# Protected namespace pattern. Accepts both `-n NAME` and `--namespace=NAME`
+# (with optional `=` or whitespace separator). Names: kube-system,
+# kube-public, kube-node-lease, garden, gardener-system, extensions, plus
+# anything starting with `garden-`. `shoot--...` deliberately NOT matched
+# per user choice.
+_PROTECTED_NS_NAME_RE = re.compile(
+    r"\b("
+    r"kube-system|kube-public|kube-node-lease|"
+    r"garden|gardener-system|extensions|"
+    r"garden-[\w-]+"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Match `-n NAME` or `--namespace NAME` or `--namespace=NAME`. Allow the
+# namespace value to appear in the next arg (split on space) or via `=`.
+_NS_FLAG_RE = re.compile(
+    r"(?:-n\s+|--namespace=?)\s*([^\s]+)",
+    re.IGNORECASE,
+)
+
+# Pattern A — kubectl apply (any args, any ns).
+_HARD_BLOCK_APPLY_RE = re.compile(r"^kubectl\s+apply\b", re.IGNORECASE)
+
+# Pattern B — kubectl delete <critical_resource>. The verb comes right
+# after `kubectl`, then resource-type positional. The critical-resource
+# search is anchored to the FIRST positional token after `delete` (using
+# `_extract_positional_resource`) so flag values like `--namespace=kube-node-lease`
+# (which contains "node") and `--namespace=...` (which contains "namespace") do
+# NOT false-positive.
+_HARD_BLOCK_DELETE_RE = re.compile(r"^kubectl\s+delete\b", re.IGNORECASE)
+
+# Resource-type positional token extraction. Skips flags (tokens starting
+# with `-`). Returns the first non-flag token after the verb, or "" if
+# none found. Handles `/`-segregated forms like `pod/foo` and `service/bar`.
+_RESOURCE_TYPE_TOKEN_RE = re.compile(r"^[A-Za-z][\w./-]*$")
+
+# Pattern C — kubectl + mutating verb + protected namespace. Verbs are
+# the destructive verbs that touch cluster state across namespaces:
+# delete/edit/scale/patch/replace/drain. `apply` is handled by Pattern A
+# alone since it is globally blocked.
+_HARD_BLOCK_MUTATING_VERBS_RE = re.compile(
+    r"^kubectl\s+(delete|edit|scale|patch|replace|drain)\b",
+    re.IGNORECASE,
+)
+
+
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
+# Shell command separators we tolerate before the kubectl/helm mutation.
+# `&&`, `||`, `;` — any of these can sit between `export KUBECONFIG=...`
+# and `kubectl delete ...`. We split on each occurrence so blocked segments
+# past a separator still trigger. Aided by `_strip_env_prefix`.
+_SEPARATOR_RE = re.compile(r"(?:&&|\|\||;)")
 
 
 def _strip_env_prefix(cmd: str) -> str:
@@ -72,23 +162,129 @@ def _strip_env_prefix(cmd: str) -> str:
     return s.strip()
 
 
+def _extract_segments(cmd: str) -> list:
+    """Split ``cmd`` on shell separators (``&&``, ``||``, ``;``) into
+    individual sub-commands, each with leading env vars stripped.
+
+    `export KUBECONFIG=/tmp/x && kubectl delete node worker-1` becomes:
+    `["export KUBECONFIG=/tmp/x", "kubectl delete node worker-1"]` — the
+    first segment evaluates as benign (no kubectl/helm verb), the second
+    triggers the mutation pattern.
+    """
+    if not cmd:
+        return []
+    parts = _SEPARATOR_RE.split(cmd)
+    return [_strip_env_prefix(p) for p in parts]
+
+
+def _extract_positional_resources(stripped: str, verb: str) -> list:
+    """Return all positional resource-type tokens after ``kubectl <verb>``.
+
+    Skips tokens starting with ``-`` (flags). For ``type/name`` slashed forms
+    (e.g. ``pod/foo``) returns the ``type`` part only. Does NOT skip flag
+    values — but ``_CRITICAL_RESOURCE_RE.fullmatch`` rejects hyphenated
+    namespace values like ``kube-node-lease`` (where ``node`` is a substring
+    but the full string does not match any critical resource name).
+
+    Examples:
+        ``kubectl delete node worker-1`` → ``["node", "worker-1"]``
+        ``kubectl delete -n kube-system secret foo`` → ``["kube-system", "secret", "foo"]``
+        ``kubectl delete pod/foo service/bar`` → ``["pod", "service"]``
+    """
+    tokens = stripped.split()
+    if len(tokens) < 3:
+        return []
+    out = []
+    for tok in tokens[2:]:  # tokens[0]="kubectl", tokens[1]=verb
+        if tok.startswith("-"):
+            continue
+        if "/" in tok:
+            tok = tok.split("/", 1)[0]
+        out.append(tok)
+    return out
+
+
 def _is_mutation(cmd: Any) -> bool:
     """True if `cmd` is a mutating kubectl/helm command.
 
+    Splits on shell separators (``&&``, ``||``, ``;``) and tests each
+    sub-command separately, so chained mutations like
+    ``kubectl get pods && kubectl delete svc my-svc`` are detected even
+    when the FIRST segment is benign.
+
     Returns False on empty / non-string / parse error — never raises.
     """
+    reason = _mutation_reason(cmd)
+    return reason is not None
+
+
+def _mutation_reason(cmd: Any, *, hard_block_only: bool = False) -> Optional[str]:
+    """Return a short reason string if ``cmd`` should be blocked; ``None``
+    if it should pass through.
+
+    - ``hard_block_only=False`` (default): returns the FIRST reason found,
+      whether hard-block OR admin-gate mutation. Used by `_is_mutation` for
+      legacy behavior compatibility.
+    - ``hard_block_only=True``: only check hard-block patterns A/B/C —
+      used by `_wrap_one` BEFORE the admin check so hard-block wins over
+      admin-gate. An admin issuing `kubectl apply -f x.yaml` gets the
+      hard-block message, not the admin-gate pass-through.
+
+    Reason strings: ``"hard_block_apply"``, ``"hard_block_delete_critical"``,
+    ``"hard_block_protected_ns"``, or ``"mutation_prefix"`` (the
+    admin-gate mutation match without a hard-block trigger).
+    """
     if not isinstance(cmd, str) or not cmd.strip():
-        return False
+        return None
     try:
-        stripped = _strip_env_prefix(cmd)
+        segments = _extract_segments(cmd) or [_strip_env_prefix(cmd)]
     except Exception:
-        return False
-    if not stripped:
-        return False
-    for pat in MUTATING_PATTERNS:
-        if pat.match(stripped):
-            return True
-    return False
+        return None
+    if not segments:
+        return None
+    for stripped in segments:
+        if not stripped:
+            continue
+        # --- Hard-block rules first (apply to admins too) -----------
+        # Pattern A: any `kubectl apply ...`. Globally blocked because
+        # apply mutates cluster state declaratively and the file may
+        # contain any resource type — too risky to auto-approve even for
+        # admins without an out-of-band confirmation.
+        if _HARD_BLOCK_APPLY_RE.match(stripped):
+            return "hard_block_apply"
+        # Pattern B: `kubectl delete <critical_resource>` regardless of
+        # namespace. Critical resource matched only on the FIRST positional
+        # token after `delete` (or the prefix of `type/name` form) — never on
+        # flag values like `--namespace=kube-node-lease` that contain
+        # critical-resource words.
+        if _HARD_BLOCK_DELETE_RE.match(stripped):
+            rtypes = _extract_positional_resources(stripped, verb="delete")
+            if rtypes and any(_CRITICAL_RESOURCE_RE.fullmatch(t) for t in rtypes):
+                return "hard_block_delete_critical"
+        # Pattern C: `kubectl <mutating-verb> ... -n <protected-ns>`.
+        # The mutating verbs are the ones that touch cluster state
+        # across namespaces: delete/edit/scale/patch/replace/drain.
+        # `apply` already handled by Pattern A.
+        if _HARD_BLOCK_MUTATING_VERBS_RE.match(stripped):
+            ns_match = _NS_FLAG_RE.search(stripped)
+            if ns_match:
+                ns_value = ns_match.group(1).strip()
+                if _PROTECTED_NS_NAME_RE.fullmatch(ns_value):
+                    return "hard_block_protected_ns"
+        if hard_block_only:
+            continue
+        # --- Admin-gate mutation rules (skip for admins) -----------
+        for pat in MUTATING_PATTERNS:
+            if pat.match(stripped):
+                return "mutation_prefix"
+    return None
+
+
+def _is_hard_blocked(cmd: Any) -> Optional[str]:
+    """Convenience wrapper returning the hard-block reason string or
+    ``None``. Used by `_wrap_one` to short-circuit before the admin check.
+    """
+    return _mutation_reason(cmd, hard_block_only=True)
 
 
 def set_admin_check_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -177,6 +373,20 @@ def _wrap_one(tool) -> None:
 
     def wrapped_invoke(params, context=None):
         cmd = (params or {}).get("command") if isinstance(params, dict) else None
+        # Hard-block fires BEFORE admin-gate: applies to admins too. The four
+        # patterns (kubectl apply anywhere, kubectl delete <critical>, and
+        # any mutating verb in a protected namespace) are unrecoverable and
+        # must never auto-execute on behalf of the LLM — even a senior admin
+        # fat-fingering them would lose cluster state.
+        hard_block_reason = _is_hard_blocked(cmd)
+        if hard_block_reason is not None:
+            logger.warning(
+                "admin_gate_hard_blocked",
+                command_preview=str(cmd)[:200],
+                reason=hard_block_reason,
+            )
+            return _build_hard_block_result(cmd, hard_block_reason)
+
         if not _is_mutation(cmd):
             return original_invoke(params, context)
 
@@ -211,6 +421,50 @@ def _wrap_one(tool) -> None:
     object.__setattr__(tool, "invoke", wrapped_invoke)
     object.__setattr__(tool, "_admin_gate_wrapped", True)
     logger.info("Wrapped bash tool with admin_gate")
+
+
+_HARD_BLOCK_MESSAGES = {
+    "hard_block_apply": (
+        "kubectl apply is globally blocked by the bot's safety policy — "
+        "declarative apply can mutate any resource type, which is too "
+        "risky to auto-execute. Do NOT retry this command or `apply` "
+        "variants. If you need to apply a manifest, instruct the user to "
+        "run it via /shell manually after review."
+    ),
+    "hard_block_delete_critical": (
+        "kubectl delete on a critical resource (node/pv/pvc/namespace/crd/"
+        "clusterrole/service) is blocked by the bot's safety policy — "
+        "such deletions are unrecoverable and may cause permanent data "
+        "loss. Do NOT retry or attempt alternate resource aliases (no/ns/"
+        "pvc/svc/etc). Pivot to read-only investigation: `kubectl get` / "
+        "describe` / `logs` to gather context, then instruct the user to "
+        "run the delete via /shell manually."
+    ),
+    "hard_block_protected_ns": (
+        "kubectl <verb> in a protected namespace (kube-system / kube-public "
+        "/ kube-node-lease / garden / gardener-system / extensions / "
+        "garden-*) is blocked by the bot's safety policy — these namespaces "
+        "hold K8s/Gardener control-plane state. Do NOT retry or target a "
+        "different protected namespace. Pivot to read-only investigation: "
+        "`kubectl get` / `describe` / `logs` to gather context, then "
+        "instruct the user to run the change via /shell manually."
+    ),
+}
+
+
+def _build_hard_block_result(cmd: Any, reason: str):
+    """Return StructuredToolResult ERROR for a hard-blocked command. Lazy
+    import (same shape as `_build_block_result`)."""
+    from holmes.core.tools import StructuredToolResult, StructuredToolResultStatus
+
+    cmd_preview = str(cmd)[:300] if cmd is not None else ""
+    msg_body = _HARD_BLOCK_MESSAGES.get(reason, _HARD_BLOCK_MESSAGES["hard_block_apply"])
+    return StructuredToolResult(
+        status=StructuredToolResultStatus.ERROR,
+        error=f"HARD-BLOCKED ({reason}): {msg_body}",
+        params={"command": cmd_preview},
+        invocation="bash(blocked-by-hard-policy)",
+    )
 
 
 def _build_block_result(cmd: Any):

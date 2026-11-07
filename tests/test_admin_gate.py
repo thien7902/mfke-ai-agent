@@ -97,6 +97,37 @@ def test_is_mutation_leading_whitespace_tolerated():
     assert admin_gate._is_mutation("   kubectl scale deploy/x --replicas=2") is True
 
 
+def test_is_mutation_separator_amp_amp():
+    """`export KUBECONFIG=... && kubectl delete ...` must be detected."""
+    assert admin_gate._is_mutation("export KUBECONFIG=/tmp/x && kubectl delete pod foo") is True
+    assert admin_gate._is_mutation("kubectl get pods && kubectl delete svc my-svc") is True
+
+
+def test_is_mutation_separator_semicolon():
+    """Semicolon-separated mutations are detected even if the first
+    segment is benign."""
+    assert admin_gate._is_mutation("kubectl get pods; kubectl delete pod foo") is True
+
+
+def test_is_mutation_separator_pipe_pipe():
+    assert admin_gate._is_mutation("kubectl get pods || kubectl delete pod foo") is True
+
+
+def test_is_mutation_multiple_separators_with_env():
+    """Multiple env prefixes + separators stacked — each segment is
+    stripped before pattern matching, so detection still fires."""
+    cmd = (
+        "export KUBECONFIG=/tmp/x && cd /tmp && kubectl delete node worker-1"
+    )
+    assert admin_gate._is_mutation(cmd) is True
+
+
+def test_is_mutation_benign_chained_segments_not_flagged():
+    """All segments benign → no false positive."""
+    assert admin_gate._is_mutation("kubectl get pods && kubectl get svc && kubectl get nodes") is False
+    assert admin_gate._is_mutation("echo hi; ls -la") is False
+
+
 # ---------- is_admin_sync fast path ----------
 
 def test_is_admin_sync_none_returns_false():
@@ -267,6 +298,9 @@ def test_wrap_idempotent():
 
 
 def test_non_admin_mutation_blocked(monkeypatch):
+    # `kubectl create` is a mutation but NOT a hard-block pattern — admin-gate
+    # path. (kubectl apply, delete node, etc. would also fire hard-block, which
+    # is covered by separate tests below.)
     monkeypatch.setattr(admin_gate.config, "admin_user_ids", [])  # not admin
     monkeypatch.setattr(admin_gate, "_ADMIN_LOOP", None)  # slow path unavailable
     tool = FakeBashTool()
@@ -274,7 +308,7 @@ def test_non_admin_mutation_blocked(monkeypatch):
     admin_gate.wrap_tools_with_admin_gate(ex)
 
     ctx = FakeCtx(request_context={"user_id": "99999"})
-    r = tool.invoke({"command": "kubectl apply -f x.yaml"}, ctx)
+    r = tool.invoke({"command": "kubectl create namespace test"}, ctx)
     assert r.status.value == "error"
     assert "Admin access required" in r.error
     assert "Pivot now to read-only" in r.error
@@ -283,17 +317,17 @@ def test_non_admin_mutation_blocked(monkeypatch):
 
 
 def test_admin_mutation_pass_through_with_user_approved(monkeypatch):
+    # `kubectl create` is admin-gate-mutation but NOT hard-block — admin can
+    # still pass through.
     monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
     tool = FakeBashTool()
     ex = FakeExecutor([FakeToolset([tool])])
     admin_gate.wrap_tools_with_admin_gate(ex)
 
     ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
-    r = tool.invoke({"command": "kubectl apply -f x.yaml"}, ctx)
+    r = tool.invoke({"command": "kubectl create namespace test"}, ctx)
     assert r.status.value == "success"
-    # Underlying invoke was called
-    assert tool.last_params == {"command": "kubectl apply -f x.yaml"}
-    # Wrapper set user_approved=True so Holmes' bash tool skips validation
+    assert tool.last_params == {"command": "kubectl create namespace test"}
     assert tool.last_context.user_approved is True
 
 
@@ -348,3 +382,193 @@ def test_no_user_id_blocks_mutation(monkeypatch):
     ctx = FakeCtx(request_context={})
     r = tool.invoke({"command": "kubectl apply -f x.yaml"}, ctx)
     assert r.status.value == "error"
+
+
+# ---------- Hard-block rules (Pattern A: kubectl apply) ----------
+
+@pytest.mark.parametrize("cmd", [
+    "kubectl apply -f x.yaml",
+    "kubectl apply -f -",
+    "kubectl apply -k dir/",
+    "kubectl apply --prune -f x.yaml",
+    "kubectl apply -n default -f x.yaml",
+    "kubectl apply -n kube-system -f x.yaml",  # ns-irrelevant — apply globally blocked
+    "KUBECONFIG=/tmp/x kubectl apply -f y.yaml",
+    "kubectl get pods && kubectl apply -f z.yaml",  # blocked via second segment
+])
+def test_hard_block_apply_blocks_all(monkeypatch, cmd):
+    """Pattern A: kubectl apply (any args, any ns) is globally hard-blocked —
+    admins and non-admins both blocked."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "HARD-BLOCKED" in r.error
+    assert "hard_block_apply" in r.error
+    assert tool.last_params is None  # underlying invoke NOT called
+
+
+def test_hard_block_apply_beats_admin_gate(monkeypatch):
+    """Hard-block fires BEFORE admin check — admin issuing apply still blocked."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": "kubectl apply -f critical.yaml"}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_apply" in r.error
+    # user_approved MUST NOT be flipped to True for hard-blocked commands
+    assert ctx.user_approved is False
+
+
+# ---------- Hard-block rules (Pattern B: kubectl delete critical) ----------
+
+@pytest.mark.parametrize("cmd", [
+    "kubectl delete node worker-1",
+    "kubectl delete nodes worker-1",
+    "kubectl delete no worker-1",
+    "kubectl delete pv my-pv",
+    "kubectl delete persistentvolume my-pv",
+    "kubectl delete persistentvolumes my-pv",
+    "kubectl delete pvc my-pvc",
+    "kubectl delete persistentvolumeclaim my-pvc",
+    "kubectl delete persistentvolumeclaims my-pvc",
+    "kubectl delete namespace my-ns",
+    "kubectl delete namespaces my-ns",
+    "kubectl delete ns my-ns",
+    "kubectl delete crd my-crd",
+    "kubectl delete customresourcedefinition my-crd",
+    "kubectl delete customresourcedefinitions my-crd",
+    "kubectl delete clusterrole my-role",
+    "kubectl delete clusterroles my-role",
+    "kubectl delete service my-svc",
+    "kubectl delete services my-svc",
+    "kubectl delete svc my-svc",
+    "kubectl delete svc/my-svc",
+    "kubectl delete pod/foo service/bar",  # critical resource anywhere in cmd
+    "kubectl delete -n some-ns service my-svc",  # any ns
+])
+def test_hard_block_delete_critical_blocks(monkeypatch, cmd):
+    """Pattern B: kubectl delete <critical_resource> blocked regardless of ns."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_delete_critical" in r.error
+    assert tool.last_params is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "kubectl delete pod foo",           # pod NOT critical — recoverable
+    "kubectl delete deploy foo",
+    "kubectl delete deployment foo",
+    "kubectl delete sts foo",
+    "kubectl delete configmap foo",
+    "kubectl delete secret foo",
+    "kubectl delete job foo",
+    "kubectl delete cronjob foo",
+    "kubectl delete rs foo",
+    "kubectl delete ds foo",
+])
+def test_hard_block_delete_non_critical_passes_through_to_admin_gate(monkeypatch, cmd):
+    """Non-critical deletes go through the admin-gate (mutation_prefix) path,
+    NOT the hard-block path — admins still pass through."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": cmd}, ctx)
+    # Admin path → success
+    assert r.status.value == "success"
+    assert ctx.user_approved is True
+
+
+# ---------- Hard-block rules (Pattern C: mutating verb in protected ns) ----------
+
+@pytest.mark.parametrize("verb", ["delete", "edit", "scale", "patch", "replace", "drain"])
+@pytest.mark.parametrize("ns_flag", ["-n kube-system", "--namespace=kube-system",
+                                      "--namespace kube-public", "-n kube-node-lease",
+                                      "-n garden", "-n gardener-system", "-n extensions",
+                                      "-n garden-foo", "-n garden-some-project"])
+def test_hard_block_mutating_verb_in_protected_ns(monkeypatch, verb, ns_flag):
+    """Pattern C: kubectl <mutating-verb> -n <protected-ns> blocked for admins too."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    cmd = f"kubectl {verb} {ns_flag} some-resource"
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_protected_ns" in r.error
+    assert tool.last_params is None
+
+
+@pytest.mark.parametrize("cmd", [
+    # shoot-- namespaces deliberately NOT blocked (per user choice)
+    "kubectl delete -n shoot--proj--name pod foo",
+    "kubectl edit -n shoot--proj--name deploy bar",
+    # Non-protected ns unaffected — admin-gate path
+    "kubectl delete -n default pod foo",
+    "kubectl edit -n my-ns deploy bar",
+    "kubectl patch -n some-app svc x",
+    # Read-only verbs in protected ns still pass through
+    "kubectl get -n kube-system pods",
+    "kubectl describe -n kube-system pod foo",
+    "kubectl logs -n garden pod-x",
+    "kubectl top -n kube-public pods",
+])
+def test_hard_block_protected_ns_not_triggered(monkeypatch, cmd):
+    """shoot--*, default, and read-only verbs in protected ns are not hard-blocked."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": cmd}, ctx)
+    # Should NOT hard-block — passes through (admin may pass through for
+    # mutating verbs in unprotected ns; read-only passes through for any user).
+    assert "hard_block_protected_ns" not in (r.error or "")
+
+
+def test_hard_block_protected_ns_with_env_prefix(monkeypatch):
+    """env-prefix-stripped command still triggers hard-block."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    cmd = "KUBECONFIG=/tmp/x kubectl delete -n kube-system configmap foo"
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_protected_ns" in r.error
+
+
+def test_hard_block_chained_with_separator_triggers(monkeypatch):
+    """Mutating verb in protected ns via && still triggers hard-block."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    cmd = "kubectl get pods && kubectl delete -n kube-system secret foo"
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    # Hard-block wins; the first benign segment doesn't matter
+    assert "hard_block_protected_ns" in r.error or "hard_block_delete_critical" in r.error
