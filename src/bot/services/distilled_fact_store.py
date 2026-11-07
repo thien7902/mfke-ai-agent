@@ -245,7 +245,6 @@ class DistilledFactStore:
         """
         if batch_size < 1:
             batch_size = 1
-        from src.bot.services.embedder import embed_chunks
         scanned = 0
         embedded = 0
         errors = 0
@@ -274,6 +273,7 @@ class DistilledFactStore:
         ``len(batch)`` and the return value is the error count. Used by
         ``backfill_embeddings``."""
         try:
+            from src.bot.services.embedder import embed_chunks
             texts = [d.get("text") or "" for d in batch]
             vecs = embed_chunks(texts)
         except Exception as e:
