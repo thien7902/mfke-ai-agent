@@ -37,6 +37,8 @@ def mock_store():
     store = MagicMock()
     store.add = AsyncMock(return_value=True)
     store.record_run = AsyncMock()
+    store.get_last_distilled_count = MagicMock(return_value=0)
+    store.retire_topic_facts = MagicMock(return_value=0)
     return store
 
 
@@ -112,9 +114,10 @@ async def test_fire_skip_when_llm_raises(svc, mock_conversations):
         await svc._fire((20, 10))
     svc._store.add.assert_not_called()
     svc._store.record_run.assert_not_called()
-    # Checkpoint NOT updated so a retry with same count will still skip, but
-    # a future fire with more messages will retry.
-    assert (20, 10) not in svc._last_distilled_count
+    # Checkpoint NOT updated by the failed run. It may have been populated
+    # with the DB-fallback value (0) during the idle-guard lookup — that's
+    # the pre-consolidation checkpoint, not the result of this run.
+    assert svc._last_distilled_count[(20, 10)] == 0
 
 
 @pytest.mark.asyncio
@@ -338,7 +341,9 @@ async def test_llm_timeout_releases_semaphore_and_returns(svc, mock_conversation
 
     # No record_run, no checkpoint (early-return on timeout).
     svc._store.record_run.assert_not_awaited()
-    assert (20, 10) not in svc._last_distilled_count
+    # Pre-consolidation DB fallback may have populated the key with 0 —
+    # that's the idle-guard checkpoint, NOT the result of this timed-out run.
+    assert svc._last_distilled_count.get((20, 10), 0) == 0
     # Semaphore released and re-acquirable immediately.
     async with svc._semaphore:
         pass

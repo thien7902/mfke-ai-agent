@@ -192,6 +192,37 @@ class ConsolidatorService:
     # Public API — called by MessageHandler after each save_conversation
     # ------------------------------------------------------------------ #
 
+    async def backfill_all_topics(self) -> int:
+        """On bot startup, schedule consolidation for every persisted topic.
+
+        Without this, topics that existed before the bot started never get
+        consolidated — the idle timer is only armed by MessageHandler when
+        a NEW message arrives on the topic, so old backlog stays untouched.
+
+        Calls ConversationService.get_all_topic_keys() to enumerate every
+        (chat_id, topic_id) pair that has a conversation in MongoDB, then
+        schedules_if_idle on each. The idle guard inside _consolidate
+        handles "no new messages since last run" via checkpoint; topics
+        already consolidated will skip cheaply.
+
+        Returns the number of topics scheduled.
+        """
+        if not bot_config.consolidator_enabled:
+            return 0
+        try:
+            keys = await self._conversations.get_all_topic_keys()
+        except Exception as e:
+            logger.warning(
+                "consolidator_backfill_enumerate_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return 0
+        for chat_id, topic_id in keys:
+            self.schedule_if_idle(chat_id, topic_id)
+        logger.info("consolidator_backfill_scheduled", topic_count=len(keys))
+        return len(keys)
+
     def schedule_if_idle(self, chat_id: int, topic_id: Optional[int]) -> None:
         """Arm (or re-arm) the idle timer for this topic. No-op when the
         consolidator is disabled. Always cancels any prior pending timer
@@ -275,7 +306,22 @@ class ConsolidatorService:
 
         # Idle guard — skip if no new messages since the last consolidation
         # for this topic. This makes idle topics free after the first run.
-        last_count = self._last_distilled_count.get(key, 0)
+        # In-memory cache first (fast path); fall back to DB when missing
+        # (e.g. after a bot restart, the in-memory dict is empty but the
+        # persisted checkpoint lets us skip topics that haven't grown).
+        last_count = self._last_distilled_count.get(key)
+        if last_count is None:
+            try:
+                last_count = self._store.get_last_distilled_count(chat_id, topic_id)
+                self._last_distilled_count[key] = last_count
+            except Exception as e:
+                logger.warning(
+                    "consolidator_get_count_failed",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                last_count = 0
+                self._last_distilled_count[key] = 0
         if len(messages) <= last_count:
             logger.info(
                 "consolidator_no_new_messages",
@@ -383,7 +429,16 @@ class ConsolidatorService:
         # pointer — newer run wins per the user's "fact sau ưu tiên hơn
         # fact trước" intent. (See Known follow-ups in the plan for the
         # empty-run wipe caveat.)
-        await self._store.record_run(chat_id, topic_id, run_id)
+        #
+        # Persist the message-count checkpoint too so a container restart
+        # doesn't blow away the idle guard — without this, every old topic
+        # re-distills after a restart because the in-memory dict is empty.
+        await self._store.record_run(
+            chat_id,
+            topic_id,
+            run_id,
+            last_distilled_count=len(messages),
+        )
 
         # Update the per-topic checkpoint so the next idle fire on the
         # same message count is skipped.

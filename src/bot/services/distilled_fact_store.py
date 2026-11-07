@@ -119,23 +119,37 @@ class DistilledFactStore:
             )
             return False
 
-    async def record_run(self, chat_id: int, topic_id: int, run_id: str) -> None:
+    async def record_run(
+        self,
+        chat_id: int,
+        topic_id: int,
+        run_id: str,
+        last_distilled_count: Optional[int] = None,
+    ) -> None:
         """Mark ``run_id`` as the latest distillation run for this topic.
+        Optionally also persist ``last_distilled_count`` (the message-count
+        checkpoint the consolidator inspected) so it survives process
+        restart — without this, the consolidator re-runs every old topic
+        after a restart because the in-memory checkpoint is empty.
+
         Best-effort: a Mongo failure here means the topic's injection set
         keeps the previous run's facts for now — the next successful
         ``record_run`` will catch up.
         """
+        update = {
+            "$set": {
+                "chat_id": chat_id,
+                "topic_id": topic_id,
+                "latest_run_id": run_id,
+                "updated_at": datetime.datetime.utcnow(),
+            }
+        }
+        if last_distilled_count is not None:
+            update["$set"]["last_distilled_count"] = int(last_distilled_count)
         try:
             self.runs.update_one(
                 {"chat_id": chat_id, "topic_id": topic_id},
-                {
-                    "$set": {
-                        "chat_id": chat_id,
-                        "topic_id": topic_id,
-                        "latest_run_id": run_id,
-                        "updated_at": datetime.datetime.utcnow(),
-                    }
-                },
+                update,
                 upsert=True,
             )
         except Exception as e:
@@ -147,6 +161,28 @@ class DistilledFactStore:
                 topic_id=topic_id,
                 run_id=run_id,
             )
+
+    def get_last_distilled_count(self, chat_id: int, topic_id: int) -> int:
+        """Return the persisted message-count checkpoint for this topic,
+        or 0 when no record exists. Sync — called from the consolidator's
+        _consolidate path before the LLM call to short-circuit topics whose
+        message count hasn't changed since the last run (including across
+        bot restarts)."""
+        try:
+            doc = self.runs.find_one(
+                {"chat_id": chat_id, "topic_id": topic_id},
+                {"last_distilled_count": 1, "_id": 0},
+            )
+            return int((doc or {}).get("last_distilled_count") or 0)
+        except Exception as e:
+            logger.warning(
+                "distilled_run_get_count_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                chat_id=chat_id,
+                topic_id=topic_id,
+            )
+            return 0
 
     def retire_topic_facts(self, chat_id: int, topic_id: int) -> int:
         """Delete every fact previously stored for this topic, regardless of

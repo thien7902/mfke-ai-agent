@@ -121,3 +121,16 @@ class ConversationService:
         """Get all topics in a forum chat."""
         cursor = self.collection.find({"chat_id": chat_id}, {"topic_id": 1, "user_id": 1, "updated_at": 1})
         return list(cursor)
+
+    async def get_all_topic_keys(self) -> List[tuple]:
+        """List every (chat_id, topic_id) pair that has a persisted
+        conversation. Used by ConsolidatorService on startup to backfill
+        idle-timer schedules for old topics — without this, topics that
+        existed before the bot started never get consolidated until a new
+        message arrives on them.
+        """
+        cursor = self.collection.find(
+            {"chat_id": {"$exists": True}, "topic_id": {"$exists": True, "$gt": 0}},
+            {"chat_id": 1, "topic_id": 1, "_id": 0},
+        )
+        return [(doc["chat_id"], doc["topic_id"]) for doc in cursor if doc.get("chat_id") and doc.get("topic_id")]

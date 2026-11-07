@@ -227,6 +227,21 @@ class TelegramBot:
                     exc_info=True,
                 )
                 self.consolidator_service = None
+            else:
+                # Backfill: schedule consolidation for every persisted topic
+                # so conversations that existed before this restart still
+                # get distilled. Without this, only newly-active topics ever
+                # fire the consolidator (MessageHandler only arms the idle
+                # timer on a new incoming message). Wrap in try/except so
+                # a Mongo enumeration failure doesn't block bot startup.
+                try:
+                    await self.consolidator_service.backfill_all_topics()
+                except Exception as e:
+                    logger.warning(
+                        "consolidator_backfill_failed",
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
 
         # Create Telegram application
         # Defaults (PTB HTTPXRequest) are read/write=5s, pool=1s, pool_size=1 — too tight
