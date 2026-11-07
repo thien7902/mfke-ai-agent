@@ -153,7 +153,7 @@ def mock_config(tmp_path_factory):
         mock.consolidator_llm_timeout_seconds = 60
         # KB defaults: disabled in tests that don't opt in.
         mock.kb_enabled = False
-        mock.kb_top_k = 20
+        mock.kb_top_k = 50
         mock.kb_distill_model = None
         yield mock
 

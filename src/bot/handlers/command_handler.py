@@ -249,7 +249,8 @@ class CommandHandler:
             # In general chat - create new topic
             from src.bot.handlers.message_handler import _generate_topic_name
 
-            topic_name = _generate_topic_name("New conversation", user.id)
+            creator_name = user.first_name or user.username or f"user{user.id}"
+            topic_name = _generate_topic_name("New conversation", user.id, creator_name=creator_name)
             try:
                 forum_topic = await context.bot.create_forum_topic(
                     chat_id=chat.id,

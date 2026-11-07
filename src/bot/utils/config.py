@@ -150,9 +150,9 @@ class Config:
     # src/bot/utils/health.py. Reuses GRAPHITI_EMBEDDING_MODEL /
     # GRAPHITI_EMBEDDING_DIM for the embedder.
     kb_enabled: bool = False
-    # Top-K rules injected per /kb_match call. Rules are one-line if-then,
-    # so 10-20 fit in the snapshot tool output without bloat.
-    kb_top_k: int = 20
+    # Top-K rules injected per /kb_match call. Rules are one-line if-then; a
+    # larger K surfaces more candidate rules for the LLM to reason about.
+    kb_top_k: int = 50
     # Model used ONE-TIME at ingest to distill KB articles into if-then
     # rules. Falls back to CONSOLIDATOR_MODEL if unset. Recommended: a
     # cheap/gp-fast model — the distill runs strictly offline at ingest
@@ -211,7 +211,7 @@ def load_config() -> Config:
         consolidator_max_concurrent=int(os.getenv("CONSOLIDATOR_MAX_CONCURRENT", "5")),
         consolidator_llm_timeout_seconds=int(os.getenv("CONSOLIDATOR_LLM_TIMEOUT_SECONDS", "60")),
         kb_enabled=os.getenv("KB_ENABLED", "").lower() in ("1", "true", "yes", "on"),
-        kb_top_k=int(os.getenv("KB_TOP_K", "20")),
+        kb_top_k=int(os.getenv("KB_TOP_K", "50")),
         kb_distill_model=os.getenv("KB_DISTILL_MODEL") or os.getenv("CONSOLIDATOR_MODEL") or None,
     )
 

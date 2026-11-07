@@ -173,8 +173,13 @@ def _user_model_display_name(user_model) -> Optional[str]:
     return " ".join(parts) if parts else None
 
 
-def _generate_topic_name(user_message: str, user_id: int) -> str:
-    """Generate a topic name from user message: 2-3 word summary + random ID."""
+def _generate_topic_name(user_message: str, user_id: int, creator_name: Optional[str] = None) -> str:
+    """Generate a topic name from user message: creator display name + 2-3 word summary + random ID.
+
+    ``creator_name`` prefixes the topic so /new topics show who started them
+    (e.g. "💬 Alice — New Conversation #1234"). Falls back to the original
+    summary-only format when not provided (back-compat for the mention path).
+    """
     # Simple keyword extraction - take first few meaningful words
     words = user_message.strip().split()
     # Filter out common words, mentions, keep meaningful words
@@ -193,6 +198,11 @@ def _generate_topic_name(user_message: str, user_id: int) -> str:
 
     # Add random 4-digit ID to prevent duplication
     random_id = random.randint(1000, 9999)
+    if creator_name:
+        # Cap creator length so the whole topic name still fits Telegram's 128-char
+        # limit after the emoji/summary/id are added.
+        creator = creator_name.strip()[:40]
+        return f"💬 {creator} — {summary} #{random_id}"
     return f"💬 {summary} #{random_id}"
 
 
@@ -871,7 +881,8 @@ class MessageHandler:
 
         # Create a NEW forum topic for each mention (don't reuse existing topics)
         try:
-            topic_name = _generate_topic_name(clean_message or "Hello", user.id)
+            creator_name = user.first_name or user.username or f"user{user.id}"
+            topic_name = _generate_topic_name(clean_message or "Hello", user.id, creator_name=creator_name)
             forum_topic = await context.bot.create_forum_topic(
                 chat_id=chat_id,
                 name=topic_name[:100],  # Max 100 chars
