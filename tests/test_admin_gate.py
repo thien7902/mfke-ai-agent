@@ -113,6 +113,34 @@ def test_is_mutation_separator_pipe_pipe():
     assert admin_gate._is_mutation("kubectl get pods || kubectl delete pod foo") is True
 
 
+def test_is_mutation_separator_single_pipe():
+    """Single pipe (manifest bypass: `echo '...' | kubectl apply -f -`)
+    must be detected — split so the kubectl segment's mutation fires."""
+    assert admin_gate._is_mutation("echo 'apiVersion: v1' | kubectl apply -f -") is True
+    assert admin_gate._is_mutation("cat manifest.yaml | kubectl delete -f -") is True
+    assert admin_gate._is_mutation("kubectl get pods | kubectl apply -f -") is True
+
+
+def test_is_mutation_single_pipe_does_not_false_positive_on_benign():
+    """Read-only pipe chains don't false-positive."""
+    assert admin_gate._is_mutation("kubectl get pods | grep Running") is False
+    assert admin_gate._is_mutation("echo hi | cat") is False
+
+
+def test_is_mutation_kubectl_global_flag_before_verb():
+    """The LLM bypass `kubectl --kubeconfig=/tmp/x.yaml apply -f -` puts
+    a global flag between `kubectl` and the verb — must still be detected."""
+    assert admin_gate._is_mutation("kubectl --kubeconfig=/tmp/x.yaml apply -f -") is True
+    assert admin_gate._is_mutation("kubectl --kubeconfig=/tmp/x.yaml delete pod foo") is True
+    assert admin_gate._is_mutation("kubectl -n kube-system apply -f x.yaml") is True
+    assert admin_gate._is_mutation("kubectl --context=shoot--p--x apply -f -") is True
+
+
+def test_is_mutation_helm_global_flag_before_verb():
+    """Same bypass for helm — `helm --kube-version=... upgrade ...`."""
+    assert admin_gate._is_mutation("helm --kube-version=1.28 upgrade r ./chart") is True
+
+
 def test_is_mutation_multiple_separators_with_env():
     """Multiple env prefixes + separators stacked — each segment is
     stripped before pattern matching, so detection still fires."""
@@ -395,6 +423,20 @@ def test_no_user_id_blocks_mutation(monkeypatch):
     "kubectl apply -n kube-system -f x.yaml",  # ns-irrelevant — apply globally blocked
     "KUBECONFIG=/tmp/x kubectl apply -f y.yaml",
     "kubectl get pods && kubectl apply -f z.yaml",  # blocked via second segment
+    # LLM bypass attempts — must ALL still hard-block:
+    "kubectl --kubeconfig=/tmp/shoot_kubeconfig_x.yaml apply -f -",
+    "kubectl --context=shoot--p--x apply -f -",
+    "kubectl -n default --kubeconfig=/tmp/x.yaml apply -f -",
+    "echo 'apiVersion: v1' | kubectl --kubeconfig=/tmp/x.yaml apply -f -",
+    "cat manifest.yaml | kubectl apply -f -",
+    "echo 'manifest' | kubectl apply -f -",
+    # Real-world bypass forms observed in production history:
+    "kubectl --kubeconfig=/root/.kube/active_config apply -f /tmp/restart-containerd.yaml",
+    "kubectl --kubeconfig=\"/root/.holmes/outbox/received/test.txt\" apply -f /tmp/x.yaml",
+    "kubectl --kubeconfig /root/kubeconfig/production-sgn --context=garden apply -f x.yaml",
+    "kubectl --kubeconfig=/tmp/shoot_kubeconfig_x.yaml --server=https://127.0.0.1:6443 --insecure-skip-tls-verify apply -f -",
+    "export KUBECONFIG=/tmp/shoot_kubeconfig_x.yaml && kubectl apply -f -",
+    "KUBECONFIG=/root/kubeconfig/production-han kubectl --context=han-ops-seed1-private-prd apply -f x.yaml",
 ])
 def test_hard_block_apply_blocks_all(monkeypatch, cmd):
     """Pattern A: kubectl apply (any args, any ns) is globally hard-blocked —
@@ -453,6 +495,15 @@ def test_hard_block_apply_beats_admin_gate(monkeypatch):
     "kubectl delete svc/my-svc",
     "kubectl delete pod/foo service/bar",  # critical resource anywhere in cmd
     "kubectl delete -n some-ns service my-svc",  # any ns
+    # LLM bypass: kubectl global flags inserted between `kubectl` and `delete`
+    "kubectl --kubeconfig=/tmp/x.yaml delete node worker-1",
+    "kubectl --context=shoot--p--x delete -n kube-system node worker-1",
+    "kubectl -n kube-system --kubeconfig=/tmp/x.yaml delete svc my-svc",
+    # Real-world critical-resource delete forms observed in production history:
+    "kubectl --context kubernetes-admin-seed-osp-public-cluster@new-seed-osp-public-cluster delete pv pvc-37227b9d-3b62-4663-97d2-cc31b8b4b5f9 --wait=false 2>&1 | grep -v Starlark",
+    "kubectl --context kubernetes-admin-seed-osp-public-cluster@new-seed-osp-public-cluster delete pvc main-etcd-etcd-main-0 -n fke-h100-v2-ope25-p0pubr1p --wait=false 2>&1 | grep -v Starlark",
+    "kubectl delete pvc main-etcd-etcd-main-0 -n fke-cluster2-3010-f13mypqu 2>&1",
+    "KUBECONFIG=/root/kubeconfig/production-han kubectl --context han-vcd-seed1-svc-integration-prd delete svc my-svc -n default",
 ])
 def test_hard_block_delete_critical_blocks(monkeypatch, cmd):
     """Pattern B: kubectl delete <critical_resource> blocked regardless of ns."""
@@ -501,7 +552,8 @@ def test_hard_block_delete_non_critical_passes_through_to_admin_gate(monkeypatch
 @pytest.mark.parametrize("ns_flag", ["-n kube-system", "--namespace=kube-system",
                                       "--namespace kube-public", "-n kube-node-lease",
                                       "-n garden", "-n gardener-system", "-n extensions",
-                                      "-n garden-foo", "-n garden-some-project"])
+                                      "-n extensions-something", "-n garden-foo",
+                                      "-n garden-some-project"])
 def test_hard_block_mutating_verb_in_protected_ns(monkeypatch, verb, ns_flag):
     """Pattern C: kubectl <mutating-verb> -n <protected-ns> blocked for admins too."""
     monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
@@ -515,6 +567,33 @@ def test_hard_block_mutating_verb_in_protected_ns(monkeypatch, verb, ns_flag):
     assert r.status.value == "error"
     assert "hard_block_protected_ns" in r.error
     assert tool.last_params is None
+
+
+@pytest.mark.parametrize("cmd", [
+    # Real-world mutating-verb-in-protected-ns commands from production history:
+    "kubectl delete pod debug-mem2 -n kube-system --force --grace-period=0 2>&1",
+    "kubectl delete pod debug-mem4 -n kube-system --force --grace-period=0 2>&1",
+    "kubectl delete pod holmes-osdbg4 -n kube-system --context kubernetes-admin-seed-osp-public-cluster@new-seed-osp-public-cluster --wait=false --ignore-not-found 2>&1 | grep -v Starlark",
+    "KUBECONFIG=/root/kubeconfig/production-hoa-lac kubectl --context hoalac-cloud-seed2-prd delete pod csi-cinder-nodeplugin-hwln8 -n kube-system --force --grace-period=0 2>&1",
+    "kubectl delete pod debug-node-shell-worker4 -n kube-system --force --grace-period=0 2>&1",
+    "kubectl delete pod vpn-shoot-8459f5bd74-r9mgn -n kube-system 2>&1",
+    "export KUBECONFIG=/tmp/shoot_kubeconfig_fmon-agent-1-yant1n2u.yaml && kubectl delete pod apiserver-proxy-56vv6 -n kube-system --wait=false 2>&1 && echo Pod deleted",
+    "kubectl delete pod debug-mem3 -n kube-system --force --grace-period=0 2>&1 && kubectl run debug-mem4 --namespace=kube-system",
+    "kubectl annotate shoot tts-ai-hcm-fwk45snm -n garden-tts-ai-hcm2-vpc-rhsdzbql9v5ad3sudgbnch gardener.cloud/operation=reconcile --overwrite --context garden",
+    "KUBECONFIG=/root/kubeconfig/production-han kubectl --context han-vcd-seed1-svc-integration-prd annotate shoot fmon-agent-2-9w2uwvog -n garden-fmon-osp-sun-agent-vpc-esaipxtdwylmzuyeystjtt gardener.cloud/operation=reconcile",
+])
+def test_hard_block_protected_ns_real_world_commands(monkeypatch, cmd):
+    """Pattern C real-world forms: kubectl <mutating verb> ... -n kube-system ...
+    must hard-block regardless of context flags, env prefixes, or trailing args."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_protected_ns" in r.error
 
 
 @pytest.mark.parametrize("cmd", [
@@ -602,6 +681,13 @@ def test_hard_block_chained_with_separator_triggers(monkeypatch):
     "OS_AUTH_URL=https://x openstack server delete prod-web-1",
     # bare verb with no name token — blocked on ambiguity (no fke anywhere)
     "openstack server delete",
+    # Real-world openstack mutations from production history:
+    "source /root/.holmes/credentials/openrc-fmon-agent-2-9w2uwvog.sh && openstack server delete b43e3699-6b6d-484e-9a42-481299a05fea 2>&1",
+    "source /root/.holmes/credentials/openrc-fmon-agent-1.sh; export OS_PROJECT_DOMAIN_NAME=X; openstack server delete d6348720-0181-44f4-ab04-bdcf5eb1fae7 2>&1 && echo VM deleted",
+    "bash -c 'source /root/.holmes/credentials/openrc-fmon-agent-1.sh; openstack server delete d6348720-0181-44f4-ab04-bdcf5eb1fae7 2>&1'",
+    "source /root/.holmes/credentials/openrc-han-v130-0eeuu0wi.sh && openstack port delete b8fae43a-5199-451f-b5af-c6162cb58c9e 2>&1",
+    "source /root/.holmes/credentials/openrc-fmon-agent-2-9w2uwvog.sh && openstack server group delete e2aca021-492d-4ecd-8d7d-494a99e8f9df 06e9dcba 2>&1",
+    "bash -c 'source /root/.holmes/credentials/openrc-fmon-agent-1.sh; export OS_PROJECT_DOMAIN_NAME=X; sleep 15; openstack volume delete 86c93ff5-1f0e-4756-9f23 2>&1'",
 ])
 def test_hard_block_openstack_non_fke_blocks(monkeypatch, cmd):
     """Pattern D: openstack <verb> with no fke token in command blocked."""

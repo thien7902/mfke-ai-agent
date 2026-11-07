@@ -31,6 +31,26 @@ _ADMIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 _ADMIN_LOOKUP_TIMEOUT_S = 1.5
 
 
+# Kubectl / Helm global flag prefix. Matches zero-or-more flag tokens
+# between `kubectl`/`helm` and the verb. Each flag is `-X` or `--xxx`,
+# optionally followed by `=value` in the SAME token AND a separate value
+# token when the flag takes one without `=` (e.g. `-n default` or
+# `--kubeconfig /tmp/x`). Value tokens can't start with `-` (would be a
+# different flag) — bounded so the loop can't swallow the verb itself.
+#
+# Used by MUTATING_PATTERNS and the hard-block regexes below so the LLM
+# bypass `kubectl --kubeconfig=/tmp/x.yaml apply -f -` and the variant
+# `kubectl -n default --kubeconfig=... apply -f -` both still trigger.
+_KUBECTL_GLOBAL_FLAGS = (
+    r"(?:"
+    r"--?[A-Za-z][\w./=:-]*"               # the flag token (-x or --xxx[=y])
+    r"(?:=\S+)?"                            # optional =value in same token
+    r"(?:\s+(?!-)[^\s]+)?"                  # optional separate value token (not `-`)
+    r"\s+"
+    r")*"
+)
+
+
 # Regex patterns for mutating kubectl / helm subcommands. Anchored at start
 # (re.match). env-prefix stripping is done before matching, so leading
 # `KUBECONFIG=...` is already gone. Whitespace prefix is tolerated by re.match
@@ -39,13 +59,18 @@ _ADMIN_LOOKUP_TIMEOUT_S = 1.5
 # `kubectl_run_image` (separate Holmes tool, not bash) is OUT OF SCOPE here —
 # it's disabled by default and we don't wrap it.
 MUTATING_PATTERNS: tuple = (
-    # kubectl mutating subcommands. Allow optional resource-type positional
-    # between `kubectl` and the verb (e.g. `kubectl rollout undo`, `kubectl
-    # scale deploy`, `kubectl apply -f`). Match the verb right after kubectl.
-    re.compile(r"^kubectl\s+(apply|delete|edit|patch|scale|replace|rollout|exec|cp|create|label|annotate|taint|cordon|uncordon|drain|rolling-update|expose|set\s+env|set\s+image|set\s+resources|set\s+serviceaccount|set\s+selector|auth\s+reconcile|auth\s+can-i\s+--delete|taint\s+)\b"),
-    # helm mutating subcommands. install/upgrade/uninstall/rollback/delete pull
-    # repo add/remove are the ones that change cluster or repo state.
-    re.compile(r"^helm\s+(install|upgrade|uninstall|rollback|delete|repo\s+add|repo\s+remove|push|pull|cm-push|registry\s+login)\b"),
+    # kubectl mutating subcommands. Tolerate kubectl global flags (e.g.
+    # `--kubeconfig=...`, `-n`) between `kubectl` and the verb — see
+    # `_KUBECTL_GLOBAL_FLAGS` above.
+    re.compile(
+        rf"^kubectl\s+{_KUBECTL_GLOBAL_FLAGS}(?:apply|delete|edit|patch|scale|replace|rollout|exec|cp|create|label|annotate|taint|cordon|uncordon|drain|rolling-update|expose|set\s+env|set\s+image|set\s+resources|set\s+serviceaccount|set\s+selector|auth\s+reconcile|auth\s+can-i\s+--delete|taint\s+)\b"
+    ),
+    # helm mutating subcommands. install/upgrade/uninstall/rollback/delete
+    # pull repo add/remove are the ones that change cluster or repo state.
+    # Tolerate helm global flags before the verb the same way.
+    re.compile(
+        rf"^helm\s+{_KUBECTL_GLOBAL_FLAGS}(?:install|upgrade|uninstall|rollback|delete|repo\s+add|repo\s+remove|push|pull|cm-push|registry\s+login)\b"
+    ),
 )
 
 
@@ -111,8 +136,18 @@ _NS_FLAG_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Pattern A — kubectl apply (any args, any ns).
-_HARD_BLOCK_APPLY_RE = re.compile(r"^kubectl\s+apply\b", re.IGNORECASE)
+# Pattern A — kubectl apply (any args, any ns). Tolerate kubectl global
+# flags (e.g. `--kubeconfig=...`, `-n`) between `kubectl` and the verb. The
+# LLM bypass `kubectl --kubeconfig=/tmp/x.yaml apply -f -` (and the
+# variant `kubectl -n default --kubeconfig=... apply ...`) must still
+# trigger.
+#
+# `_KUBECTL_GLOBAL_FLAGS` is defined above `MUTATING_PATTERNS` and reused
+# here. It matches zero-or-more flag tokens (each with optional separate
+# value token) so the anchored verb at the end of the group is reachable
+# even when the LLM inserts `--kubeconfig=...` or `-n default` between
+# `kubectl` and the verb.
+_HARD_BLOCK_APPLY_RE = re.compile(rf"^kubectl\s+{_KUBECTL_GLOBAL_FLAGS}apply\b", re.IGNORECASE)
 
 # Pattern B — kubectl delete <critical_resource>. The verb comes right
 # after `kubectl`, then resource-type positional. The critical-resource
@@ -120,7 +155,7 @@ _HARD_BLOCK_APPLY_RE = re.compile(r"^kubectl\s+apply\b", re.IGNORECASE)
 # `_extract_positional_resource`) so flag values like `--namespace=kube-node-lease`
 # (which contains "node") and `--namespace=...` (which contains "namespace") do
 # NOT false-positive.
-_HARD_BLOCK_DELETE_RE = re.compile(r"^kubectl\s+delete\b", re.IGNORECASE)
+_HARD_BLOCK_DELETE_RE = re.compile(rf"^kubectl\s+{_KUBECTL_GLOBAL_FLAGS}delete\b", re.IGNORECASE)
 
 # Resource-type positional token extraction. Skips flags (tokens starting
 # with `-`). Returns the first non-flag token after the verb, or "" if
@@ -131,8 +166,17 @@ _RESOURCE_TYPE_TOKEN_RE = re.compile(r"^[A-Za-z][\w./-]*$")
 # the destructive verbs that touch cluster state across namespaces:
 # delete/edit/scale/patch/replace/drain. `apply` is handled by Pattern A
 # alone since it is globally blocked.
+# Pattern C — kubectl + mutating verb + protected namespace. Verbs are
+# the destructive verbs that touch cluster state across namespaces:
+# delete/edit/scale/patch/replace/drain plus the metadata mutators
+# (annotate/label/taint) and node lifecycle verbs (cordon/uncordon). Also
+# rollout/create/exec/cp/etc. can harm control-plane state. `apply` is
+# handled by Pattern A alone since it is globally blocked.
 _HARD_BLOCK_MUTATING_VERBS_RE = re.compile(
-    r"^kubectl\s+(delete|edit|scale|patch|replace|drain)\b",
+    rf"^kubectl\s+{_KUBECTL_GLOBAL_FLAGS}(?:delete|edit|scale|patch|replace|drain|"
+    rf"annotate|label|taint|cordon|uncordon|rollout|create|exec|cp|"
+    rf"set\s+env|set\s+image|set\s+resources|set\s+serviceaccount|set\s+selector|"
+    rf"expose|rolling-update)\b",
     re.IGNORECASE,
 )
 
@@ -161,7 +205,7 @@ _HARD_BLOCK_MUTATING_VERBS_RE = re.compile(
 #   openstack server delete mfke-api-gw-1            ("fke" substring)
 #   openstack volume set --bootable fke-data-vol    ("fke" substring)
 _OPENSTACK_MUTATING_VERB_RE = re.compile(
-    r"^openstack\s+\S+\s+(delete|set|unset|update|remove)\b",
+    r"^openstack\s+(?:\S+\s+){0,3}(?:delete|set|unset|update|remove)\b",
     re.IGNORECASE,
 )
 _OPENSTACK_FKE_RE = re.compile(r"fke", re.IGNORECASE)
@@ -169,10 +213,12 @@ _OPENSTACK_FKE_RE = re.compile(r"fke", re.IGNORECASE)
 
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
 # Shell command separators we tolerate before the kubectl/helm mutation.
-# `&&`, `||`, `;` — any of these can sit between `export KUBECONFIG=...`
-# and `kubectl delete ...`. We split on each occurrence so blocked segments
-# past a separator still trigger. Aided by `_strip_env_prefix`.
-_SEPARATOR_RE = re.compile(r"(?:&&|\|\||;)")
+# `&&`, `||`, `;`, and single `|` (pipe). The LLM pipes manifests like
+# `echo 'apiVersion: ...' | kubectl --kubeconfig=... apply -f -` to bypass
+# detection — single pipe must split too. Regex alternation tries
+# left-to-right, so `||` must come before `|` so it matches as a single
+# separator (not `|` twice with empty middle).
+_SEPARATOR_RE = re.compile(r"(?:&&|\|\||;|\|)")
 
 
 def _strip_env_prefix(cmd: str) -> str:
