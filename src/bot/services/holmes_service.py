@@ -49,6 +49,11 @@ def _patch_bash_kill_process_group():
     Fix: run the shell in its own session (start_new_session=True) and on timeout
     send SIGKILL to the entire process group with os.killpg. This kills bash plus
     every descendant it spawned.
+
+    KB rules injection is NO LONGER done here — it's done uniformly for ALL
+    tool results (bash + custom Holmes tools + MCP + HTTP) by patching the
+    single chokepoint `holmes.core.models.format_tool_result_data`. See
+    `_patch_format_tool_result_data` below.
     """
     import os
     import signal
@@ -63,7 +68,7 @@ def _patch_bash_kill_process_group():
     # `from ...common.bash import execute_bash_command`, which binds the
     # function reference into bash_toolset's own namespace at import time.
     # Patching only the source module leaves that bound reference pointing
-    # at the original function, so bash_toolset._invoke would keep calling
+    # at stock Holmes, so bash_toolset._invoke would keep calling
     # stock Holmes. Patch both places.
     from holmes.plugins.toolsets.bash import bash_toolset as holmes_bash_toolset
 
@@ -83,7 +88,6 @@ def _patch_bash_kill_process_group():
             stdout, _ = process.communicate(timeout=timeout)
             stdout = stdout.strip() if stdout else ""
             stdout = check_oom_and_append_hint(stdout, process.returncode)
-            stdout = _maybe_inject_kb_rules(stdout, cmd)
             return holmes_bash.BashResult(
                 stdout=stdout,
                 return_code=process.returncode,
@@ -100,7 +104,6 @@ def _patch_bash_kill_process_group():
                 process.kill()
             stdout, _ = process.communicate()
             stdout = stdout.strip() if stdout else ""
-            stdout = _maybe_inject_kb_rules(stdout, cmd)
             return holmes_bash.BashResult(
                 stdout=stdout,
                 return_code=None,
@@ -113,63 +116,110 @@ def _patch_bash_kill_process_group():
     logger.info("Patched execute_bash_command to kill process group on timeout")
 
 
-# Snapshot tools whose stdout should get KB rules appended. Match by
-# command substring — broad enough to catch whichever toolset ships the
-# gardener snapshot tool (custom YAML). Avoid matching generic `kubectl
-# get` so we don't pay KB embed cost on plain pod listings.
-_SNAPSHOT_CMD_MARKERS = (
+# Snapshot tools whose output should get KB rules appended. Matched FIRST
+# against ``tool_name`` (custom Holmes tools like gardener_controlplane_snapshot
+# are registered under their YAML-declared name) and FALLBACK against
+# ``tool_result.invocation`` (the bash command string for toolset=Bash — for
+# cases where a snapshot is invoked via a Bash tool wrapping the snapshot
+# script rather than a native Python tool).
+_SNAPSHOT_TOOL_MARKERS = (
     "gardener_controlplane_snapshot",
     "controlplane_snapshot",
     "control-plane snapshot",
     "snapshot.sh",
 )
 
-# Heuristic: append KB rules only when stdout is at least this big. A real
-# cluster snapshot spans 100k+ chars; a tiny stdout means the snapshot
-# script failed early (kubeconfig bad, shoot not found) and there's no
-# signal worth matching against. Skip the KB call to save embed API cost.
+# Heuristic: append KB rules only when the tool output is at least this big.
+# A real cluster snapshot spans 100k+ chars; a tiny output means the snapshot
+# script failed early (kubeconfig bad, shoot not found) and there's no signal
+# worth matching against. Skip the KB call to save embed API cost.
 _SNAPSHOT_MIN_STDOUT_CHARS = 5000
 
-# Per-snapshot KB match budget. Snapshot stdout can hit 700k chars; the
-# embed call batched at 32 chunks/request takes ~5s for 30k chars. We
-# cap the input so embeds stay under ~10s even with a slow API. Above
-# the cap, keep the first + last slice so both early events and trailing
-# shoot conditions make it into the cosine/BM25 tracks.
+# Per-snapshot KB match budget. Snapshot output can hit 700k chars; the embed
+# call batched at 32 chunks/request takes ~5s for 30k chars. Cap the input so
+# embeds stay under ~10s even with a slow API. Above the cap, keep the first
+# + last slice so both early events and trailing shoot conditions make it
+# into the cosine/BM25 tracks.
 _KB_QUERY_MAX_CHARS = 60000
 
 
-def _maybe_inject_kb_rules(stdout: str, cmd: str) -> str:
-    """Append a KB rules block to snapshot-tool stdout before Holmes
-    sees it. In-process — no HTTP, no aiohttp body limit, no curl timeout.
+def _maybe_inject_kb_rules_into_tool_result(tool_result, tool_name: str) -> None:
+    """Mutate ``tool_result.data`` in place — append a KB rules block to the
+    snapshot tool's textual output before Holmes serializes it to the LLM.
 
-    Trigger conditions:
-      - Command matches `_SNAPSHOT_CMD_MARKERS` (gardener snapshot, etc).
-      - stdout is at least `_SNAPSHOT_MIN_STDOUT_CHARS` chars (signal-rich).
+    Works for both native Holmes custom tools (matched by ``tool_name``) and
+    Bash-wrapped snapshot scripts (matched by ``tool_result.invocation`` —
+    the bash command string). Custom tools set ``data`` to either a string
+    or a JSON-serializable dict; we handle both shapes.
 
-    On any failure (KB disabled, store empty, embed API down), returns
-    the original stdout unchanged — KB must never break the tool result.
+    On any failure (KB disabled, store empty, embed API down, no snapshot
+    marker, output too small) the ``tool_result`` is left untouched — KB
+    must never break the tool result the LLM sees.
     """
-    if not stdout or len(stdout) < _SNAPSHOT_MIN_STDOUT_CHARS:
-        return stdout
-    if not any(m in cmd for m in _SNAPSHOT_CMD_MARKERS):
-        return stdout
     try:
-        from src.bot.services.kb_store import KBStore, format_rules_block
-        # Use the singleton wired in main.py if available; fall back to a
-        # fresh KBStore when called outside the bot (CLI debugging).
+        if tool_result is None:
+            return
+        # Determine whether this tool result is a snapshot-tool result.
+        # Custom Holmes tools use ``tool_name`` directly; Bash toolsets carry
+        # the command in ``tool_result.invocation``.
+        invocation = getattr(tool_result, "invocation", None) or ""
+        matched = (tool_name in _SNAPSHOT_TOOL_MARKERS) or any(
+            m in tool_name or m in (invocation or "") for m in _SNAPSHOT_TOOL_MARKERS
+        )
+        if not matched:
+            return
+
+        # Extract textual output regardless of data shape (str / dict / list).
+        data = getattr(tool_result, "data", None)
+        if isinstance(data, str):
+            stdout = data
+        elif isinstance(data, dict):
+            # Common Holmes custom-tool pattern: {'output': ...} or {'stdout': ...}
+            stdout = (
+                data.get("output")
+                or data.get("stdout")
+                or data.get("result")
+                or ""
+            )
+            if not isinstance(stdout, str):
+                # Last resort — stringify the dict so we have something to match.
+                import json as _json
+                stdout = _json.dumps(data, ensure_ascii=False)
+        else:
+            return
+
+        if not stdout or len(stdout) < _SNAPSHOT_MIN_STDOUT_CHARS:
+            return
+
+        from src.bot.services.kb_store import format_rules_block
         store = _get_kb_store_singleton()
         if store is None:
-            return stdout
+            return
         # Cap input length — see _KB_QUERY_MAX_CHARS comment.
         query_text = stdout if len(stdout) <= _KB_QUERY_MAX_CHARS else (
             stdout[:_KB_QUERY_MAX_CHARS // 2] + "\n...[truncated]...\n" + stdout[-_KB_QUERY_MAX_CHARS // 2:]
         )
         rules = store.get_relevant_rules(query_text)
         if not rules:
-            return stdout
+            return
         block = format_rules_block(rules)
-        # Fire-and-forget increment. Same pattern as the old /kb_match
-        # HTTP handler — don't block tool return on the Mongo write.
+        # Mutate data in place — Holmes reads tool_result.data after this
+        # returns, via get_stringified_data().
+        if isinstance(data, str):
+            tool_result.data = stdout + "\n" + block
+        elif isinstance(data, dict):
+            key = (
+                "output" if "output" in data
+                else "stdout" if "stdout" in data
+                else "result" if "result" in data
+                else None
+            )
+            if key is not None:
+                data[key] = (data[key] or "") + "\n" + block
+            else:
+                data["_kb_rules"] = block
+        # Fire-and-forget match_count increment. Same pattern as the old
+        # /kb_match HTTP handler — don't block tool return on the Mongo write.
         rule_ids = [r["rule_id"] for r in rules]
         import asyncio as _asyncio
         try:
@@ -179,10 +229,46 @@ def _maybe_inject_kb_rules(stdout: str, cmd: str) -> str:
             # No event loop in this thread (Holmes runs sync) — just call
             # record_matches directly. It swallows its own DB errors.
             store.record_matches(rule_ids)
-        return stdout + "\n" + block
     except Exception as e:
-        logger.warning("kb_injection_failed", error=str(e), error_type=type(e).__name__)
-        return stdout
+        logger.warning(
+            "kb_injection_failed",
+            error=str(e),
+            error_type=type(e).__name__,
+            tool_name=tool_name,
+        )
+
+
+def _patch_format_tool_result_data():
+    """Monkey-patch the universal Holmes tool-result formatter so we can
+    inject KB rules into a tool's output BEFORE the LLM sees it.
+
+    The patched chokepoint is ``holmes.core.models.format_tool_result_data``.
+    Every tool result (bash, custom Holmes tools, MCP, HTTP, frontend-resumed)
+    flows through this module-level function before becoming the ``content``
+    text of the LLM ``role="tool"`` message. Patching here is strictly more
+    reliable than the previous ``bash.execute_bash_command`` patch, which
+    only fired for bash-toolset calls and missed custom Holmes tools like
+    ``gardener_controlplane_snapshot`` entirely.
+
+    We mutate ``tool_result.data`` in place before calling the original,
+    so the existing serialization path (``get_stringified_data``) still
+    builds the final string — we just feed it richer input.
+    """
+    import holmes.core.models as _m
+
+    if getattr(_m, "_mfke_kb_patched", False):
+        return
+
+    _orig = _m.format_tool_result_data
+
+    def format_tool_result_data_patched(tool_result, tool_call_id, tool_name, extra_metadata=None):
+        _maybe_inject_kb_rules_into_tool_result(tool_result, tool_name)
+        return _orig(tool_result, tool_call_id, tool_name, extra_metadata)
+
+    format_tool_result_data_patched._mfke_orig = _orig
+    _m.format_tool_result_data = format_tool_result_data_patched
+    _m._mfke_kb_patched = True
+    logger.info("Patched holmes.core.models.format_tool_result_data for KB injection")
 
 
 # Set by HolmesService.__init__ — gives _maybe_inject_kb_rules access to
@@ -409,6 +495,11 @@ class HolmesService:
             # Patch bash tool to kill the whole process group on timeout, so
             # kubectl/wget/curl children don't keep the worker thread stuck.
             _patch_bash_kill_process_group()
+            # Patch the universal tool-result formatter so KB rules get
+            # appended to snapshot tool output (both native custom tools
+            # like gardener_controlplane_snapshot and bash-wrapped snapshot
+            # scripts) before Holmes sends it to the LLM.
+            _patch_format_tool_result_data()
             logger.info("Holmes service initialized successfully",
                        model=self._config.model,
                        api_base=getattr(self._config, 'api_base', None))
