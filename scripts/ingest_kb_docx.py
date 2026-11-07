@@ -52,6 +52,28 @@ from src.bot.utils.config import config as bot_config
 from src.bot.utils.mongodb import MongoDB
 from src.bot.services import vision_service
 
+# Configure structlog + stdlib logging from LOG_LEVEL env (default INFO).
+# Without this the structlog logger inherits WARNING and all the
+# per-article [ok] progress lines + rule-count summaries are silent.
+import logging as _stdlib_logging
+_log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+_stdlib_logging.basicConfig(
+    level=getattr(_stdlib_logging, _log_level, _stdlib_logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+structlog.configure(
+    processors=[
+        structlog.stdlib.filter_by_level,
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(getattr(_stdlib_logging, _log_level, _stdlib_logging.INFO)),
+    cache_logger_on_first_use=True,
+)
+
 logger = structlog.get_logger(__name__)
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
