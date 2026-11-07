@@ -148,6 +148,38 @@ class DistilledFactStore:
                 run_id=run_id,
             )
 
+    def retire_topic_facts(self, chat_id: int, topic_id: int) -> int:
+        """Delete every fact previously stored for this topic, regardless of
+        which run produced it. Called by ConsolidatorService before inserting
+        a new run's facts — clean-slate semantics.
+
+        Why delete (not soft-mark): the user wants "1 fully-formed fact per
+        entity, no temporal accumulation". Old facts lingering with
+        ``superseded=True`` would still consume space + index slots, and
+        ``get_injectable_facts`` already filters by latest_run_id — soft-
+        mark adds work for no benefit.
+
+        Sync — called from the consolidator's async _consolidate path
+        (not awaited, runs in the same thread context as the consolidator's
+        other store calls). Best-effort: errors bubble to the caller to log.
+
+        Returns the number of deleted documents.
+        """
+        try:
+            result = self.facts.delete_many(
+                {"source_chat_id": chat_id, "source_topic_id": topic_id}
+            )
+            return int(getattr(result, "deleted_count", 0) or 0)
+        except Exception as e:
+            logger.warning(
+                "distilled_facts_retire_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                chat_id=chat_id,
+                topic_id=topic_id,
+            )
+            return 0
+
     # ------------------------------------------------------------------ #
     # Reads (called from sync _build_holmes_messages in HolmesService)
     # ------------------------------------------------------------------ #

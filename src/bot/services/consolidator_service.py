@@ -62,17 +62,49 @@ logger = structlog.get_logger(__name__)
 
 
 _SYSTEM_PROMPT = (
-    "You are a knowledge extractor for a Kubernetes operations Telegram bot. "
-    "Read the chat transcript below and extract durable, reusable facts worth "
-    "remembering for future conversations: MFKE/Gardener/OpenStack architecture, "
-    "runbook steps, conventions, account/cluster mappings, common pitfalls and "
-    "their fixes. Skip everything that only matters in this conversation "
-    "(the specific bug being debugged, ad-hoc commands, greetings, status "
-    "updates). Each fact must be one self-contained declarative sentence in "
-    "English or Vietnamese. Output STRICT JSON only — no prose, no markdown "
-    "fences:\n"
-    '{"facts":[{"text":"one self-contained declarative sentence"}]}\n'
-    'Return {"facts":[]} when nothing is reusable.'
+    "You are a knowledge extractor for an MFKE/Gardener operations Telegram bot.\n"
+    "Read the chat transcript below and extract GENERAL, reusable operational "
+    "knowledge that will help in future conversations on ANY cluster — not "
+    "pinned to one specific shoot, namespace, or account.\n\n"
+    "## CRITICAL CONSTRAINTS\n"
+    "1. Each fact must be ONE RICH PARAGRAPH of about 5 sentences. Combine "
+    "related observations about the same pattern, component, or behavior into "
+    "one paragraph. Do NOT split one insight into multiple atomic one-liners, "
+    "and do NOT emit a single terse sentence either.\n"
+    "2. Generalize away from the specific cluster name in the transcript. "
+    "Replace 'In the fmon-agent-1-yant1n2u Shoot' with 'In MFKE Shoots running "
+    "<component>' or 'For OTEL agents on MFKE shoots'. Keep technical specifics "
+    "that are general (image names, namespace conventions, controller names, "
+    "error signatures, OpenStack flavor/gardener region mappings) — drop "
+    "qualifiers that only identify a single cluster.\n"
+    "3. Scope = MFKE, Gardener, OpenStack, VMware/vSphere platforms from a "
+    "operator's lens. Extract:\n"
+    "   - Architecture patterns (OTEL agents deployed as DaemonSet/StatefulSet "
+    "     on MFKE shoots, control plane pod topology in seeds, MCM boot flow, "
+    "     etcd backup-restore sidecar behavior)\n"
+    "   - Runbook patterns proven in this conversation (how a senior engineer "
+    "     diagnosed an issue, what they checked, in what order)\n"
+    "   - Cross-component gotchas (CSI driver ↔ Cinder, MCM ↔ OpenStack "
+    "     image_id, Gardenlet ↔ seed throttling)\n"
+    "   - Common pitfalls + their fixes observed here\n"
+    "   - Account/tenant/project naming conventions that hold across the "
+    "     platform\n"
+    "4. SKIP:\n"
+    "   - Conversation-ephemeral state: 'currently debugging X', 'patch in "
+    "     progress', a specific transient log line, a one-off scaling event\n"
+    "   - Generic Kubernetes textbook truths with no MFKE/Gardener flavor "
+    "     ('StatefulSet pods are ordered' — until you tie it to a Gardener\n"
+    "     control plane pattern)\n"
+    "   - Greetings, status updates, ad-hoc kubectl commands with no "
+    "     reusable lesson\n"
+    "5. The fact must read as a self-contained knowledge paragraph that a "
+    "   senior engineer would write in a runbook — not as a transcript "
+    "   excerpt with shoot names still in it.\n\n"
+    "## OUTPUT FORMAT\n"
+    "Strict JSON only — no prose, no markdown fences:\n"
+    '{"facts":[{"text":"<5-sentence general-knowledge paragraph>"}]}\n'
+    'Return {"facts":[]} when nothing qualifies — a conversation with zero '
+    'reusable lessons should produce an empty array, not filler.'
 )
 
 
@@ -303,6 +335,25 @@ class ConsolidatorService:
 
         new_count = 0
         dup_count = 0
+        # Clean-slate per topic: retire all facts from prior runs of this
+        # topic before inserting the new run's facts. The user's intent is
+        # "1 fact per entity, fully formed, no temporal accumulation" —
+        # if a new run produces richer facts they overwrite (not append to)
+        # the old ones. Same-text-upsert is insufficient because the prior
+        # facts would still linger and confuse the injection layer.
+        try:
+            self._store.retire_topic_facts(chat_id, topic_id)
+        except Exception as e:
+            logger.warning(
+                "distilled_facts_retire_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                chat_id=chat_id,
+                topic_id=topic_id,
+            )
+            # Continue anyway — best-effort. Worst case the new facts
+            # coexist with old ones for this topic; injection still picks
+            # the latest run_id (the new one) via distilled_runs.
         for fact in facts:
             if not isinstance(fact, dict):
                 continue
