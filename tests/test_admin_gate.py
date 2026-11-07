@@ -572,3 +572,184 @@ def test_hard_block_chained_with_separator_triggers(monkeypatch):
     assert r.status.value == "error"
     # Hard-block wins; the first benign segment doesn't matter
     assert "hard_block_protected_ns" in r.error or "hard_block_delete_critical" in r.error
+
+
+# ---------- Hard-block rules (Pattern D: openstack non-fke mutations) ----------
+
+@pytest.mark.parametrize("cmd", [
+    # delete operations on non-fke resources
+    "openstack server delete prod-web-1",
+    "openstack volume delete prod-vol-1",
+    "openstack network delete prod-net",
+    "openstack subnet delete prod-subnet",
+    "openstack stack delete my-stack",
+    "openstack image delete prod-img",
+    "openstack router delete prod-rtr",
+    "openstack port delete prod-port",
+    # set/unset — property mutations
+    "openstack volume set --bootable prod-vol",
+    "openstack server set --property foo=bar prod-web-1",
+    "openstack server unset --property foo prod-web-1",
+    # update (e.g. Heat stack update)
+    "openstack stack update my-stack -t template.yaml",
+    # remove (role/aggregate membership)
+    "openstack role remove --user alice --project prod Member",
+    # positional name flag forms
+    "openstack server delete --server prod-web-1",
+    # case-insensitive: verb in caps, name in caps
+    "OPENSTACK SERVER DELETE PROD-WEB-1",
+    # env-prefix tolerated
+    "OS_AUTH_URL=https://x openstack server delete prod-web-1",
+    # bare verb with no name token — blocked on ambiguity (no fke anywhere)
+    "openstack server delete",
+])
+def test_hard_block_openstack_non_fke_blocks(monkeypatch, cmd):
+    """Pattern D: openstack <verb> with no fke token in command blocked."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_openstack_non_fke" in r.error
+    assert tool.last_params is None
+
+
+@pytest.mark.parametrize("cmd", [
+    # fke in positional name → allowed
+    "openstack server delete mfke-api-gw-1",
+    "openstack volume delete fke-data-vol",
+    "openstack stack update fke-stack -t t.yaml",
+    "openstack network delete fke-net",
+    # fke as substring of a larger name → still allowed (case-insensitive)
+    "openstack server delete MFKE-PROD-DB-1",
+    "openstack volume delete somethinfke-thing",
+    # fke in flag value (--server fke-x) → allowed
+    "openstack server delete --server fke-web-1",
+    # fke in a flag value with =
+    "openstack server delete --server=fke-web-1",
+])
+def test_hard_block_openstack_fke_passes_through(monkeypatch, cmd):
+    """fke-named openstack resources pass through (admin-gate may still
+    block non-admins, but the hard-block D pattern does not fire)."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": cmd}, ctx)
+    # Not hard-blocked — admin path passes through
+    assert "hard_block_openstack_non_fke" not in (r.error or "")
+
+
+@pytest.mark.parametrize("cmd", [
+    # read-only verbs — not mutations
+    "openstack server show prod-web-1",
+    "openstack server list",
+    "openstack volume list --all-projects",
+    "openstack network show prod-net",
+    "openstack stack list",
+    "openstack image list",
+    # mutating verbs against fke resources — allowed (no fke check fails)
+    "openstack server delete fke-x",
+])
+def test_hard_block_openstack_read_only_not_affected(monkeypatch, cmd):
+    """Read-only openstack commands do not trigger any hard-block."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": cmd}, ctx)
+    assert "hard_block_openstack_non_fke" not in (r.error or "")
+
+
+def test_hard_block_openstack_non_fke_beats_admin(monkeypatch):
+    """Hard-block D fires BEFORE admin check — admin issuing openstack
+    server delete prod-web-1 still blocked."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": "openstack server delete prod-web-1"}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_openstack_non_fke" in r.error
+    # user_approved MUST NOT be flipped
+    assert ctx.user_approved is False
+
+
+def test_hard_block_openstack_chained_with_separator_triggers(monkeypatch):
+    """Mutating openstack verb via && still triggers hard-block when no
+    fke token in any segment that has the verb."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    cmd = "openstack server list && openstack volume delete prod-vol"
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_openstack_non_fke" in r.error
+
+
+def test_hard_block_openstack_chained_with_fke_in_first_segment_does_not_save(monkeypatch):
+    """A fke token in the FIRST (benign) segment does not save a non-fke
+    mutation in the SECOND segment — each segment is scanned independently."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    cmd = "openstack server show fke-x && openstack server delete prod-web"
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_openstack_non_fke" in r.error
+
+
+# ---------- Extension* namespace fix ----------
+
+@pytest.mark.parametrize("cmd", [
+    "kubectl delete -n extensions pod foo",         # exact "extensions" no longer blocked
+    "kubectl delete -n extension pod foo",
+    "kubectl delete -n extensions-foo pod foo",
+    "kubectl delete -n extension-gardener-foo pod foo",
+    "kubectl edit -n extensions svc bar",
+    "kubectl scale -n extension deploy/x --replicas=2",
+])
+def test_extension_namespace_pattern_blocks(monkeypatch, cmd):
+    """Post-fix: `extension*` (prefix match) blocks; pure `extensions`
+    alone is NOT a hard-block anymore — only `extension[\\w-]*` matches,
+    so `extensions` and `extensions-foo` both match as prefix forms.
+    However `extension` alone also matches."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_protected_ns" in r.error
+
+
+def test_extension_namespace_not_false_positive_on_unrelated_ns(monkeypatch):
+    """Namespaces like `my-extension-data` would still match (prefix). User
+    decided extension* is protected — that's the policy. Verify a name
+    that does NOT start with `extension` does not false-positive."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    # unrelated namespace → not blocked (admin pass-through succeeds).
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": "kubectl delete -n my-ns pod foo"}, ctx)
+    assert "hard_block_protected_ns" not in (r.error or "")

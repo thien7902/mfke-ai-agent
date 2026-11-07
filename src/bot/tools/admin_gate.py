@@ -91,12 +91,15 @@ _CRITICAL_RESOURCE_RE = re.compile(
 # (with optional `=` or whitespace separator). Names: kube-system,
 # kube-public, kube-node-lease, garden, gardener-system, extensions, plus
 # anything starting with `garden-`. `shoot--...` deliberately NOT matched
-# per user choice.
+# per user choice. `extension*` (gardener extension namespaces, not a literal
+# `extensions` namespace) — matched via prefix only per user note that no
+# namespace is exactly named `extensions`.
 _PROTECTED_NS_NAME_RE = re.compile(
     r"\b("
     r"kube-system|kube-public|kube-node-lease|"
-    r"garden|gardener-system|extensions|"
-    r"garden-[\w-]+"
+    r"garden|gardener-system|"
+    r"garden-[\w-]+|"
+    r"extension[\w-]*"
     r")\b",
     re.IGNORECASE,
 )
@@ -132,6 +135,36 @@ _HARD_BLOCK_MUTATING_VERBS_RE = re.compile(
     r"^kubectl\s+(delete|edit|scale|patch|replace|drain)\b",
     re.IGNORECASE,
 )
+
+# Pattern D — OpenStack mutating verbs on resources whose name does NOT
+# contain "fke". OpenStack CLI verbs that change state: delete (destroy),
+# set/unset (mutate properties), update (Heat stack update), remove (role/
+# aggregate membership).
+#
+# User policy: only allow these verbs against resources whose name contains
+# `fke` (case-insensitive substring). Any non-`fke` target is blocked —
+# admins too — because the bot might be inspecting prod/customer cloud
+# resources shared with other teams. Operators run mutations via /shell
+# manually after review.
+#
+# Detection: any token in the command past `openstack <resource-type> <verb>`
+# that contains "fke" (case-insensitive) marks the command as fke-targeted.
+# Tokens starting with `-` are flags (their values can still be resource
+# names — `--server fke-1` — those are scanned too). A bare `openstack
+# server delete` with no name argument is blocked on grounds of ambiguity.
+#
+# Examples blocked:
+#   openstack server delete prod-web-1               (no "fke")
+#   openstack volume set --bootable prod-vol         (no "fke")
+#   openstack stack update my-stack                 (no "fke")
+# Examples allowed:
+#   openstack server delete mfke-api-gw-1            ("fke" substring)
+#   openstack volume set --bootable fke-data-vol    ("fke" substring)
+_OPENSTACK_MUTATING_VERB_RE = re.compile(
+    r"^openstack\s+\S+\s+(delete|set|unset|update|remove)\b",
+    re.IGNORECASE,
+)
+_OPENSTACK_FKE_RE = re.compile(r"fke", re.IGNORECASE)
 
 
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
@@ -271,6 +304,13 @@ def _mutation_reason(cmd: Any, *, hard_block_only: bool = False) -> Optional[str
                 ns_value = ns_match.group(1).strip()
                 if _PROTECTED_NS_NAME_RE.fullmatch(ns_value):
                     return "hard_block_protected_ns"
+        # Pattern D: `openstack <resource> <delete|set|unset|update|remove>`
+        # targeting a resource whose name does NOT contain "fke". The bot
+        # may inspect shared prod/customer cloud resources — mutations on
+        # non-fke targets are blocked regardless of admin status; operators
+        # run them via /shell manually after review.
+        if _OPENSTACK_MUTATING_VERB_RE.match(stripped) and not _OPENSTACK_FKE_RE.search(stripped):
+            return "hard_block_openstack_non_fke"
         if hard_block_only:
             continue
         # --- Admin-gate mutation rules (skip for admins) -----------
@@ -442,12 +482,23 @@ _HARD_BLOCK_MESSAGES = {
     ),
     "hard_block_protected_ns": (
         "kubectl <verb> in a protected namespace (kube-system / kube-public "
-        "/ kube-node-lease / garden / gardener-system / extensions / "
+        "/ kube-node-lease / garden / gardener-system / extension* / "
         "garden-*) is blocked by the bot's safety policy — these namespaces "
         "hold K8s/Gardener control-plane state. Do NOT retry or target a "
         "different protected namespace. Pivot to read-only investigation: "
         "`kubectl get` / `describe` / `logs` to gather context, then "
         "instruct the user to run the change via /shell manually."
+    ),
+    "hard_block_openstack_non_fke": (
+        "openstack <delete|set|unset|update|remove> on a resource whose "
+        "name does NOT contain 'fke' is blocked by the bot's safety policy — "
+        "the bot may inspect shared prod/customer OpenStack cloud resources "
+        "and mutations on non-fke targets are not auto-approved. Do NOT "
+        "retry or alternative-target a different non-fke resource. Pivot "
+        "to read-only investigation: `openstack <resource> show` / `list` "
+        "to gather context, then instruct the user to run the change via "
+        "/shell manually. FKE-targeted resources (name contains 'fke') "
+        "pass through."
     ),
 }
 
