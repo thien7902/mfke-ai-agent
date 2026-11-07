@@ -141,6 +141,12 @@ class Config:
     # Wall-clock cap on a single consolidator LLM call. A hung model call
     # would otherwise hold the cross-topic semaphore indefinitely.
     consolidator_llm_timeout_seconds: int = 60
+    # Cosine threshold for deduplicating distilled facts at inject time.
+    # Two facts with cosine ≥ this are treated as duplicates; the newest
+    # one (per `created_at`) is kept, the older one dropped from the
+    # system-prompt bullets. 0 disables dedup (~1.0 = only drop exact twins).
+    # 0.92 is a conservative floor for BGE-m3 on Vietnamese paragraph facts.
+    distilled_dedup_cosine: float = 0.92
 
     # Known-issues KB (FPT Container). Disabled by default. Enable after
     # running `python -m scripts.ingest_kb_docx <docx path>` once to seed
@@ -210,6 +216,7 @@ def load_config() -> Config:
         consolidator_max_turns=int(os.getenv("CONSOLIDATOR_MAX_TURNS", "20")),
         consolidator_max_concurrent=int(os.getenv("CONSOLIDATOR_MAX_CONCURRENT", "5")),
         consolidator_llm_timeout_seconds=int(os.getenv("CONSOLIDATOR_LLM_TIMEOUT_SECONDS", "60")),
+        distilled_dedup_cosine=float(os.getenv("DISTILLED_DEDUP_COSINE", "0.92")),
         kb_enabled=os.getenv("KB_ENABLED", "").lower() in ("1", "true", "yes", "on"),
         kb_top_k=int(os.getenv("KB_TOP_K", "50")),
         kb_distill_model=os.getenv("KB_DISTILL_MODEL") or os.getenv("CONSOLIDATOR_MODEL") or None,

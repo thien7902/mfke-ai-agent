@@ -25,6 +25,7 @@ consolidator log surface gets the warning; user-visible behavior is
 "no facts this turn" rather than a crashed turn.
 """
 import datetime
+import math
 from typing import List, Optional
 
 import structlog
@@ -32,9 +33,81 @@ from pymongo import ASCENDING, DESCENDING
 from pymongo.collection import Collection
 from pymongo.errors import DuplicateKeyError
 
+from src.bot.utils.config import config as bot_config
 from src.bot.utils.mongodb import MongoDB
 
 logger = structlog.get_logger(__name__)
+
+
+def _cosine(a, b) -> float:
+    if not a or not b:
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+def _dedup_facts_by_cosine(facts: List[dict], threshold: float) -> List[dict]:
+    """Drop near-duplicate facts (cosine ≥ ``threshold``) by greedy
+    pairwise comparison. Newest fact wins — when two facts collide, the
+    one with the LATER ``created_at`` is kept in the output list.
+
+    Inputs are sorted ascending by ``created_at`` (the caller's sort order),
+    so iterating from the end toward the start, building a kept-list, gives
+    the newest facts priority: a fact is kept iff none of the already-kept
+    (newer) facts is similar to it.
+
+    Embeddings are batched via ``embed_chunks`` (BGE-m3, 1024-dim). On any
+    embed failure the caller falls back to the un-deduplicated list — we
+    surface that as an exception so the wrapper can log + return the
+    original ``facts`` untouched.
+    """
+    if not facts:
+        return facts
+    # Lazy import to keep distilled_fact_store importable in tests that
+    # don't exercise the embed path (avoids the OPENAI_API_KEY requirement
+    # at module load).
+    from src.bot.services.embedder import embed_chunks
+
+    texts = [(f.get("text") or "").strip() for f in facts]
+    if not any(texts):
+        return facts
+    vectors = embed_chunks(texts)
+    if not vectors or all(not v for v in vectors):
+        # Embed produced nothing usable — caller already records the
+        # warning; bubble up as "no dedup possible".
+        raise RuntimeError("embed_chunks returned no vectors")
+    # Greedy from newest (end of ascending list) to oldest.
+    kept: List[dict] = []
+    kept_vecs: List[List[float]] = []
+    for i in range(len(facts) - 1, -1, -1):
+        v = vectors[i] if i < len(vectors) else []
+        if not v:
+            # No embedding for this fact — keep it (can't compare), do not
+            # block the dedup pass for the rest.
+            kept.append(facts[i])
+            kept_vecs.append([])
+            continue
+        dup = False
+        for kv in kept_vecs:
+            if not kv:
+                continue
+            if _cosine(v, kv) >= threshold:
+                dup = True
+                break
+        if not dup:
+            kept.append(facts[i])
+            kept_vecs.append(v)
+    # Reverse to preserve original ascending created_at order in the output.
+    kept.reverse()
+    return kept
 
 
 class DistilledFactStore:
@@ -221,7 +294,8 @@ class DistilledFactStore:
     # ------------------------------------------------------------------ #
 
     def get_injectable_facts(self) -> List[dict]:
-        """Return facts from the latest run per topic, across all topics.
+        """Return facts from the latest run per topic, across all topics,
+        with near-duplicate facts deduplicated by cosine similarity.
 
         Sync — called from the sync ``_build_holmes_messages`` path so the
         prompt is assembled without an extra thread hop. Returns ``[]`` on
@@ -229,10 +303,18 @@ class DistilledFactStore:
         turn. Documents are projected to ``{text, source_topic_id,
         source_run_id, created_at}`` for the caller.
 
-        Algorithm: read all latest-run pointers from ``distilled_runs``
-        (one doc per topic), then fetch facts whose ``source_run_id`` is in
-        that set. Older runs' facts stay in ``distilled_facts`` but are
-        filtered out here — this is the "newer run wins per topic" filter.
+        Algorithm:
+          1. Read all latest-run pointers from ``distilled_runs`` (one doc
+             per topic), then fetch facts whose ``source_run_id`` is in
+             that set. Older runs' facts stay in ``distilled_facts`` but
+             are filtered out here — this is the "newer run wins per topic"
+             filter.
+          2. Optionally dedup the surviving facts via cosine similarity on
+             their text embeddings (``distilled_dedup_cosine`` threshold).
+             Two facts above the threshold are treated as duplicates; the
+             newest one (per ``created_at``) wins. Dedup failures (embed
+             API down, threshold disabled) fall back to returning the
+             un-deduplicated list — never break the prompt.
         """
         try:
             latest_runs = list(
@@ -256,7 +338,7 @@ class DistilledFactStore:
                 )
                 .sort("created_at", ASCENDING)
             )
-            return list(cursor)
+            facts = list(cursor)
         except Exception as e:
             logger.warning(
                 "distilled_facts_get_injectable_failed",
@@ -264,3 +346,27 @@ class DistilledFactStore:
                 error_type=type(e).__name__,
             )
             return []
+
+        # Dedup pass — fails open (return un-deduplicated list) if the embed
+        # API is unavailable. Failing open means the prompt may carry near-
+        # duplicates for one turn; never breaks the bot.
+        threshold = getattr(bot_config, "distilled_dedup_cosine", 0.0) or 0.0
+        if not facts or threshold <= 0.0:
+            return facts
+        try:
+            deduped = _dedup_facts_by_cosine(facts, threshold)
+            if len(deduped) < len(facts):
+                logger.info(
+                    "distilled_facts_deduped",
+                    before=len(facts),
+                    after=len(deduped),
+                    threshold=threshold,
+                )
+            return deduped
+        except Exception as e:
+            logger.warning(
+                "distilled_facts_dedup_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return facts

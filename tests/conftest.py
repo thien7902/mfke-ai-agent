@@ -151,6 +151,8 @@ def mock_config(tmp_path_factory):
         mock.consolidator_max_turns = 20
         mock.consolidator_max_concurrent = 5
         mock.consolidator_llm_timeout_seconds = 60
+        # Off by default — opt-in tests can flip on.
+        mock.distilled_dedup_cosine = 0.0
         # KB defaults: disabled in tests that don't opt in.
         mock.kb_enabled = False
         mock.kb_top_k = 50

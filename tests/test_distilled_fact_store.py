@@ -9,8 +9,9 @@ import datetime
 
 import pytest
 from pymongo.errors import DuplicateKeyError
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+from src.bot.services import distilled_fact_store as dfs_mod
 from src.bot.services.distilled_fact_store import DistilledFactStore
 
 
@@ -107,3 +108,77 @@ def test_get_injectable_facts_swallows_db_error():
     runs.find.side_effect = Exception("mongo down")
     store = _store_with(runs=runs)
     assert store.get_injectable_facts() == []
+
+
+def test_get_injectable_facts_skips_dedup_when_threshold_zero():
+    """Threshold 0 → dedup off, full list returned even though embeddings
+    would collapse identical-vector facts if dedup ran."""
+    facts = MagicMock()
+    runs = MagicMock()
+    runs.find.return_value = [{"latest_run_id": "r1", "topic_id": 5}]
+    cursor = MagicMock()
+    cursor.sort.return_value = iter([
+        {"text": "alpha", "source_run_id": "r1", "source_topic_id": 5, "created_at": 1},
+        {"text": "alpha dup", "source_run_id": "r1", "source_topic_id": 5, "created_at": 2},
+    ])
+    facts.find.return_value = cursor
+    store = _store_with(facts=facts, runs=runs)
+    with patch.object(dfs_mod.bot_config, "distilled_dedup_cosine", 0.0):
+        out = store.get_injectable_facts()
+    assert len(out) == 2
+
+
+def test_get_injectable_facts_dedups_near_duplicate_facts():
+    """Two facts above the cosine threshold get collapsed; newest (per
+    created_at) wins; dissimilar facts pass through."""
+    facts = MagicMock()
+    runs = MagicMock()
+    runs.find.return_value = [{"latest_run_id": "r1", "topic_id": 5}]
+    cursor = MagicMock()
+    cursor.sort.return_value = iter([
+        # Ascending created_at — oldest first.
+        {"text": "old OOM rule", "source_run_id": "r1", "source_topic_id": 5, "created_at": 1},
+        {"text": "newest OOM rule", "source_run_id": "r1", "source_topic_id": 5, "created_at": 3},
+        {"text": "totally unrelated disk fact", "source_run_id": "r1", "source_topic_id": 5, "created_at": 2},
+    ])
+    facts.find.return_value = cursor
+    store = _store_with(facts=facts, runs=runs)
+
+    # Embeddings: dup pair shares the same vector; unrelated fact orthogonal.
+    # embed_chunks is called in input order — same as the list order above.
+    vectors = [
+        [1.0, 0.0, 0.0],   # old OOM rule
+        [1.0, 0.0, 0.0],   # newest OOM rule — identical vector → cosine 1.0 ≥ threshold
+        [0.0, 1.0, 0.0],   # disk fact — orthogonal to both
+    ]
+    with patch.object(dfs_mod.bot_config, "distilled_dedup_cosine", 0.92), \
+         patch("src.bot.services.embedder.embed_chunks", return_value=vectors):
+        out = store.get_injectable_facts()
+
+    # Newest wins → "newest OOM rule" kept, "old OOM rule" dropped.
+    texts = [f["text"] for f in out]
+    assert "newest OOM rule" in texts
+    assert "old OOM rule" not in texts
+    assert "totally unrelated disk fact" in texts
+    assert len(out) == 2
+
+
+def test_get_injectable_facts_dedup_failure_returns_undismissed_facts():
+    """If the embed API is down, dedup is skipped and the original list is
+    returned — never break the prompt."""
+    facts = MagicMock()
+    runs = MagicMock()
+    runs.find.return_value = [{"latest_run_id": "r1", "topic_id": 5}]
+    cursor = MagicMock()
+    cursor.sort.return_value = iter([
+        {"text": "fact A", "source_run_id": "r1", "source_topic_id": 5, "created_at": 1},
+        {"text": "fact B", "source_run_id": "r1", "source_topic_id": 5, "created_at": 2},
+    ])
+    facts.find.return_value = cursor
+    store = _store_with(facts=facts, runs=runs)
+
+    with patch.object(dfs_mod.bot_config, "distilled_dedup_cosine", 0.92), \
+         patch("src.bot.services.embedder.embed_chunks", return_value=[]):
+        out = store.get_injectable_facts()
+    # Embed returned nothing → dedup skipped → both facts returned.
+    assert len(out) == 2
