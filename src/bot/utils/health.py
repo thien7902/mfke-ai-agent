@@ -49,7 +49,12 @@ class HealthChecker:
 
     def create_app(self) -> web.Application:
         """Create the aiohttp application with health endpoints."""
-        app = web.Application()
+        # client_max_size raised to 4 MB so the snapshot tool can POST a
+        # full gardener_controlplane_snapshot body (~700k chars Vietnamese
+        # → 1.5–2 MB UTF-8). Past this size aiohttp returns 413 before
+        # kb_match_handler even runs, and the snapshot tool sees an empty
+        # KB block — silently broken.
+        app = web.Application(client_max_size=4 * 1024 * 1024)
         app.router.add_get("/health", self.health_handler)
         app.router.add_get("/live", self.liveness_handler)
         app.router.add_get("/ready", self.readiness_handler)

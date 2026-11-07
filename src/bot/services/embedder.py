@@ -29,6 +29,14 @@ logger = structlog.get_logger(__name__)
 # chunks by callers so its own cap is the per-text size, not a sum.
 _MAX_CHARS_PER_TEXT = 6000
 
+# Cap chunks per `embeddings.create` call. Most OpenAI-compatible
+# providers (including vLLM/Qwen serving) limit input array length to
+# 64-100 items; BGE-m3 hosting on OPENAI_API_BASE commonly 4096 tokens
+# per chunk but rejects long input arrays with a 400 before processing.
+# Batching keeps each call < 64 items × 6k chars = ~384k chars, well
+# under any provider's per-request byte limit.
+_CHUNKS_PER_CALL = 32
+
 
 def _client() -> "openai.OpenAI":
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -64,11 +72,17 @@ def embed_text(text: str) -> List[float]:
 
 
 def embed_chunks(texts: List[str]) -> List[List[float]]:
-    """Embed a batch of texts in a single API call. OpenAI's embeddings
-    endpoint accepts `input=[...]` and returns parallel `data[i].embedding`.
-    Returns [] on any failure or empty input. The caller (KBStore) iterates
-    the returned list by index — empty list means "no vectors, skip
-    retrieval entirely".
+    """Embed a batch of texts in batches of `_CHUNKS_PER_CALL`. OpenAI's
+    embeddings endpoint accepts `input=[...]` and returns parallel
+    `data[i].embedding`. Returns [] on any failure or empty input. The
+    caller (KBStore) iterates the returned list by index — empty list
+    means "no vectors, skip retrieval entirely".
+
+    Batching prevents a 700k-char snapshot (~120 chunks) from blowing
+    the provider's per-request input array limit. Each batch is one HTTP
+    call; failures of any batch are logged but don't invalidate the
+    others (partial embedding is better than none — KBStore's best_cos
+    logic uses whatever vectors came back).
     """
     if not texts:
         return []
@@ -82,17 +96,24 @@ def embed_chunks(texts: List[str]) -> List[List[float]]:
     except Exception as e:
         logger.warning("kb_embed_no_api_key", error=str(e))
         return []
-    try:
-        resp = client.embeddings.create(
-            model=bot_config.graphiti_embedding_model,
-            input=[t for _, t in pairs],
-        )
-        # Re-key back into the caller's original positions. Returned
-        # `data` order matches input order, so we map back via `pairs`.
-        out: List[List[float]] = [[] for _ in texts]
-        for (orig_idx, _text), datum in zip(pairs, resp.data):
-            out[orig_idx] = list(datum.embedding or [])
-        return out
-    except Exception as e:
-        logger.warning("kb_embed_chunks_failed", error=str(e), error_type=type(e).__name__)
-        return []
+    out: List[List[float]] = [[] for _ in texts]
+    for batch_start in range(0, len(pairs), _CHUNKS_PER_CALL):
+        batch = pairs[batch_start:batch_start + _CHUNKS_PER_CALL]
+        try:
+            resp = client.embeddings.create(
+                model=bot_config.graphiti_embedding_model,
+                input=[t for _, t in batch],
+            )
+            for (orig_idx, _text), datum in zip(batch, resp.data):
+                out[orig_idx] = list(datum.embedding or [])
+        except Exception as e:
+            logger.warning(
+                "kb_embed_chunk_batch_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                batch_start=batch_start,
+                batch_size=len(batch),
+            )
+            # Leave the failed batch's slots as [] — KBStore's caller
+            # filters empty vectors before cosine scoring.
+    return out

@@ -114,4 +114,6 @@ def test_embed_chunks_api_failure_returns_empty():
         client = MagicMock()
         client.embeddings.create.side_effect = RuntimeError("api down")
         mock_openai.return_value = client
-        assert embed_chunks(["a", "b"]) == []
+        # Batched path swallows per-batch errors → vectors stay empty.
+        out = embed_chunks(["a", "b"])
+        assert out == [[], []]
