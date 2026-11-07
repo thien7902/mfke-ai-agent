@@ -142,6 +142,23 @@ class Config:
     # would otherwise hold the cross-topic semaphore indefinitely.
     consolidator_llm_timeout_seconds: int = 60
 
+    # Known-issues KB (FPT Container). Disabled by default. Enable after
+    # running `python -m scripts.ingest_kb_docx <docx path>` once to seed
+    # the `kb_rules` MongoDB collection with LLM-distilled if-then rules.
+    # Injection happens at the snapshot tool output (NOT system prompt) —
+    # see src/bot/services/kb_store.py + the /kb_match endpoint in
+    # src/bot/utils/health.py. Reuses GRAPHITI_EMBEDDING_MODEL /
+    # GRAPHITI_EMBEDDING_DIM for the embedder.
+    kb_enabled: bool = False
+    # Top-K rules injected per /kb_match call. Rules are one-line if-then,
+    # so 10-20 fit in the snapshot tool output without bloat.
+    kb_top_k: int = 20
+    # Model used ONE-TIME at ingest to distill KB articles into if-then
+    # rules. Falls back to CONSOLIDATOR_MODEL if unset. Recommended: a
+    # cheap/gp-fast model — the distill runs strictly offline at ingest
+    # time, ~329 calls total.
+    kb_distill_model: Optional[str] = None
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -193,6 +210,9 @@ def load_config() -> Config:
         consolidator_max_turns=int(os.getenv("CONSOLIDATOR_MAX_TURNS", "20")),
         consolidator_max_concurrent=int(os.getenv("CONSOLIDATOR_MAX_CONCURRENT", "5")),
         consolidator_llm_timeout_seconds=int(os.getenv("CONSOLIDATOR_LLM_TIMEOUT_SECONDS", "60")),
+        kb_enabled=os.getenv("KB_ENABLED", "").lower() in ("1", "true", "yes", "on"),
+        kb_top_k=int(os.getenv("KB_TOP_K", "20")),
+        kb_distill_model=os.getenv("KB_DISTILL_MODEL") or os.getenv("CONSOLIDATOR_MODEL") or None,
     )
 
 

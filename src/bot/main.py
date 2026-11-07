@@ -137,6 +137,7 @@ class TelegramBot:
         self.permission_service: PermissionService = None
         self.memory_service: MemoryService = None
         self.distilled_fact_store = None
+        self.kb_store = None
         self.consolidator_service = None
         self.cluster_probe_service: ClusterProbeService = ClusterProbeService()
         self.last_update_time: float = 0  # Track last received update
@@ -172,13 +173,6 @@ class TelegramBot:
             print(f"[MEMORY INIT FAILED] {type(e).__name__}: {e}", flush=True)
             traceback.print_exc()
 
-        self.holmes_service = HolmesService(
-            memory_service=self.memory_service,
-            distilled_fact_store=self.distilled_fact_store,
-        )
-        await self.holmes_service.initialize()
-        health_checker.set_holmes_ready(True)
-
         self.conversation_service = ConversationService()
         self.permission_service = PermissionService()
 
@@ -189,6 +183,24 @@ class TelegramBot:
         # when empty (all reads return []).
         from src.bot.services.distilled_fact_store import DistilledFactStore
         self.distilled_fact_store = DistilledFactStore()
+
+        # KBStore (MongoDB `kb_rules`) — distilled if-then rules from the
+        # FPT Container KB. Built unconditionally: when KB_ENABLED=false
+        # all reads return [] and /kb_match serves an empty block. The
+        # snapshot tool's curl hits /kb_match on the health port; that
+        # integration is what surfaces rules to Holmes — not a system
+        # prompt injection.
+        from src.bot.services.kb_store import KBStore
+        self.kb_store = KBStore()
+        health_checker.set_kb_store(self.kb_store)
+
+        self.holmes_service = HolmesService(
+            memory_service=self.memory_service,
+            distilled_fact_store=self.distilled_fact_store,
+            kb_store=self.kb_store,
+        )
+        await self.holmes_service.initialize()
+        health_checker.set_holmes_ready(True)
 
         # Background consolidator — populates distilled_fact_store on idle.
         # Best-effort init: failure doesn't block the bot, mirroring the

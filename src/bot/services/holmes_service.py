@@ -164,7 +164,7 @@ def _empty_llm_result() -> LLMResult:
 class HolmesService:
     """Service for interacting with HolmesGPT."""
 
-    def __init__(self, memory_service: Optional["MemoryService"] = None, distilled_fact_store=None):
+    def __init__(self, memory_service: Optional["MemoryService"] = None, distilled_fact_store=None, kb_store=None):
         self._config: Optional[Config] = None
         self._tool_executor: Optional[ToolExecutor] = None
         self._tool_calling_llm: Optional[ToolCallingLLM] = None
@@ -174,6 +174,11 @@ class HolmesService:
         # injects the latest-run-per-topic distilled facts block at the top
         # of the system-prompt additions (high priority, no tool call needed).
         self._distilled_store = distilled_fact_store
+        # Optional KBStore — NOT injected into the system prompt. KB rule
+        # injection happens deterministically at the snapshot tool's stdout
+        # via POST /kb_match (handler in health.py), so Holmes sees the
+        # rules block as part of the tool result without an LLM opt-in.
+        self._kb_store = kb_store
         # Lazily-built second ToolCallingLLM keyed by CLAUDE_ENTERPRISE_MODEL
         # (a key in ~/.holmes/model_list.yaml). Built on first /claude call so
         # a missing or misconfigured enterprise model doesn't break startup.
