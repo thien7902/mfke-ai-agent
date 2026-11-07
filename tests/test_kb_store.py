@@ -23,6 +23,11 @@ def _store_with(*entries, loaded=True):
     s._loaded = loaded
     for rid, rule, vec in entries:
         s._index[rid] = {"rule": rule, "vector": vec}
+    # Build the BM25 inverted index too — _ensure_loaded would have done
+    # this if loaded normally via Mongo. Test bypasses _ensure_loaded so
+    # the BM25 index must be constructed explicitly.
+    from src.bot.services.kb_store import _BM25Index
+    s._bm25 = _BM25Index(s._index)
     return s
 
 
@@ -275,3 +280,106 @@ def test_db_load_failure_returns_empty_after_load_attempt(monkeypatch):
     assert out == []
     # After the failed load attempt, _loaded=True so we don't loop forever.
     assert s._loaded is True
+
+
+# --------------------------------------------------------------------- #
+# Hybrid BM25 + cosine (RRF)
+# --------------------------------------------------------------------- #
+
+def test_bm25_exact_keyword_match_rescues_low_cosine(monkeypatch):
+    """Rule with exact keyword match (CrashLoopBackOff) but low cosine
+    should still surface because BM25 carries it past the floor.
+    """
+    rule = _rule_doc(
+        issue_id="KB2025-001",
+        rule_text="IF pod CrashLoopBackOff AND OOMKilled -> bump memory",
+        match_count=0,
+    )
+    # Vector orthogonal to query [1,0,0] → cosine 0.
+    a = ("KB2025-001#1", rule, [0.0, 0.0, 0.1])
+    s = _store_with(a)
+    with patch.object(kb_store_mod.bot_config, "kb_enabled", True), \
+         patch.object(kb_store_mod, "embed_chunks", return_value=[make_vec(1.0)]):
+        out = s.get_relevant_rules("CrashLoopBackOff on pod api-gw")
+    # BM25 picks up CrashLoopBackOff + pod despite zero cosine.
+    assert len(out) == 1
+    assert out[0]["rule_id"] == "KB2025-001#1"
+    assert out[0]["cosine"] == 0.0
+    assert out[0]["bm25"] > 0.0
+
+
+def test_both_below_floor_skipped():
+    """Cosine 0 + no keyword overlap → dropped."""
+    rule = _rule_doc(
+        issue_id="KB2025-001",
+        rule_text="IF some unrelated symptom -> generic fix",
+        match_count=0,
+    )
+    # Orthogonal vector + token set disjoint from query.
+    a = ("KB2025-001#1", rule, [0.0, 0.0, 0.1])
+    s = _store_with(a)
+    with patch.object(kb_store_mod.bot_config, "kb_enabled", True), \
+         patch.object(kb_store_mod, "embed_chunks", return_value=[make_vec(1.0)]):
+        out = s.get_relevant_rules("CrashLoopBackOff OOMKilled")
+    assert out == []
+
+
+def test_embed_failure_falls_back_to_bm25_only(monkeypatch):
+    """If embed_chunks throws, BM25 still returns matches (graceful
+    degradation when the embedding API is down).
+    """
+    rule = _rule_doc(
+        issue_id="KB2025-001",
+        rule_text="IF pod CrashLoopBackOff AND OOMKilled -> bump memory",
+        match_count=0,
+    )
+    a = ("KB2025-001#1", rule, make_vec(1.0))
+    s = _store_with(a)
+    with patch.object(kb_store_mod.bot_config, "kb_enabled", True), \
+         patch.object(kb_store_mod, "embed_chunks", side_effect=RuntimeError("embed api down")):
+        out = s.get_relevant_rules("pod CrashLoopBackOff OOMKilled")
+    assert len(out) == 1
+    assert out[0]["rule_id"] == "KB2025-001#1"
+    assert out[0]["cosine"] == 0.0
+    assert out[0]["bm25"] > 0.0
+
+
+def test_bm25_high_match_count_surface_keyword_rule_above_low_freq():
+    """Two rules both BM25-match the query. The one with higher
+    match_count should rank higher (after frequency boost).
+    """
+    rule_a = _rule_doc(
+        issue_id="KB2025-001",
+        rule_text="IF pod CrashLoopBackOff -> bump memory",
+        match_count=10,
+    )
+    rule_b = _rule_doc(
+        issue_id="KB2025-002",
+        rule_text="IF pod CrashLoopBackOff -> restart node",
+        match_count=0,
+    )
+    # Same orthogonal vector → same cosine 0; BM25 + freq boost decides.
+    a = ("KB2025-001#1", rule_a, [0.0, 0.0, 0.1])
+    b = ("KB2025-002#1", rule_b, [0.0, 0.0, 0.1])
+    s = _store_with(a, b)
+    with patch.object(kb_store_mod.bot_config, "kb_enabled", True), \
+         patch.object(kb_store_mod, "embed_chunks", return_value=[make_vec(1.0)]):
+        out = s.get_relevant_rules("pod CrashLoopBackOff")
+    assert len(out) == 2
+    assert out[0]["rule_id"] == "KB2025-001#1"  # higher match_count wins
+    assert out[1]["rule_id"] == "KB2025-002#1"
+
+
+def test_bm25_returns_empty_when_only_stopwords():
+    """Query of just stopwords/short tokens → BM25 empty → only cosine decides."""
+    rule = _rule_doc(rule_text="IF pod CrashLoopBackOff -> bump memory")
+    a = ("KB2025-001#1", rule, make_vec(1.0))
+    s = _store_with(a)
+    with patch.object(kb_store_mod.bot_config, "kb_enabled", True), \
+         patch.object(kb_store_mod, "embed_chunks", return_value=[make_vec(1.0)]):
+        # "the" and "a" are stopwords; "x" is 1-char filtered.
+        out = s.get_relevant_rules("the a x")
+    # Query tokens empty after filter → BM25 empty; cosine still runs.
+    assert len(out) == 1
+    assert out[0]["bm25"] == 0.0
+
