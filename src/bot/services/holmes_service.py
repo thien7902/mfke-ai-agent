@@ -83,6 +83,7 @@ def _patch_bash_kill_process_group():
             stdout, _ = process.communicate(timeout=timeout)
             stdout = stdout.strip() if stdout else ""
             stdout = check_oom_and_append_hint(stdout, process.returncode)
+            stdout = _maybe_inject_kb_rules(stdout, cmd)
             return holmes_bash.BashResult(
                 stdout=stdout,
                 return_code=process.returncode,
@@ -99,6 +100,7 @@ def _patch_bash_kill_process_group():
                 process.kill()
             stdout, _ = process.communicate()
             stdout = stdout.strip() if stdout else ""
+            stdout = _maybe_inject_kb_rules(stdout, cmd)
             return holmes_bash.BashResult(
                 stdout=stdout,
                 return_code=None,
@@ -109,6 +111,88 @@ def _patch_bash_kill_process_group():
     holmes_bash_toolset.execute_bash_command = execute_bash_command_patched
     holmes_bash._mfke_patched = True
     logger.info("Patched execute_bash_command to kill process group on timeout")
+
+
+# Snapshot tools whose stdout should get KB rules appended. Match by
+# command substring — broad enough to catch whichever toolset ships the
+# gardener snapshot tool (custom YAML). Avoid matching generic `kubectl
+# get` so we don't pay KB embed cost on plain pod listings.
+_SNAPSHOT_CMD_MARKERS = (
+    "gardener_controlplane_snapshot",
+    "controlplane_snapshot",
+    "control-plane snapshot",
+    "snapshot.sh",
+)
+
+# Heuristic: append KB rules only when stdout is at least this big. A real
+# cluster snapshot spans 100k+ chars; a tiny stdout means the snapshot
+# script failed early (kubeconfig bad, shoot not found) and there's no
+# signal worth matching against. Skip the KB call to save embed API cost.
+_SNAPSHOT_MIN_STDOUT_CHARS = 5000
+
+# Per-snapshot KB match budget. Snapshot stdout can hit 700k chars; the
+# embed call batched at 32 chunks/request takes ~5s for 30k chars. We
+# cap the input so embeds stay under ~10s even with a slow API. Above
+# the cap, keep the first + last slice so both early events and trailing
+# shoot conditions make it into the cosine/BM25 tracks.
+_KB_QUERY_MAX_CHARS = 60000
+
+
+def _maybe_inject_kb_rules(stdout: str, cmd: str) -> str:
+    """Append a KB rules block to snapshot-tool stdout before Holmes
+    sees it. In-process — no HTTP, no aiohttp body limit, no curl timeout.
+
+    Trigger conditions:
+      - Command matches `_SNAPSHOT_CMD_MARKERS` (gardener snapshot, etc).
+      - stdout is at least `_SNAPSHOT_MIN_STDOUT_CHARS` chars (signal-rich).
+
+    On any failure (KB disabled, store empty, embed API down), returns
+    the original stdout unchanged — KB must never break the tool result.
+    """
+    if not stdout or len(stdout) < _SNAPSHOT_MIN_STDOUT_CHARS:
+        return stdout
+    if not any(m in cmd for m in _SNAPSHOT_CMD_MARKERS):
+        return stdout
+    try:
+        from src.bot.services.kb_store import KBStore, format_rules_block
+        # Use the singleton wired in main.py if available; fall back to a
+        # fresh KBStore when called outside the bot (CLI debugging).
+        store = _get_kb_store_singleton()
+        if store is None:
+            return stdout
+        # Cap input length — see _KB_QUERY_MAX_CHARS comment.
+        query_text = stdout if len(stdout) <= _KB_QUERY_MAX_CHARS else (
+            stdout[:_KB_QUERY_MAX_CHARS // 2] + "\n...[truncated]...\n" + stdout[-_KB_QUERY_MAX_CHARS // 2:]
+        )
+        rules = store.get_relevant_rules(query_text)
+        if not rules:
+            return stdout
+        block = format_rules_block(rules)
+        # Fire-and-forget increment. Same pattern as the old /kb_match
+        # HTTP handler — don't block tool return on the Mongo write.
+        rule_ids = [r["rule_id"] for r in rules]
+        import asyncio as _asyncio
+        try:
+            loop = _asyncio.get_running_loop()
+            loop.run_in_executor(None, store.record_matches, rule_ids)
+        except RuntimeError:
+            # No event loop in this thread (Holmes runs sync) — just call
+            # record_matches directly. It swallows its own DB errors.
+            store.record_matches(rule_ids)
+        return stdout + "\n" + block
+    except Exception as e:
+        logger.warning("kb_injection_failed", error=str(e), error_type=type(e).__name__)
+        return stdout
+
+
+# Set by HolmesService.__init__ — gives _maybe_inject_kb_rules access to
+# the shared KBStore instance so embedding cache + BM25 index persist
+# across snapshot calls.
+_kb_store_singleton = None
+
+
+def _get_kb_store_singleton():
+    return _kb_store_singleton
 
 # Request context for CLI-like usage
 _CLI_REQUEST_CONTEXT = {"user_id": DEFAULT_CLI_USER}
@@ -175,10 +259,15 @@ class HolmesService:
         # of the system-prompt additions (high priority, no tool call needed).
         self._distilled_store = distilled_fact_store
         # Optional KBStore — NOT injected into the system prompt. KB rule
-        # injection happens deterministically at the snapshot tool's stdout
-        # via POST /kb_match (handler in health.py), so Holmes sees the
-        # rules block as part of the tool result without an LLM opt-in.
+        # injection happens in-process: `_maybe_inject_kb_rules` (in this
+        # module) scans bash-tool stdout for snapshot commands and appends
+        # the top-K rules block before Holmes sees the next LLM round. No
+        # HTTP, no aiohttp body limit, no curl timeout — works for 700k+
+        # char snapshots without the snapshot toolset YAML having to know
+        # anything about it.
         self._kb_store = kb_store
+        global _kb_store_singleton
+        _kb_store_singleton = kb_store
         # Lazily-built second ToolCallingLLM keyed by CLAUDE_ENTERPRISE_MODEL
         # (a key in ~/.holmes/model_list.yaml). Built on first /claude call so
         # a missing or misconfigured enterprise model doesn't break startup.

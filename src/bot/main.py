@@ -186,13 +186,13 @@ class TelegramBot:
 
         # KBStore (MongoDB `kb_rules`) — distilled if-then rules from the
         # FPT Container KB. Built unconditionally: when KB_ENABLED=false
-        # all reads return [] and /kb_match serves an empty block. The
-        # snapshot tool's curl hits /kb_match on the health port; that
-        # integration is what surfaces rules to Holmes — not a system
-        # prompt injection.
+        # all reads return [] and the bash-stdout injection in
+        # holmes_service._maybe_inject_kb_rules short-circuits. KB rule
+        # matching happens in-process (no HTTP) — the snapshot tool's
+        # stdout is scanned for snapshot command markers and the top-K
+        # rules block is appended before Holmes sees the next LLM round.
         from src.bot.services.kb_store import KBStore
         self.kb_store = KBStore()
-        health_checker.set_kb_store(self.kb_store)
 
         self.holmes_service = HolmesService(
             memory_service=self.memory_service,
