@@ -64,26 +64,44 @@ def _dedup_facts_by_cosine(facts: List[dict], threshold: float) -> List[dict]:
     the newest facts priority: a fact is kept iff none of the already-kept
     (newer) facts is similar to it.
 
-    Embeddings are batched via ``embed_chunks`` (BGE-m3, 1024-dim). On any
-    embed failure the caller falls back to the un-deduplicated list — we
-    surface that as an exception so the wrapper can log + return the
-    original ``facts`` untouched.
+    Embeddings are read from each fact's ``embedding`` field — populated at
+    ``add()`` time and/or by ``backfill_embeddings()``. Facts missing a
+    vector get re-embedded via ``embed_chunks`` (batched) and the result is
+    not persisted here — ``add()`` is the only writer. On any embed failure
+    the caller falls back to the un-deduplicated list — we surface that as
+    an exception so the wrapper can log + return the original ``facts``
+    untouched.
     """
     if not facts:
         return facts
-    # Lazy import to keep distilled_fact_store importable in tests that
-    # don't exercise the embed path (avoids the OPENAI_API_KEY requirement
-    # at module load).
-    from src.bot.services.embedder import embed_chunks
 
     texts = [(f.get("text") or "").strip() for f in facts]
     if not any(texts):
         return facts
-    vectors = embed_chunks(texts)
-    if not vectors or all(not v for v in vectors):
-        # Embed produced nothing usable — caller already records the
-        # warning; bubble up as "no dedup possible".
-        raise RuntimeError("embed_chunks returned no vectors")
+    # Index: where each fact's vector came from. Pre-computed vectors (from
+    # the doc's `embedding` field) cost 0 API calls; recomputed vectors
+    # cost one batched call covering all missing slots.
+    vectors = [list(f.get("embedding") or []) for f in facts]
+    missing_idx = [i for i, v in enumerate(vectors) if not v]
+    if missing_idx:
+        # Lazy import to keep distilled_fact_store importable in tests that
+        # don't exercise the embed path (avoids the OPENAI_API_KEY requirement
+        # at module load).
+        from src.bot.services.embedder import embed_chunks
+        try:
+            recalced = embed_chunks([texts[i] for i in missing_idx])
+        except Exception as e:
+            logger.warning(
+                "distilled_facts_dedup_embed_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            raise RuntimeError("embed_chunks raised") from e
+        if not recalced or all(not v for v in recalced):
+            raise RuntimeError("embed_chunks returned no vectors")
+        for idx, vec in zip(missing_idx, recalced):
+            if vec:
+                vectors[idx] = vec
     # Greedy from newest (end of ascending list) to oldest.
     kept: List[dict] = []
     kept_vecs: List[List[float]] = []
@@ -164,16 +182,35 @@ class DistilledFactStore:
         source_topic_id: int,
         source_run_id: str,
     ) -> bool:
-        """Insert one fact. Returns True if newly inserted, False on duplicate
-        (same ``text`` already exists). All other errors are swallowed and
-        return False so a Mongo blip doesn't crash the consolidator.
+        """Insert one fact with its BGE-m3 embedding embedded in the doc
+        (so the injector can dedup at zero API cost per turn). Returns True
+        if newly inserted, False on duplicate (same ``text`` already exists).
+        All other errors are swallowed and return False so a Mongo blip
+        doesn't crash the consolidator — embedding failures still allow
+        the insert (with an empty ``embedding`` field) so dedup falls back
+        to recompute-then-cache on the first inject that touches that fact.
         """
         if not text or not text.strip():
             return False
+        clean = text.strip()
+        embedding = None
+        try:
+            # Lazy import — keeps test imports free of the OPENAI_API_KEY
+            # requirement at module load.
+            from src.bot.services.embedder import embed_text
+            embedding = embed_text(clean) or None
+        except Exception as e:
+            logger.warning(
+                "distilled_fact_embed_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                fact_preview=clean[:80],
+            )
         try:
             self.facts.insert_one(
                 {
-                    "text": text.strip(),
+                    "text": clean,
+                    "embedding": embedding,
                     "source_chat_id": source_chat_id,
                     "source_topic_id": source_topic_id,
                     "source_run_id": source_run_id,
@@ -191,6 +228,77 @@ class DistilledFactStore:
                 fact_preview=text[:80],
             )
             return False
+
+    def backfill_embeddings(self, batch_size: int = 64) -> dict:
+        """One-shot backfill: for every fact doc missing an ``embedding``,
+        embed its text and write the vector back. Idempotent — facts that
+        already have an ``embedding`` (truthy non-empty list) are skipped.
+
+        Run this ONCE after deploying v2.3.44 (e.g. from a one-off Python
+        shell inside the container). Returns ``{"scanned", "embedded",
+        "errors"}``.
+
+        The unique index on ``text`` means same-text facts collapse at
+        insert time, so most fact docs are unique — but a fact inserted
+        before embeddings existed will have ``embedding: None`` and needs
+        this pass to get one. Subsequent ``add()`` calls always embed.
+        """
+        if batch_size < 1:
+            batch_size = 1
+        from src.bot.services.embedder import embed_chunks
+        scanned = 0
+        embedded = 0
+        errors = 0
+        cursor = self.facts.find(
+            {"$or": [{"embedding": None}, {"embedding": {"$exists": False}}]},
+            {"_id": 1, "text": 1},
+        )
+        batch: list = []
+        for doc in cursor:
+            scanned += 1
+            batch.append(doc)
+            if len(batch) >= batch_size:
+                e = self._embed_and_update_batch(batch)
+                embedded += e
+                errors += len(batch) - e
+                batch.clear()
+        if batch:
+            e = self._embed_and_update_batch(batch)
+            embedded += e
+            errors += len(batch) - e
+        return {"scanned": scanned, "embedded": embedded, "errors": errors}
+
+    def _embed_and_update_batch(self, batch: list) -> int:
+        """Embed one batch of fact docs and write embeddings back. Returns
+        number of docs successfully written — the difference between
+        ``len(batch)`` and the return value is the error count. Used by
+        ``backfill_embeddings``."""
+        try:
+            texts = [d.get("text") or "" for d in batch]
+            vecs = embed_chunks(texts)
+        except Exception as e:
+            logger.warning(
+                "distilled_facts_backfill_embed_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                batch_size=len(batch),
+            )
+            return 0
+        written = 0
+        for doc, vec in zip(batch, vecs):
+            if not vec:
+                continue
+            try:
+                self.facts.update_one({"_id": doc["_id"]}, {"$set": {"embedding": vec}})
+                written += 1
+            except Exception as e:
+                logger.warning(
+                    "distilled_facts_backfill_write_failed",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    doc_id=str(doc.get("_id")),
+                )
+        return written
 
     async def record_run(
         self,
@@ -331,6 +439,7 @@ class DistilledFactStore:
                     {
                         "_id": 0,
                         "text": 1,
+                        "embedding": 1,
                         "source_topic_id": 1,
                         "source_run_id": 1,
                         "created_at": 1,

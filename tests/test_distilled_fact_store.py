@@ -182,3 +182,75 @@ def test_get_injectable_facts_dedup_failure_returns_undismissed_facts():
         out = store.get_injectable_facts()
     # Embed returned nothing → dedup skipped → both facts returned.
     assert len(out) == 2
+
+
+def test_get_injectable_facts_dedup_uses_persisted_embedding_skips_api():
+    """Facts whose docs already carry an ``embedding`` vector are deduped
+    WITHOUT calling embed_chunks — pure-local cosine. This is the path
+    every inject hits after add() persisted the embedding at insert time.
+    """
+    facts = MagicMock()
+    runs = MagicMock()
+    runs.find.return_value = [{"latest_run_id": "r1", "topic_id": 5}]
+    cursor = MagicMock()
+    cursor.sort.return_value = iter([
+        {"text": "old OOM rule",
+         "embedding": [1.0, 0.0, 0.0],
+         "source_run_id": "r1", "source_topic_id": 5, "created_at": 1},
+        {"text": "newest OOM rule",
+         "embedding": [1.0, 0.0, 0.0],
+         "source_run_id": "r1", "source_topic_id": 5, "created_at": 3},
+        {"text": "unrelated disk fact",
+         "embedding": [0.0, 1.0, 0.0],
+         "source_run_id": "r1", "source_topic_id": 5, "created_at": 2},
+    ])
+    facts.find.return_value = cursor
+    store = _store_with(facts=facts, runs=runs)
+
+    with patch.object(dfs_mod.bot_config, "distilled_dedup_cosine", 0.92), \
+         patch("src.bot.services.embedder.embed_chunks") as mock_embed:
+        out = store.get_injectable_facts()
+
+    mock_embed.assert_not_called()  # zero API calls — vectors came from Mongo.
+    texts = [f["text"] for f in out]
+    assert "newest OOM rule" in texts
+    assert "old OOM rule" not in texts
+    assert "unrelated disk fact" in texts
+    assert len(out) == 2
+
+
+@pytest.mark.asyncio
+async def test_add_persists_embedding_in_doc():
+    """`add()` embeds the fact text once and stores the vector in the
+    fact doc so dedup at inject time skips the API call."""
+    facts = MagicMock()
+    facts.insert_one.return_value = MagicMock(inserted_id="oid")
+    store = _store_with(facts=facts)
+
+    with patch("src.bot.services.embedder.embed_text", return_value=[0.1, 0.2, 0.3]):
+        added = await store.add(
+            text="OOM pod needs more memory",
+            source_chat_id=20,
+            source_topic_id=10,
+            source_run_id="r1",
+        )
+    assert added is True
+    inserted = facts.insert_one.call_args[0][0]
+    assert inserted["embedding"] == [0.1, 0.2, 0.3]
+    assert inserted["text"] == "OOM pod needs more memory"
+
+
+@pytest.mark.asyncio
+async def test_add_continues_without_embedding_on_embed_failure():
+    """If the embed API is down at insert time, the fact is still inserted
+    with embedding=None — dedup will recompute on demand and the next
+    backfill_embeddings() pass can fill it in."""
+    facts = MagicMock()
+    facts.insert_one.return_value = MagicMock(inserted_id="oid")
+    store = _store_with(facts=facts)
+
+    with patch("src.bot.services.embedder.embed_text", side_effect=RuntimeError("api down")):
+        added = await store.add(text="x", source_chat_id=20, source_topic_id=10, source_run_id="r1")
+    assert added is True
+    inserted = facts.insert_one.call_args[0][0]
+    assert inserted["embedding"] is None
