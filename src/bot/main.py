@@ -82,7 +82,12 @@ POOL_WEDGE_ERRORS = (
     'all connections in the connection pool are occupied',
 )
 # Exit after this many pool-wedge log lines within this many seconds.
-POOL_WEDGE_THRESHOLD = 3
+# Threshold = 1 because a single PoolTimeout from PTB's Updater is enough
+# signal that the httpx pool is wedged — by the time the error reaches
+# the logger, PTB has already retried silently several times. Keeps
+# recovery latency near-zero instead of waiting for 3 hits to accumulate
+# (during which the user sees the bot as dead).
+POOL_WEDGE_THRESHOLD = 1
 POOL_WEDGE_WINDOW_SECONDS = 60.0
 
 
@@ -92,9 +97,10 @@ class FatalPollingDetector(logging.Handler):
     Two failure classes:
       - TLS/certificate errors (FATAL_POLLING_ERRORS): never transient, exit
         on first match.
-      - httpx pool wedge (POOL_WEDGE_ERRORS): transient blips happen, so exit
-        only after N matches in a 60s window — a wedged pool logs repeatedly
-        while PTB retries, a one-off slow request does not.
+      - httpx pool wedge (POOL_WEDGE_ERRORS): a single PoolTimeout reaching
+        PTB's Updater logger is already strong evidence the httpx pool is
+        wedged — by the time it surfaces, PTB has silently retried several
+        times. Exit on first match; Docker restarts us with a fresh pool.
     """
 
     def __init__(self):
