@@ -65,25 +65,24 @@ def _install_fake_mcp_sdk(monkeypatch):
 
 def test_search_issues_parses_jira_response(monkeypatch):
     """search_issues receives a JSON {"issues": [...]} string in the
-    CallToolResult, parses and returns the list."""
+    CallToolResult, parses and returns the list. Verifies the client
+    calls tool `jira_search` (the actual mcp-atlassian server name)."""
     fake_streamablehttp, fake_session_mod = _install_fake_mcp_sdk(monkeypatch)
     session = MagicMock()
     session.initialize = AsyncMock()
     session.call_tool = AsyncMock(return_value=_content_with_text(
-        json.dumps({"issues": [{"key": "ISD-1"}, {"key": "ISD-2"}]})
+        json.dumps({"total": 2, "issues": [{"key": "ISD-1"}, {"key": "ISD-2"}]})
     ))
     fake_session_mod.ClientSession.return_value.__aenter__ = AsyncMock(return_value=session)
     fake_session_mod.ClientSession.return_value.__aexit__ = AsyncMock(return_value=False)
 
     from src.bot.utils.mcp_client import McpJiraClient
     client = McpJiraClient("http://localhost:9001/mcp")
-    issues = pytest.run_async_loopsafe(client.search_issues("category = X")) if hasattr(pytest, "run_async_loopsafe") else None
-
-    # Fallback: use asyncio.run directly since pytest-asyncio auto mode might not
-    # pick up this non-async test. Use anyio/asyncio.
     import asyncio
     issues = asyncio.get_event_loop().run_until_complete(client.search_issues("category = X"))
     assert [i["key"] for i in issues] == ["ISD-1", "ISD-2"]
+    # Verify the client called the correct tool name with arg `limit`.
+    session.call_tool.assert_called_with("jira_search", {"jql": "category = X", "limit": 50})
 
 
 def test_search_issues_handles_empty_issues_list(monkeypatch):
@@ -180,7 +179,7 @@ def test_list_tools_returns_tools(monkeypatch):
     session.initialize = AsyncMock()
     tools_result = MagicMock()
     tool = MagicMock()
-    tool.name = "jira_search_issues"
+    tool.name = "jira_search"
     tool.description = "Search Jira issues via JQL"
     tools_result.tools = [tool]
     session.list_tools = AsyncMock(return_value=tools_result)
@@ -191,7 +190,7 @@ def test_list_tools_returns_tools(monkeypatch):
     client = McpJiraClient("http://localhost:9001/mcp")
     import asyncio
     tools = asyncio.get_event_loop().run_until_complete(client.list_tools())
-    assert any(t["name"] == "jira_search_issues" for t in tools)
+    assert any(t["name"] == "jira_search" for t in tools)
 
 
 def test_extract_content_normalizes_call_tool_result():

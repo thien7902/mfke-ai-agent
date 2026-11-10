@@ -46,21 +46,28 @@ class McpJiraClient:
         return []
 
     async def search_issues(self, jql: str, fields: Optional[list[str]] = None,
-                            max_results: int = 100) -> list[dict]:
-        """Calls mcp-atlassian's `jira_search_issues` tool with the given JQL.
+                            max_results: int = 50) -> list[dict]:
+        """Calls mcp-atlassian's `jira_search` tool with the given JQL.
 
         Returns a list of issue dicts (the Jira issue shape: {key, fields: {...}, ...}).
         Returns [] on any failure (server down, SDK missing, parse error).
+
+        NOTE on tool name: the upstream mcp-atlassian server registers this
+        tool as `jira_search` (NOT `jira_search_issues`). Parameter names:
+        `jql` (str), `fields` (comma-separated str), `limit` (1-50), `start_at`.
+        Response: {"total": int, "issues": [...simplified_issue_dicts...]}.
         """
-        args: dict[str, Any] = {"jql": jql, "maxResults": max_results}
+        args: dict[str, Any] = {"jql": jql, "limit": max_results}
         if fields:
-            args["fields"] = fields
-        result = await self._call_tool("jira_search_issues", args)
+            args["fields"] = ",".join(fields)
+        result = await self._call_tool("jira_search", args)
         return self._parse_issue_list(result)
 
     async def get_issue(self, key: str) -> Optional[dict]:
         """Fetches a single issue's full metadata via mcp-atlassian's
-        `jira_get_issue` tool. Returns None on any failure."""
+        `jira_get_issue` tool. Returns None on any failure.
+
+        Parameter name: `issue_key`."""
         result = await self._call_tool("jira_get_issue", {"issue_key": key})
         if not result:
             return None
