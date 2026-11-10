@@ -208,3 +208,31 @@ def test_extract_content_normalizes_call_tool_result():
 def test_extract_content_empty_for_none():
     from src.bot.utils.mcp_client import McpJiraClient
     assert McpJiraClient._extract_content(None) == []
+
+
+def test_parse_issue_list_handles_markdown_fenced_json(monkeypatch):
+    """mcp-atlassian sometimes wraps tool output in ```json ... ``` fences.
+    The lenient parser must strip them and parse the JSON inside."""
+    from src.bot.utils.mcp_client import McpJiraClient
+    fenced = '```json\n{"issues": [{"key": "ISD-1"}]}\n```'
+    issues = McpJiraClient._parse_issue_list(
+        [{"type": "text", "text": fenced}]
+    )
+    assert [i["key"] for i in issues] == ["ISD-1"]
+
+
+def test_parse_issue_list_handles_empty_text():
+    """Empty text should not raise json.JSONDecodeError — return [] silently."""
+    from src.bot.utils.mcp_client import McpJiraClient
+    assert McpJiraClient._parse_issue_list([{"type": "text", "text": ""}]) == []
+
+
+def test_parse_issue_list_handles_prose_wrapped_json():
+    """If the server prefixes the JSON with prose, the parser should still
+    locate the first balanced {...} block."""
+    from src.bot.utils.mcp_client import McpJiraClient
+    text = 'Here is the result:\n{"issues": [{"key": "ISD-7"}]}\nDone.'
+    issues = McpJiraClient._parse_issue_list(
+        [{"type": "text", "text": text}]
+    )
+    assert [i["key"] for i in issues] == ["ISD-7"]

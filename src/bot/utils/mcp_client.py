@@ -67,11 +67,11 @@ class McpJiraClient:
         text = self._first_text(result)
         if text is None:
             return None
-        try:
-            return json.loads(text)
-        except Exception as e:
-            logger.warning("mcp_jira_get_issue_parse_failed", error=str(e))
+        data = self._parse_json_lenient(text)
+        if data is None:
+            logger.warning("mcp_jira_get_issue_parse_failed", text_preview=text[:200])
             return None
+        return data if isinstance(data, dict) else None
 
     async def _call_tool(self, name: str, args: dict) -> Any:
         return await self._call("tools/call", {"name": name, "arguments": args})
@@ -138,13 +138,48 @@ class McpJiraClient:
         text = cls._first_text(content)
         if text is None:
             return []
-        try:
-            data = json.loads(text)
-        except Exception as e:
-            logger.warning("mcp_jira_search_parse_failed", error=str(e))
+        data = cls._parse_json_lenient(text)
+        if data is None:
+            logger.warning("mcp_jira_search_parse_failed", text_preview=text[:200])
             return []
         if isinstance(data, dict) and "issues" in data:
             return data["issues"] or []
         if isinstance(data, list):
             return data
         return []
+
+    @staticmethod
+    def _parse_json_lenient(text: str) -> Any:
+        """Tolerant JSON extraction. mcp-atlassian sometimes wraps tool
+        output in markdown fences (```json ... ```) or prefixed prose.
+        Strip fences, then try direct json.loads; on failure, grab the
+        first balanced {...} or [...] substring and retry."""
+        if not text:
+            return None
+        s = text.strip()
+        # Strip a single surrounding markdown code fence if present.
+        if s.startswith("```"):
+            # Drop the opening fence line (``` or ```json).
+            nl = s.find("\n")
+            if nl != -1:
+                s = s[nl + 1:]
+            if s.rstrip().endswith("```"):
+                s = s.rstrip()[:-3]
+            s = s.strip()
+        try:
+            return json.loads(s)
+        except Exception:
+            pass
+        # Fall back: find the first balanced JSON object/array.
+        for opener, closer in (("{", "}"), ("[", "]")):
+            start = s.find(opener)
+            if start == -1:
+                continue
+            end = s.rfind(closer)
+            if end == -1 or end <= start:
+                continue
+            try:
+                return json.loads(s[start:end + 1])
+            except Exception:
+                continue
+        return None
