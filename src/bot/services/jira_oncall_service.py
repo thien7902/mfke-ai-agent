@@ -318,11 +318,15 @@ class JiraOncallService:
     async def _process_ticket(self, issue: dict, date_str: str, shift: str,
                               oncall_user_ids: list[int]) -> None:
         key = issue.get("key", "ISD-UNKNOWN")
-        fields = issue.get("fields", {}) or {}
-        summary = fields.get("summary", "(no summary)")
-        priority_obj = fields.get("priority", {}) or {}
+        # mcp-atlassian `jira_search` returns issues in the
+        # `Issue.to_simplified_dict()` shape — summary, description, status,
+        # priority, issuetype are TOP-LEVEL fields on each issue dict,
+        # NOT nested under `fields` like raw Jira REST API v2. See upstream
+        # src/mcp_atlassian/models/jira/issue.py:to_simplified_dict.
+        summary = issue.get("summary") or "(no summary)"
+        priority_obj = issue.get("priority", {}) or {}
         priority = priority_obj.get("name", "?")
-        status_obj = fields.get("status", {}) or {}
+        status_obj = issue.get("status", {}) or {}
         status = status_obj.get("name", "?")
         url = f"https://servicedesk.fci.vn/browse/{key}"
         # a) create topic.
@@ -472,9 +476,8 @@ class JiraOncallService:
     def _build_investigation_prompt(issue: dict) -> str:
         key = issue.get("key", "ISD-UNKNOWN")
         url = f"https://servicedesk.fci.vn/browse/{key}"
-        fields = issue.get("fields", {}) or {}
-        summary = fields.get("summary", "") or ""
-        description = fields.get("description", "") or ""
+        summary = issue.get("summary") or ""
+        description = issue.get("description") or ""
         return (
             f"This is an automated on-call precheck for Jira ticket "
             f"[{key}]({url}).\n"

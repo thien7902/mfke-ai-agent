@@ -26,14 +26,15 @@ from src.bot.services.jira_oncall_service import JiraOncallService
 
 def _make_issue(key="ISD-1", summary="pod crashloop", priority="P2",
                 status="Open", description="pod in crashloop"):
+    # Match mcp-atlassian `Issue.to_simplified_dict()` shape: summary,
+    # description, priority, status are top-level keys (not nested under
+    # `fields` like raw Jira REST v2).
     return {
         "key": key,
-        "fields": {
-            "summary": summary,
-            "description": description,
-            "priority": {"name": priority},
-            "status": {"name": status},
-        },
+        "summary": summary,
+        "description": description,
+        "priority": {"name": priority},
+        "status": {"name": status},
     }
 
 
