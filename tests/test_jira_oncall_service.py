@@ -68,7 +68,7 @@ def fake_config(monkeypatch):
     cfg.oncall_mcp_url = "http://localhost:9001/mcp"
     cfg.oncall_jira_jql_template = (
         'category = "Cloud FKE (K8S)" AND statusCategory != Done '
-        'AND updated >= "{since}"'
+        'AND created >= "{since}"'
     )
     cfg.oncall_check_interval_seconds = 1  # fast for tests
     cfg.oncall_shift_morning_hour = 8
@@ -241,6 +241,10 @@ async def test_fire_for_shift_uses_jql_without_assignee_filter(fake_config, fake
     jql = args.args[0]
     assert "assignee" not in jql
     assert 'Cloud FKE (K8S)' in jql
+    # Filters on `created`, not `updated` — only newly-created tickets in
+    # the shift window, not old tickets with new comments/status.
+    assert 'created >= ' in jql
+    assert 'updated' not in jql
     # Template substitution ran (timestamp should be present, format may vary)
     assert "2026-" in jql
 

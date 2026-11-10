@@ -182,14 +182,20 @@ class Config:
     oncall_chat_id: Optional[int] = None
     oncall_mcp_url: Optional[str] = None
     # JQL template; {since} is substituted with the shift-start timestamp.
+    # Uses `created >=` (not `updated >=`) so only tickets created within
+    # the shift window are fetched — comments/status changes on old
+    # tickets do not trigger a precheck.
     oncall_jira_jql_template: str = (
         'category = "Cloud FKE (K8S)" AND statusCategory != Done '
-        'AND updated >= "{since}"'
+        'AND created >= "{since}"'
     )
     oncall_check_interval_seconds: int = 60
     oncall_shift_morning_hour: int = 8
     oncall_shift_night_hour: int = 19
-    oncall_lookback_minutes: int = 720
+    # Lookback = length of the LONGEST shift (night = 13h) + small buffer so
+    # the morning-after-night handover does not miss a ticket created at
+    # 18:59 the previous evening.
+    oncall_lookback_minutes: int = 780
     oncall_topic_icon_color: int = 0x6FB9F0
     # Virtual Telegram user id for auto-investigations. MUST NOT be in
     # ADMIN_USER_IDS — keeps admin_gate's hard-block on mutations active.
@@ -257,7 +263,7 @@ def load_config() -> Config:
         oncall_mcp_url=os.getenv("ONCALL_MCP_URL") or None,
         oncall_jira_jql_template=os.getenv("ONCALL_JIRA_JQL_TEMPLATE") or (
             'category = "Cloud FKE (K8S)" AND statusCategory != Done '
-            'AND updated >= "{since}"'
+            'AND created >= "{since}"'
         ),
         oncall_check_interval_seconds=int(os.getenv("ONCALL_CHECK_INTERVAL_SECONDS", "60")),
         oncall_shift_morning_hour=int(os.getenv("ONCALL_SHIFT_MORNING_HOUR", "8")),

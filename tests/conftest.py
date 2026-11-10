@@ -164,12 +164,12 @@ def mock_config(tmp_path_factory):
         mock.oncall_mcp_url = None
         mock.oncall_jira_jql_template = (
             'category = "Cloud FKE (K8S)" AND statusCategory != Done '
-            'AND updated >= "{since}"'
+            'AND created >= "{since}"'
         )
         mock.oncall_check_interval_seconds = 60
         mock.oncall_shift_morning_hour = 8
         mock.oncall_shift_night_hour = 19
-        mock.oncall_lookback_minutes = 720
+        mock.oncall_lookback_minutes = 780
         mock.oncall_topic_icon_color = 0x6FB9F0
         mock.oncall_bot_user_id = 0
         yield mock
