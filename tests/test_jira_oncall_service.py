@@ -581,3 +581,46 @@ async def test_fire_now_fires_for_existing_shift(fake_config, fake_mongo):
     assert result.get("date") == "2026-11-10"
     assert result.get("shift") == "morning"
     assert "elapsed_seconds" in result
+
+
+async def test_fire_now_auto_picks_other_shift_when_first_has_no_registrants(
+    fake_config, fake_mongo,
+):
+    """/oncall test (no args) at 14:00 defaults to morning. If no morning
+    registrant exists but night has one, fall back to night. Stops the
+    "I registered night but tested mid-morning → no oncall shifts" UX
+    trap."""
+    mock_mongo, collections = fake_mongo
+    # First find() (morning, auto-pick) returns [] — no registrants.
+    # Second find() (night, fallback) returns the registered shift.
+    collections["oncall_shifts"].find.side_effect = [
+        [],                                        # morning lookup
+        [_make_shift(date="2026-11-10", shift="night")],  # night fallback
+    ]
+    svc = JiraOncallService()
+    svc._bot = _Bot()
+    svc._telegram_bot = _TelegramBot()
+    svc._mcp = MagicMock()
+    svc._mcp.search_issues = AsyncMock(return_value=[])
+    svc._process_ticket = AsyncMock()
+    # fire_now with no shift → auto-pick morning, fallback night.
+    with patch("src.bot.services.jira_oncall_service.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2026, 11, 10, 14, 0)
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        result = await svc.fire_now("2026-11-10")
+    assert result.get("shift") == "night"
+    assert result.get("date") == "2026-11-10"
+    assert "error" not in result
+
+
+async def test_fire_now_explicit_shift_no_fallback(fake_config, fake_mongo):
+    """If caller explicitly passes a shift, don't fallback to the other
+    one — they asked for that specific shift, return the friendly error
+    if it's empty."""
+    mock_mongo, collections = fake_mongo
+    collections["oncall_shifts"].find.return_value = []
+    svc = JiraOncallService()
+    result = await svc.fire_now("2026-11-10", "morning")
+    assert result.get("error")
+    assert "no oncall shifts" in result["error"]
+    assert result.get("shift") == "morning"

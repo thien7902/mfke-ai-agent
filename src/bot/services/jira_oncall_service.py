@@ -472,7 +472,8 @@ class JiraOncallService:
         short summary dict for the reply. Bypasses the time-check."""
         if not date_str:
             date_str = datetime.now().strftime("%Y-%m-%d")
-        if not shift:
+        auto_pick_shift = not shift
+        if auto_pick_shift:
             now = datetime.now()
             shift = "morning" if now.hour < 19 else "night"
         col = MongoDB.get_collection(SHIFTS_COLLECTION)
@@ -481,10 +482,19 @@ class JiraOncallService:
         except Exception as e:
             return {"date": date_str, "shift": shift, "error": str(e),
                     "fired": 0}
+        # Auto-pick fallback: if the time-based shift guess has no
+        # registrants, try the OTHER shift for the same date. Helps
+        # "I registered night but tested mid-morning" not error out.
+        if not shifts and auto_pick_shift:
+            other = "night" if shift == "morning" else "morning"
+            try:
+                shifts = list(col.find({"date": date_str, "shift": other}))
+            except Exception as e:
+                return {"date": date_str, "shift": other, "error": str(e),
+                        "fired": 0}
+            if shifts:
+                shift = other
         if not shifts:
-            # For /oncall test, fall back to using the caller's own shift if
-            # they have one for today; otherwise just look up any oncall
-            # shift for that date. If still none, return a friendly error.
             return {"date": date_str, "shift": shift,
                     "error": "no oncall shifts registered for this date/shift",
                     "fired": 0}
