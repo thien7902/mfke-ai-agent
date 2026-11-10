@@ -70,7 +70,7 @@ def fake_config(monkeypatch):
         'category = "Cloud FKE (K8S)" AND statusCategory != Done '
         'AND created >= "{since}"'
     )
-    cfg.oncall_check_interval_seconds = 1  # fast for tests
+    cfg.oncall_poll_interval_seconds = 1  # fast for tests
     cfg.oncall_shift_morning_hour = 8
     cfg.oncall_shift_night_hour = 19
     cfg.oncall_lookback_minutes = 720

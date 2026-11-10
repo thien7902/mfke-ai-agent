@@ -78,7 +78,12 @@ class McpJiraClient:
 
     async def _call(self, method: str, params: dict) -> Any:
         try:
-            from mcp.client.streamablehttp import streamablehttp_client
+            # Module name is `streamable_http` (with underscore) on the
+            # shipped `mcp` SDK. The function is `streamablehttp_client`
+            # (no underscore). Don't confuse the two — both forms exist
+            # in online references but only the underscore module name
+            # matches what `mcp>=1.2.0` exposes.
+            from mcp.client.streamable_http import streamablehttp_client
             from mcp.client.session import ClientSession
         except ImportError as e:
             logger.warning("mcp_sdk_not_installed", error=str(e))
@@ -98,10 +103,7 @@ class McpJiraClient:
                         result = await session.list_tools()
                         return [{"name": t.name, "description": getattr(t, "description", "")}
                                 for t in result.tools]
-                    else:
-                        return await session.send_request(
-                            {"method": method, "params": params or {}}
-                        )
+                    return None
         except Exception as e:
             logger.warning("mcp_call_failed", method=method, error=str(e))
             return None
