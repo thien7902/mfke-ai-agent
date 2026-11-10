@@ -418,11 +418,17 @@ class JiraOncallService:
             # route through send_rich_reply which auto-detects tables and
             # renders HTML/Markdown. Plain bot.send_message would dump raw
             # markdown into Telegram.
+            #
+            # No [:4000] truncation — send_rich_message splits text at
+            # TELEGRAM_MESSAGE_LIMIT (4096) for us, so long Holmes
+            # investigations (often >4k chars) arrive as multiple Telegram
+            # messages instead of being cut mid-sentence.
+            response_text = str(response) or "(empty response)"
             try:
                 await send_rich_reply(
                     self._bot,
                     chat_id=config.oncall_chat_id,
-                    text=str(response)[:4000] or "(empty response)",
+                    text=response_text,
                     message_thread_id=topic_id,
                 )
             except Exception as send_err:
@@ -432,7 +438,7 @@ class JiraOncallService:
                 )
                 await self._bot.send_message(
                     chat_id=config.oncall_chat_id,
-                    text=str(response)[:4000] or "(empty response)",
+                    text=response_text,
                     message_thread_id=topic_id,
                 )
         except Exception as e:
