@@ -166,7 +166,7 @@ def mock_config(tmp_path_factory):
             'category = "Cloud FKE (K8S)" AND statusCategory != Done '
             'AND created >= "{since}"'
         )
-        mock.oncall_check_interval_seconds = 60
+        mock.oncall_poll_interval_seconds = 120
         mock.oncall_shift_morning_hour = 8
         mock.oncall_shift_night_hour = 19
         mock.oncall_lookback_minutes = 780

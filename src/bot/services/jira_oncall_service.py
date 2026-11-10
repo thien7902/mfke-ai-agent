@@ -157,39 +157,29 @@ class JiraOncallService:
     # Loop
     # ------------------------------------------------------------------
     async def _oncall_loop(self) -> None:
-        # (date_str, shift) -> fired. Prevents double-firing within the
-        # 5-minute tolerance window at shift start.
-        last_fired: dict[tuple[str, str], bool] = {}
+        # Continuous worker: every `oncall_poll_interval_seconds` ticks,
+        # checks if `now` falls inside a registered shift, fetches Jira
+        # for that shift's start-to-now window, dedups against
+        # oncall_tickets, processes new ones. No "fire-once at shift-start"
+        # gate — tickets created mid-shift are caught within ~120s.
         while True:
             try:
-                await self._tick(last_fired)
+                await self._tick()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.error("oncall_tick_failed_bot_continues", error=str(e))
-            await asyncio.sleep(config.oncall_check_interval_seconds)
+            await asyncio.sleep(config.oncall_poll_interval_seconds)
 
-    async def _tick(self, last_fired: dict) -> None:
+    async def _tick(self) -> None:
         now = datetime.now()
-        # Allow ±5 minutes from shift-start to catch the boundary even if
-        # the asyncio loop tick drifted across a minute boundary.
-        is_morning_start = (
-            now.hour == config.oncall_shift_morning_hour and now.minute < 5
-        )
-        is_night_start = (
-            now.hour == config.oncall_shift_night_hour and now.minute < 5
-        )
-        if not (is_morning_start or is_night_start):
+        current = self._compute_current_shift(now)
+        if current is None:
             return
-        shift = "morning" if is_morning_start else "night"
-        date_str = now.strftime("%Y-%m-%d")
-        fire_key = (date_str, shift)
-        if last_fired.get(fire_key):
-            return
-        # Load all users who have this shift. Used only for the
-        # shift-exists check and for the human mention in the topic header.
-        # Ticket fetching is NOT per-user — the bot fetches ALL k8s tickets
-        # in the time window regardless of Jira assignee.
+        date_str, shift = current
+        shift_start_dt = self._shift_start_datetime(now, shift)
+        # Load registrants — no one on call means no poll (saves MCP
+        # calls and keeps the worker a true no-op outside shifts).
         col = MongoDB.get_collection(SHIFTS_COLLECTION)
         try:
             shifts = list(col.find({"date": date_str, "shift": shift}))
@@ -199,32 +189,73 @@ class JiraOncallService:
         if not shifts:
             return
         logger.info(
-            "oncall_shift_start",
+            "oncall_shift_active",
             date=date_str, shift=shift, user_count=len(shifts),
+            shift_start=shift_start_dt.isoformat(),
         )
         try:
-            await self._fire_for_shift(date_str, shift, shifts)
+            await self._fire_for_shift(date_str, shift, shift_start_dt, shifts)
         except Exception as e:
             logger.error(
                 "oncall_fire_failed_shift",
                 date=date_str, shift=shift, error=str(e),
             )
-        last_fired[fire_key] = True
-        # CRITICAL: reset the 90-minute idle watchdog so an in-flight
-        # investigation on a long ticket does not nuke the container.
+        # Bump watchdog whenever an active shift is running, not just on
+        # new tickets — a long quiet stretch during a shift shouldn't
+        # nuke the container via the 90m idle exit.
         if self._telegram_bot is not None:
             self._telegram_bot.last_update_time = time.time()
 
+    @staticmethod
+    def _compute_current_shift(now: datetime) -> Optional[tuple[str, str]]:
+        """Return (date_str, shift) if `now` falls inside an enabled shift,
+        else None. Morning = [08:00, 19:00), Night = [19:00, 08:00 next day).
+        For post-midnight night ticks the date is YESTERDAY's — matches the
+        shift document's `date` field set by `/oncall add <date> night`.
+
+        A shift hour < 0 disables that shift (e.g. set morning_hour=-1 to
+        run night-only).
+        """
+        m_h = config.oncall_shift_morning_hour
+        n_h = config.oncall_shift_night_hour
+        if m_h < 0 and n_h < 0:
+            return None
+        today = now.date()
+        if m_h >= 0 and m_h <= now.hour < n_h:
+            return (today.strftime("%Y-%m-%d"), "morning")
+        if n_h >= 0 and now.hour >= n_h:
+            return (today.strftime("%Y-%m-%d"), "night")
+        if n_h >= 0 and now.hour < m_h:
+            yesterday = today - timedelta(days=1)
+            return (yesterday.strftime("%Y-%m-%d"), "night")
+        return None
+
+    @staticmethod
+    def _shift_start_datetime(now: datetime, shift: str) -> datetime:
+        """For morning: today at morning_hour. For night pre-midnight: today
+        at night_hour. For night post-midnight: yesterday at night_hour —
+        matches the (date, shift) document key so JQL `created >=` covers
+        the entire ongoing night shift.
+        """
+        d = now.date()
+        if shift == "morning":
+            return datetime(d.year, d.month, d.day,
+                            config.oncall_shift_morning_hour, 0, 0)
+        if now.hour >= config.oncall_shift_night_hour:
+            return datetime(d.year, d.month, d.day,
+                            config.oncall_shift_night_hour, 0, 0)
+        yesterday = d - timedelta(days=1)
+        return datetime(yesterday.year, yesterday.month, yesterday.day,
+                        config.oncall_shift_night_hour, 0, 0)
+
     async def _fire_for_shift(self, date_str: str, shift: str,
+                              shift_start_dt: datetime,
                               shifts: list[dict]) -> None:
-        # 1) Build JQL with lookback window. No assignee filter — bot
-        # fetches ALL k8s tickets in the window.
-        since_dt = datetime.now() - timedelta(
-            minutes=config.oncall_lookback_minutes,
-        )
+        # 1) Build JQL with window starting at shift_start. No assignee
+        # filter — bot fetches ALL k8s tickets in the window.
         try:
             jql = config.oncall_jira_jql_template.format(
-                since=since_dt.strftime("%Y-%m-%d %H:%M"),
+                since=shift_start_dt.strftime("%Y-%m-%d %H:%M"),
             )
         except Exception as e:
             logger.error("oncall_jql_format_failed", error=str(e))
@@ -458,8 +489,15 @@ class JiraOncallService:
                     "error": "no oncall shifts registered for this date/shift",
                     "fired": 0}
         before = time.time()
+        # /oncall test may be invoked outside any configured shift, so use
+        # the lookback window instead of shift_start — the operator's
+        # intent is "investigate what's been happening recently", not
+        # "investigate the current shift".
+        shift_start_dt = datetime.now() - timedelta(
+            minutes=config.oncall_lookback_minutes,
+        )
         try:
-            await self._fire_for_shift(date_str, shift, shifts)
+            await self._fire_for_shift(date_str, shift, shift_start_dt, shifts)
         except Exception as e:
             return {"date": date_str, "shift": shift, "error": str(e),
                     "fired": 0}

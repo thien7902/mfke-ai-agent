@@ -189,7 +189,11 @@ class Config:
         'category = "Cloud FKE (K8S)" AND statusCategory != Done '
         'AND created >= "{since}"'
     )
-    oncall_check_interval_seconds: int = 60
+    # Worker poll interval (seconds). The oncall loop ticks every
+    # `oncall_poll_interval_seconds` and fires while a shift is active
+    # (08:00-19:00 morning, 19:00-08:00 night). No fire outside a shift
+    # or when no user is registered for the current shift.
+    oncall_poll_interval_seconds: int = 120
     oncall_shift_morning_hour: int = 8
     oncall_shift_night_hour: int = 19
     # Lookback = length of the LONGEST shift (night = 13h) + small buffer so
@@ -265,10 +269,10 @@ def load_config() -> Config:
             'category = "Cloud FKE (K8S)" AND statusCategory != Done '
             'AND created >= "{since}"'
         ),
-        oncall_check_interval_seconds=int(os.getenv("ONCALL_CHECK_INTERVAL_SECONDS", "60")),
+        oncall_poll_interval_seconds=int(os.getenv("ONCALL_POLL_INTERVAL_SECONDS", "120")),
         oncall_shift_morning_hour=int(os.getenv("ONCALL_SHIFT_MORNING_HOUR", "8")),
         oncall_shift_night_hour=int(os.getenv("ONCALL_SHIFT_NIGHT_HOUR", "19")),
-        oncall_lookback_minutes=int(os.getenv("ONCALL_LOOKBACK_MINUTES", "720")),
+        oncall_lookback_minutes=int(os.getenv("ONCALL_LOOKBACK_MINUTES", "780")),
         oncall_topic_icon_color=int(os.getenv("ONCALL_TOPIC_ICON_COLOR", str(0x6FB9F0)), base=0),
         oncall_bot_user_id=int(os.getenv("ONCALL_BOT_USER_ID", "0")),
     )

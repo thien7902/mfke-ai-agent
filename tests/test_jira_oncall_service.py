@@ -143,46 +143,58 @@ async def test_refuses_start_when_bot_user_id_is_admin(fake_config, fake_mongo):
 
 
 # ---------------------------------------------------------------------------
-# _tick
+# _tick — continuous-poll worker
 # ---------------------------------------------------------------------------
 
-async def test_tick_no_shift_at_boundary_returns_early(fake_config, fake_mongo):
+async def test_tick_outside_shift_returns_early(fake_config, fake_mongo):
+    """No shift active at the current time → no MongoDB find, no MCP call,
+    no _fire_for_shift call. The worker is a true no-op between shifts."""
+    # Disable both shifts — 03:00 with morning=08,night=19 is in night
+    # shift actually, so pick 06:00 to be in the gap between 19:00→08:00
+    # night window. Actually 06:00 IS in night window. The gap is the
+    # morning/night boundary is none — they're contiguous. The only "no
+    # shift" state is when both shift hours are -1 (disabled).
+    fake_config.oncall_shift_morning_hour = -1
+    fake_config.oncall_shift_night_hour = -1
     svc = JiraOncallService()
-    # 14:00 — neither shift start
-    dt = datetime(2026, 11, 10, 14, 5)
-    last_fired: dict = {}
-    with patch("src.bot.services.jira_oncall_service.datetime") as mock_dt:
-        mock_dt.now.return_value = dt
-        await svc._tick(last_fired)
-    assert last_fired == {}
-    assert svc._telegram_bot is None  # not set
-
-
-async def test_tick_morning_start_fires_for_users(fake_config, fake_mongo):
-    mock_mongo, collections = fake_mongo
-    collections["oncall_shifts"].find.return_value = [_make_shift()]
-    svc = JiraOncallService()
-    bot = _Bot()
-    tg_bot = _TelegramBot()
-    svc._bot = bot
-    svc._telegram_bot = tg_bot
     svc._mcp = MagicMock()
-    svc._mcp.search_issues = AsyncMock(return_value=[])
-    dt = datetime(2026, 11, 10, 8, 1)
-    last_fired: dict = {}
+    svc._fire_for_shift = AsyncMock()
+    dt = datetime(2026, 11, 10, 14, 0)
     with patch("src.bot.services.jira_oncall_service.datetime") as mock_dt:
         mock_dt.now.return_value = dt
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        # also mock the `_fire_for_shift` to avoid actually calling Holmes
-        svc._fire_for_shift = AsyncMock()
-        await svc._tick(last_fired)
-    assert svc._fire_for_shift.await_count == 1
-    assert last_fired.get(("2026-11-10", "morning")) is True
+        await svc._tick()
+    svc._fire_for_shift.assert_not_awaited()
+
+
+async def test_tick_morning_window_fires(fake_config, fake_mongo):
+    """14:00 (mid-morning) → shift active, registrant exists →
+    _fire_for_shift called with shift_start_dt = today 08:00."""
+    mock_mongo, collections = fake_mongo
+    collections["oncall_shifts"].find.return_value = [_make_shift()]
+    svc = JiraOncallService()
+    svc._bot = _Bot()
+    svc._telegram_bot = _TelegramBot()
+    svc._mcp = MagicMock()
+    svc._mcp.search_issues = AsyncMock(return_value=[])
+    svc._fire_for_shift = AsyncMock()
+    dt = datetime(2026, 11, 10, 14, 5)
+    with patch("src.bot.services.jira_oncall_service.datetime") as mock_dt:
+        mock_dt.now.return_value = dt
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        await svc._tick()
+    svc._fire_for_shift.assert_awaited_once()
+    args = svc._fire_for_shift.await_args
+    assert args.args[0] == "2026-11-10"   # date_str
+    assert args.args[1] == "morning"     # shift
+    assert args.args[2] == datetime(2026, 11, 10, 8, 0, 0)  # shift_start_dt
     # watchdog reset
-    assert tg_bot.last_update_time > 0.0
+    assert svc._telegram_bot.last_update_time > 0.0
 
 
-async def test_tick_night_start_fires_night_users(fake_config, fake_mongo):
+async def test_tick_night_pre_midnight_fires(fake_config, fake_mongo):
+    """22:00 same day → shift active, documents under "today" →
+    _fire_for_shift called with shift_start_dt = today 19:00."""
     mock_mongo, collections = fake_mongo
     collections["oncall_shifts"].find.return_value = [_make_shift(shift="night")]
     svc = JiraOncallService()
@@ -190,28 +202,120 @@ async def test_tick_night_start_fires_night_users(fake_config, fake_mongo):
     svc._telegram_bot = _TelegramBot()
     svc._mcp = MagicMock()
     svc._mcp.search_issues = AsyncMock(return_value=[])
-    dt = datetime(2026, 11, 10, 19, 2)
-    last_fired: dict = {}
+    svc._fire_for_shift = AsyncMock()
+    dt = datetime(2026, 11, 10, 22, 30)
     with patch("src.bot.services.jira_oncall_service.datetime") as mock_dt:
         mock_dt.now.return_value = dt
-        svc._fire_for_shift = AsyncMock()
-        await svc._tick(last_fired)
-    svc._fire_for_shift.assert_awaited()
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        await svc._tick()
+    svc._fire_for_shift.assert_awaited_once()
     args = svc._fire_for_shift.await_args
-    assert args.args[1] == "night"  # shift
-    assert last_fired.get(("2026-11-10", "night")) is True
+    assert args.args[0] == "2026-11-10"   # date_str = shift-start day
+    assert args.args[1] == "night"
+    assert args.args[2] == datetime(2026, 11, 10, 19, 0, 0)
 
 
-async def test_tick_does_not_refire_within_5_min_tolerance(fake_config, fake_mongo):
+async def test_tick_night_post_midnight_fires_yesterday_doc(fake_config, fake_mongo):
+    """03:00 on day N — a night shift registered under day N-1 (when the
+    shift started) must still fire. _compute_current_shift returns
+    YESTERDAY's date so the MongoDB lookup finds the shift document."""
+    mock_mongo, collections = fake_mongo
+    # The MongoDB find query in code uses {date: <date>, shift: "night"} —
+    # for a post-midnight tick the date is yesterday's. The fixture's
+    # mock `find.return_value` doesn't care about the query, so just
+    # ensure find was called with the yesterday date.
+    collections["oncall_shifts"].find.return_value = [_make_shift(shift="night")]
+    svc = JiraOncallService()
+    svc._bot = _Bot()
+    svc._telegram_bot = _TelegramBot()
+    svc._mcp = MagicMock()
+    svc._mcp.search_issues = AsyncMock(return_value=[])
+    svc._fire_for_shift = AsyncMock()
+    dt = datetime(2026, 11, 12, 3, 0)  # 03:00 day 12
+    with patch("src.bot.services.jira_oncall_service.datetime") as mock_dt:
+        mock_dt.now.return_value = dt
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        await svc._tick()
+    svc._fire_for_shift.assert_awaited_once()
+    args = svc._fire_for_shift.await_args
+    # date_str is yesterday (2026-11-11) — matches the shift document
+    assert args.args[0] == "2026-11-11"
+    assert args.args[1] == "night"
+    # shift_start_dt is yesterday's 19:00 (when the shift actually began)
+    assert args.args[2] == datetime(2026, 11, 11, 19, 0, 0)
+
+
+async def test_tick_no_registrants_returns_early(fake_config, fake_mongo):
+    """Shift active but nobody registered for it → no MCP call, no
+    _fire_for_shift. Saves an MCP round-trip."""
+    mock_mongo, collections = fake_mongo
+    collections["oncall_shifts"].find.return_value = []  # no registrants
     svc = JiraOncallService()
     svc._mcp = MagicMock()
+    svc._mcp.search_issues = AsyncMock()
     svc._fire_for_shift = AsyncMock()
-    last_fired = {("2026-11-10", "morning"): True}
-    dt = datetime(2026, 11, 10, 8, 3)
+    dt = datetime(2026, 11, 10, 14, 0)  # mid-morning
     with patch("src.bot.services.jira_oncall_service.datetime") as mock_dt:
         mock_dt.now.return_value = dt
-        await svc._tick(last_fired)
-    assert svc._fire_for_shift.await_count == 0
+        await svc._tick()
+    svc._fire_for_shift.assert_not_awaited()
+    svc._mcp.search_issues.assert_not_awaited()
+
+
+async def test_tick_bumps_watchdog_even_with_no_new_tickets(fake_config, fake_mongo):
+    """Watchdog reset happens on every tick where a shift is active —
+    not just when new tickets are found. A long quiet stretch during a
+    shift must not trigger the 90m idle-exit."""
+    mock_mongo, collections = fake_mongo
+    collections["oncall_shifts"].find.return_value = [_make_shift()]
+    # Already-processed ticket — dedup hits, no new issues to process
+    collections["oncall_tickets"].find_one.return_value = {"ticket_key": "ISD-1"}
+    svc = JiraOncallService()
+    bot = _Bot()
+    tg_bot = _TelegramBot()
+    tg_bot.last_update_time = 1000.0
+    svc._bot = bot
+    svc._telegram_bot = tg_bot
+    svc._mcp = MagicMock()
+    svc._mcp.search_issues = AsyncMock(return_value=[_make_issue(key="ISD-1")])
+    svc._process_ticket = AsyncMock()
+    dt = datetime(2026, 11, 10, 14, 0)
+    with patch("src.bot.services.jira_oncall_service.datetime") as mock_dt:
+        mock_dt.now.return_value = dt
+        await svc._tick()
+    assert tg_bot.last_update_time > 1000.0
+    # _process_ticket NOT called — ticket already fired
+    svc._process_ticket.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _compute_current_shift — boundary cases
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("hour,minute,expected_date,expected_shift", [
+    (8, 0, "2026-11-10", "morning"),    # exactly morning start
+    (18, 59, "2026-11-10", "morning"),  # last min of morning
+    (19, 0, "2026-11-10", "night"),     # exactly night start
+    (23, 59, "2026-11-10", "night"),    # last min before midnight
+    (0, 0, "2026-11-09", "night"),      # midnight — yesterday doc
+    (3, 0, "2026-11-09", "night"),      # 03:00 — yesterday doc
+    (7, 59, "2026-11-09", "night"),     # last min of post-midnight night
+])
+def test_compute_current_shift_boundaries(hour, minute, expected_date, expected_shift, fake_config):
+    """Every boundary of morning/night and the midnight-wrap edge case."""
+    svc = JiraOncallService()
+    now = datetime(2026, 11, 10, hour, minute)
+    result = svc._compute_current_shift(now)
+    assert result == (expected_date, expected_shift)
+
+
+def test_compute_current_shift_both_disabled(fake_config):
+    """When both shift hours are -1, no shift is ever active."""
+    fake_config.oncall_shift_morning_hour = -1
+    fake_config.oncall_shift_night_hour = -1
+    svc = JiraOncallService()
+    assert svc._compute_current_shift(datetime(2026, 11, 10, 14, 0)) is None
+    assert svc._compute_current_shift(datetime(2026, 11, 10, 3, 0)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +339,8 @@ async def test_fire_for_shift_uses_jql_without_assignee_filter(fake_config, fake
     )
     svc._holmes = MagicMock()
     svc._holmes.chat = AsyncMock(return_value="ok")
-    await svc._fire_for_shift("2026-11-10", "morning", [_make_shift()])
+    shift_start_dt = datetime(2026, 11, 10, 8, 0, 0)
+    await svc._fire_for_shift("2026-11-10", "morning", shift_start_dt, [_make_shift()])
     # Verify JQL passed to MCP has no "assignee"
     args = svc._mcp.search_issues.await_args
     jql = args.args[0]
@@ -245,8 +350,8 @@ async def test_fire_for_shift_uses_jql_without_assignee_filter(fake_config, fake
     # the shift window, not old tickets with new comments/status.
     assert 'created >= ' in jql
     assert 'updated' not in jql
-    # Template substitution ran (timestamp should be present, format may vary)
-    assert "2026-" in jql
+    # shift_start timestamp is substituted into the JQL
+    assert "2026-11-10 08:00" in jql
 
 
 async def test_fire_for_shift_global_dedup_skips_already_fired_tickets(fake_config, fake_mongo):
@@ -264,7 +369,8 @@ async def test_fire_for_shift_global_dedup_skips_already_fired_tickets(fake_conf
     svc._mcp = MagicMock()
     svc._mcp.search_issues = AsyncMock(return_value=issues)
     svc._process_ticket = AsyncMock()
-    await svc._fire_for_shift("2026-11-10", "morning", [_make_shift()])
+    shift_start_dt = datetime(2026, 11, 10, 8, 0, 0)
+    await svc._fire_for_shift("2026-11-10", "morning", shift_start_dt, [_make_shift()])
     # Only ISD-101 should reach _process_ticket
     assert svc._process_ticket.await_count == 1
     issue_arg = svc._process_ticket.await_args.args[0]
@@ -279,7 +385,8 @@ async def test_fire_for_shift_no_issues_no_call_to_holmes(fake_config, fake_mong
     svc._mcp = MagicMock()
     svc._mcp.search_issues = AsyncMock(return_value=[])
     svc._process_ticket = AsyncMock()
-    await svc._fire_for_shift("2026-11-10", "morning", [_make_shift()])
+    shift_start_dt = datetime(2026, 11, 10, 8, 0, 0)
+    await svc._fire_for_shift("2026-11-10", "morning", shift_start_dt, [_make_shift()])
     assert svc._process_ticket.await_count == 0
 
 
@@ -389,21 +496,20 @@ async def test_tick_resets_watchdog_when_new_tickets_found(fake_config, fake_mon
     )
     svc._holmes = MagicMock()
     svc._holmes.chat = AsyncMock(return_value="ok")
-    dt = datetime(2026, 11, 10, 8, 1)
-    last_fired: dict = {}
+    dt = datetime(2026, 11, 10, 14, 0)  # mid-morning, in shift
     with patch("src.bot.services.jira_oncall_service.datetime") as mock_dt:
         mock_dt.now.return_value = dt
-        await svc._tick(last_fired)
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        await svc._tick()
     # last_update_time bumped past the initial 1000.0
     assert tg_bot.last_update_time > 1000.0
 
 
-async def test_no_new_issues_does_not_reset_watchdog(fake_config, fake_mongo):
-    """All tickets already fired → fire_key tracked AND watchdog still reset
-    only if _fire_for_shift succeeded. The current implementation always bumps
-    the watchdog after _fire_for_shift returns (even with no issues). Test
-    the documented behavior: watchdog reset happens regardless as long as
-    shift-bucket had registered users."""
+async def test_no_new_issues_still_resets_watchdog(fake_config, fake_mongo):
+    """All tickets already fired → watchdog STILL reset because a shift
+    is active. The worker bumps the watchdog unconditionally per tick
+    when a registrant exists, so quiet stretches during a shift don't
+    nuke the container via the 90m idle exit."""
     mock_mongo, collections = fake_mongo
     collections["oncall_shifts"].find.return_value = [_make_shift()]
     collections["oncall_tickets"].find_one.return_value = {
@@ -417,14 +523,12 @@ async def test_no_new_issues_does_not_reset_watchdog(fake_config, fake_mongo):
     svc._telegram_bot = tg_bot
     svc._mcp = MagicMock()
     svc._mcp.search_issues = AsyncMock(return_value=[_make_issue(key="ISD-1")])
-    dt = datetime(2026, 11, 10, 8, 1)
-    last_fired: dict = {}
+    dt = datetime(2026, 11, 10, 14, 0)
     with patch("src.bot.services.jira_oncall_service.datetime") as mock_dt:
         mock_dt.now.return_value = dt
-        await svc._tick(last_fired)
-    # The current _tick bumps watchdog after a successful _fire_for_shift
-    # even with zero new issues — that's the documented behavior. Verify
-    # the bump happened: time should be newer than 1000.0.
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        await svc._tick()
+    # Watchdog bumped even though all tickets deduped out.
     assert tg_bot.last_update_time > 1000.0
 
 
