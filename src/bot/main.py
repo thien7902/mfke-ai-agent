@@ -23,10 +23,12 @@ from src.bot.services.conversation_service import ConversationService
 from src.bot.services.permission_service import PermissionService
 from src.bot.services.memory_service import MemoryService
 from src.bot.services.cluster_probe_service import ClusterProbeService
+from src.bot.services.jira_oncall_service import JiraOncallService
 from src.bot.handlers.message_handler import MessageHandler
 from src.bot.handlers.command_handler import CommandHandler as BotCommandHandler
 from src.bot.commands.add_memory import AddMemoryCommand
 from src.bot.commands.send_file import SendFileCommand
+from src.bot.commands.oncall_command import OncallCommand
 from src.bot.handlers.privilege_handler import PrivilegeHandler
 from src.bot.utils import file_sender
 
@@ -140,6 +142,9 @@ class TelegramBot:
         self.kb_store = None
         self.consolidator_service = None
         self.cluster_probe_service: ClusterProbeService = ClusterProbeService()
+        # On-call precheck scheduler (Jira→MCP→Topic→Holmes read-only).
+        # Ungated instantiation — start() is the gate. See JiraOncallService.
+        self.jira_oncall_service: JiraOncallService = JiraOncallService()
         self.last_update_time: float = 0  # Track last received update
         self.polling_restarts: int = 0    # Consecutive in-place restarts with no updates since
 
@@ -205,6 +210,14 @@ class TelegramBot:
         )
         await self.holmes_service.initialize()
         health_checker.set_holmes_ready(True)
+
+        # Wire dependencies into the on-call precheck scheduler. start()
+        # is gated by config.oncall_enabled and config.oncall_chat_id; the
+        # set_*() calls here are ungated so the scheduler is always ready
+        # to fire via `/oncall test` even if the loop isn't running.
+        self.jira_oncall_service.set_holmes(self.holmes_service)
+        self.jira_oncall_service.set_permissions(self.permission_service)
+        self.jira_oncall_service.set_conversation_service(self.conversation_service)
 
         # Background consolidator — populates distilled_fact_store on idle.
         # Best-effort init: failure doesn't block the bot, mirroring the
@@ -294,6 +307,7 @@ class TelegramBot:
         priv_handler = PrivilegeHandler(self.permission_service)
         add_memory_handler = AddMemoryCommand(self.memory_service, self.permission_service)
         send_file_handler = SendFileCommand()
+        oncall_handler = OncallCommand(self.jira_oncall_service)
 
         # Register command handlers
         self.application.add_handler(TelegramCommandHandler("start", cmd_handler.start_command))
@@ -313,6 +327,11 @@ class TelegramBot:
         # /addmemory — admin only; ingests replied message text or attached file
         # content as a knowledge episode into Graphiti (see src/bot/commands/add_memory.py)
         self.application.add_handler(TelegramCommandHandler("addmemory", add_memory_handler.handle))
+
+        # /oncall — admin only; register/list/rm/purge on-call shifts and
+        # fire the precheck scheduler manually for testing. See
+        # src/bot/commands/oncall_command.py.
+        self.application.add_handler(TelegramCommandHandler("oncall", oncall_handler.handle))
 
         # /sendfile — deliver a file from the outbox into this topic. The
         # assistant normally does this itself via the chat_send_file tool; the
@@ -460,6 +479,27 @@ class TelegramBot:
                 chat_id_set=bool(config.cluster_probe_chat_id),
             )
 
+        # Start the on-call precheck scheduler. Best-effort: failures never
+        # kill the bot. Only starts when ONCALL_ENABLED=true AND
+        # ONCALL_CHAT_ID is set. JiraOncallService.start() also refuses to
+        # spawn the loop if ONCALL_BOT_USER_ID is in ADMIN_USER_IDS (guard
+        # against accidentally giving the auto-investigation admin powers).
+        if config.oncall_enabled and config.oncall_chat_id:
+            try:
+                await self.jira_oncall_service.start(self.application.bot, self)
+            except Exception as e:
+                logger.error(
+                    "oncall_start_failed_bot_continues",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+        else:
+            logger.info(
+                "oncall_disabled",
+                enabled=config.oncall_enabled,
+                chat_id_set=bool(config.oncall_chat_id),
+            )
+
     async def stop(self):
         """Stop the bot gracefully."""
         logger.info("Stopping bot...")
@@ -498,6 +538,15 @@ class TelegramBot:
                 await self.cluster_probe_service.stop()
             except Exception as e:
                 logger.warning("cluster_probe_stop_failed", error=str(e))
+
+        # Stop the on-call scheduler before the Holmes executor shuts down
+        # so any in-flight investigation's subprocesses don't outlive the
+        # executor they were spawned alongside.
+        if getattr(self, "jira_oncall_service", None):
+            try:
+                await self.jira_oncall_service.stop()
+            except Exception as e:
+                logger.warning("oncall_stop_failed", error=str(e))
 
         # Shutdown the Holmes thread pool executor
         _holmes_executor.shutdown(wait=True)

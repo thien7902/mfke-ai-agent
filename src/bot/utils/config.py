@@ -171,6 +171,31 @@ class Config:
     # time, ~329 calls total.
     kb_distill_model: Optional[str] = None
 
+    # On-call precheck (admin-configured). Bot is an MCP HTTP/SSE client to
+    # mcp-atlassian running separately. At shift start (08:00 morning /
+    # 19:00 night) the bot lists all k8s Jira tickets in the lookback window
+    # (no assignee filter), creates one Telegram forum topic per NEW ticket,
+    # and auto-investigates using the main Holmes model under a read-only
+    # system-prompt rule + non-admin user_id so admin_gate hard-blocks any
+    # mutation. See src/bot/services/jira_oncall_service.py.
+    oncall_enabled: bool = False
+    oncall_chat_id: Optional[int] = None
+    oncall_mcp_url: Optional[str] = None
+    # JQL template; {since} is substituted with the shift-start timestamp.
+    oncall_jira_jql_template: str = (
+        'category = "Cloud FKE (K8S)" AND statusCategory != Done '
+        'AND updated >= "{since}"'
+    )
+    oncall_check_interval_seconds: int = 60
+    oncall_shift_morning_hour: int = 8
+    oncall_shift_night_hour: int = 19
+    oncall_lookback_minutes: int = 720
+    oncall_topic_icon_color: int = 0x6FB9F0
+    # Virtual Telegram user id for auto-investigations. MUST NOT be in
+    # ADMIN_USER_IDS — keeps admin_gate's hard-block on mutations active.
+    oncall_bot_user_id: int = 0
+
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -227,6 +252,19 @@ def load_config() -> Config:
         kb_enabled=os.getenv("KB_ENABLED", "").lower() in ("1", "true", "yes", "on"),
         kb_top_k=int(os.getenv("KB_TOP_K", "50")),
         kb_distill_model=os.getenv("KB_DISTILL_MODEL") or os.getenv("CONSOLIDATOR_MODEL") or None,
+        oncall_enabled=os.getenv("ONCALL_ENABLED", "").lower() in ("1", "true", "yes", "on"),
+        oncall_chat_id=int(os.getenv("ONCALL_CHAT_ID")) if os.getenv("ONCALL_CHAT_ID") else None,
+        oncall_mcp_url=os.getenv("ONCALL_MCP_URL") or None,
+        oncall_jira_jql_template=os.getenv("ONCALL_JIRA_JQL_TEMPLATE") or (
+            'category = "Cloud FKE (K8S)" AND statusCategory != Done '
+            'AND updated >= "{since}"'
+        ),
+        oncall_check_interval_seconds=int(os.getenv("ONCALL_CHECK_INTERVAL_SECONDS", "60")),
+        oncall_shift_morning_hour=int(os.getenv("ONCALL_SHIFT_MORNING_HOUR", "8")),
+        oncall_shift_night_hour=int(os.getenv("ONCALL_SHIFT_NIGHT_HOUR", "19")),
+        oncall_lookback_minutes=int(os.getenv("ONCALL_LOOKBACK_MINUTES", "720")),
+        oncall_topic_icon_color=int(os.getenv("ONCALL_TOPIC_ICON_COLOR", str(0x6FB9F0)), base=0),
+        oncall_bot_user_id=int(os.getenv("ONCALL_BOT_USER_ID", "0")),
     )
 
 

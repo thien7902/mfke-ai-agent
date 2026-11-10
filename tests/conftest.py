@@ -158,6 +158,20 @@ def mock_config(tmp_path_factory):
         mock.kb_enabled = False
         mock.kb_top_k = 50
         mock.kb_distill_model = None
+        # Oncall defaults: disabled in tests that don't opt in.
+        mock.oncall_enabled = False
+        mock.oncall_chat_id = None
+        mock.oncall_mcp_url = None
+        mock.oncall_jira_jql_template = (
+            'category = "Cloud FKE (K8S)" AND statusCategory != Done '
+            'AND updated >= "{since}"'
+        )
+        mock.oncall_check_interval_seconds = 60
+        mock.oncall_shift_morning_hour = 8
+        mock.oncall_shift_night_hour = 19
+        mock.oncall_lookback_minutes = 720
+        mock.oncall_topic_icon_color = 0x6FB9F0
+        mock.oncall_bot_user_id = 0
         yield mock
 
 

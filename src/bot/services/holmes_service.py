@@ -1115,6 +1115,7 @@ class HolmesService:
         cancel_event: Optional[threading.Event] = None,
         images: Optional[List[Dict[str, Any]]] = None,
         user_display_name: Optional[str] = None,
+        extra_prompt_additions: Optional[str] = None,
     ) -> str | AsyncGenerator[str, None]:
         """
         Send a message to Holmes and get response.
@@ -1135,6 +1136,11 @@ class HolmesService:
                 becomes a multimodal content array so the main LLM reads the image
                 directly. Caller must ensure the main model accepts image_url blocks
                 (see Config.main_model_supports_images).
+            extra_prompt_additions: Optional per-call override prepended to the
+                Holmes system-prompt additions stack (highest priority). Used by
+                JiraOncallService to inject a READ-ONLY rule for auto-investigations
+                without touching the global env var. Existing human-user callers
+                pass None and behave identically.
 
         Returns:
             Response text or async generator for streaming
@@ -1201,6 +1207,7 @@ class HolmesService:
             is_admin=is_admin,
             user_display_name=user_display_name,
             conversation=conversation,
+            extra_prompt_additions=extra_prompt_additions,
         )
 
         # Get feature flags from permissions
@@ -1373,6 +1380,7 @@ class HolmesService:
         is_admin: bool = False,
         user_display_name: Optional[str] = None,
         conversation: Optional[Conversation] = None,
+        extra_prompt_additions: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Build Holmes-compatible messages with proper system prompt and tool formatting.
 
@@ -1394,6 +1402,14 @@ class HolmesService:
         replay instead of stacking into the system prompt.
         """
         additions = bot_config.holmes_system_prompt_additions or ""
+        # Per-call override for the system-prompt additions stack. Used by
+        # JiraOncallService to inject a READ-ONLY rule for auto-investigations
+        # without touching the global HOLMES_SYSTEM_PROMPT_ADDITIONS env var.
+        # Prepended so it sits at the TOP of the additions (highest priority,
+        # where the LLM reads first). Caller is responsible for keeping the
+        # fragment short and self-contained.
+        if extra_prompt_additions:
+            additions = (extra_prompt_additions + "\n\n" + additions).strip()
         # Inject the distilled-knowledge block at the TOP of the additions
         # (high priority, no tool call required to surface these). Pulled
         # from the distilled_facts MongoDB collection — one bullet per

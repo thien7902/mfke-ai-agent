@@ -62,6 +62,17 @@ class ConversationService:
             return Conversation.from_dict(doc)
         return None
 
+    async def get_or_create_for_topic(self, chat_id: int, topic_id: int,
+                                       user_id: int) -> Conversation:
+        """Get-or-create a forum-topic conversation. Used by the JiraOncallService
+        auto-investigation flow which has no `Update` object — it builds a
+        conversation directly under the virtual bot user so the on-call human's
+        distilled history is not polluted. Thin wrapper around
+        `get_conversation` for the forum-topic branch."""
+        return await self.get_conversation(
+            user_id=user_id, topic_id=topic_id, chat_id=chat_id,
+        )
+
     async def save_conversation(self, conversation: Conversation) -> Conversation:
         """Save or update conversation in MongoDB."""
         doc = conversation.to_dict()

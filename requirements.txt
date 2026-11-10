@@ -26,6 +26,12 @@ Pillow>=10.0.0
 anthropic>=0.49.0,<1.0.0
 openai>=1.50.0
 
+# MCP client SDK (used by JiraOncallService to talk to mcp-atlassian over
+# HTTP/SSE — see src/bot/utils/mcp_client.py). Only imported when ONCALL_ENABLED
+# is true; the import is lazy so a missing package doesn't break the rest of
+# the bot.
+mcp>=1.2.0
+
 # Testing
 pytest==8.2.1
 pytest-asyncio==0.23.3
