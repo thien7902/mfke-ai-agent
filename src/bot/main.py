@@ -71,15 +71,18 @@ FATAL_POLLING_ERRORS = (
 )
 
 # Pool-wedge signatures: PTB logs these when getUpdates can't acquire a pooled
-# httpx connection — meaning every slot is stuck holding a dead request.
-# PTB's polling loop swallows these and retries silently, so without this
-# detector the bot looks alive but never reads messages. Unlike the TLS
-# errors above, a single occurrence can be transient (one slow request), so
-# we count hits within a window before deciding the pool is truly wedged.
+# httpx connection, OR when the cleanup-after-stop call also wedges. Any of
+# these reaching PTB's Updater logger means the httpx pool is unusable — by
+# the time it surfaces, PTB has silently retried several times already.
+# Exit immediately on first match; Docker restarts us with a fresh pool.
 POOL_WEDGE_ERRORS = (
     'pool timeout',
     'pooltimeout',
     'all connections in the connection pool are occupied',
+    # PTB's stop()-time cleanup logs this with a literal `%s` (the exception
+    # is not substituted into the message — it's printed separately via the
+    # formatter). Match on the literal template so the detector still fires.
+    'mark all fetched updates as read',
 )
 # Exit after this many pool-wedge log lines within this many seconds.
 # Threshold = 1 because a single PoolTimeout from PTB's Updater is enough

@@ -128,6 +128,29 @@ def test_pool_wedge_first_hit_exits():
         mock_hc.set_bot_alive.assert_called_once_with(False)
 
 
+def test_ptb_cleanup_log_triggers_exit():
+    """PTB's stop()-time cleanup logs `mark all fetched updates as read: %s`
+    with a literal `%s` (the exception is NOT substituted into the message).
+    The detector must match the literal template too — otherwise a wedged
+    pool that only surfaces during cleanup would not exit, and the
+    in-place polling restart would re-use the same wedged httpx client
+    (PTB doesn't recreate it on start_polling)."""
+    detector = FatalPollingDetector()
+    msg = (
+        "Error while calling `get_updates` one more time to mark all "
+        "fetched updates as read: %s. Suppressing error to ensure "
+        "graceful shutdown. When polling for updates is restarted, "
+        "updates may be fetched again. Please adjust timeouts via "
+        "`ApplicationBuilder` or the parameter `get_updates_request` of "
+        "`Bot`."
+    )
+    with patch.object(main_mod, "os") as mock_os, \
+         patch.object(main_mod, "health_checker") as mock_hc:
+        detector.emit(make_record(msg))
+        mock_os._exit.assert_called_once_with(1)
+        mock_hc.set_bot_alive.assert_called_once_with(False)
+
+
 def test_main_attaches_detector_to_updater_logger():
     """main() should attach a FatalPollingDetector to telegram.ext.Updater logger.
 
