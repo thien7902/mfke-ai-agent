@@ -185,8 +185,11 @@ class Config:
     # Uses `created >=` (not `updated >=`) so only tickets created within
     # the shift window are fetched — comments/status changes on old
     # tickets do not trigger a precheck.
+    # NOTE: `Category` is a Jira custom field (customfield_14307) on this
+    # Jira Server instance, NOT a built-in field — so JQL must use
+    # `cf[14307]` syntax. `category = "..."` returns "field does not exist".
     oncall_jira_jql_template: str = (
-        'category = "Cloud FKE (K8S)" AND statusCategory != Done '
+        'cf[14307] = "Cloud FKE (K8S)" AND statusCategory != Done '
         'AND created >= "{since}"'
     )
     # Worker poll interval (seconds). The oncall loop ticks every
@@ -266,7 +269,7 @@ def load_config() -> Config:
         oncall_chat_id=int(os.getenv("ONCALL_CHAT_ID")) if os.getenv("ONCALL_CHAT_ID") else None,
         oncall_mcp_url=os.getenv("ONCALL_MCP_URL") or None,
         oncall_jira_jql_template=os.getenv("ONCALL_JIRA_JQL_TEMPLATE") or (
-            'category = "Cloud FKE (K8S)" AND statusCategory != Done '
+            'cf[14307] = "Cloud FKE (K8S)" AND statusCategory != Done '
             'AND created >= "{since}"'
         ),
         oncall_poll_interval_seconds=int(os.getenv("ONCALL_POLL_INTERVAL_SECONDS", "120")),

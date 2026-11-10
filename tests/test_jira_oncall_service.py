@@ -67,7 +67,7 @@ def fake_config(monkeypatch):
     cfg.oncall_chat_id = -1001234567890
     cfg.oncall_mcp_url = "http://localhost:9001/mcp"
     cfg.oncall_jira_jql_template = (
-        'category = "Cloud FKE (K8S)" AND statusCategory != Done '
+        'cf[14307] = "Cloud FKE (K8S)" AND statusCategory != Done '
         'AND created >= "{since}"'
     )
     cfg.oncall_poll_interval_seconds = 1  # fast for tests

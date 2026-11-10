@@ -163,7 +163,7 @@ def mock_config(tmp_path_factory):
         mock.oncall_chat_id = None
         mock.oncall_mcp_url = None
         mock.oncall_jira_jql_template = (
-            'category = "Cloud FKE (K8S)" AND statusCategory != Done '
+            'cf[14307] = "Cloud FKE (K8S)" AND statusCategory != Done '
             'AND created >= "{since}"'
         )
         mock.oncall_poll_interval_seconds = 120
