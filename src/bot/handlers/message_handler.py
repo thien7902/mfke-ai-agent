@@ -455,7 +455,7 @@ class MessageHandler:
 
             if not extracted or not extracted.strip():
                 await update.message.reply_text(
-                    f"❌ Couldn't extract text from `{filename}`. supported: txt/code, pdf, docx, xlsx, png/jpg/webp (image OCR or vision).",
+                    f"❌ Couldn't extract text from `{filename}`. supported: txt/code, yaml/json, csv, pdf, docx, xlsx, png/jpg/webp (image OCR or vision).",
                     message_thread_id=update.message.message_thread_id or None,
                     parse_mode="Markdown",
                 )

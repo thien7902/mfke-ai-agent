@@ -51,6 +51,36 @@ def _extract_text_file(path: Path) -> str:
         return f.read()
 
 
+# Number of leading bytes to inspect when sniffing an unknown file type.
+_SNIFF_BYTES = 8192
+
+
+def _sniff_is_text(path: Path) -> bool:
+    """Heuristic: detect text files with no recognized extension.
+
+    Many Telegram uploads (e.g. kubeconfigs exported as `*-kubeconfig` with no
+    `.yaml` suffix) arrive with an empty/unknown extension and a generic
+    `application/octet-stream` mime. We sniff the leading bytes: a file is
+    treated as text only when every sampled byte is printable text — i.e. in
+    the tab/LF/CR/FF whitespace set (0x09-0x0d), printable ASCII (0x20-0x7e),
+    or a non-ASCII UTF-8 byte (0x80+, covers accented/multibyte chars). Any
+    NUL or other control byte (0x00-0x08, 0x0e-0x1f) marks the file as binary,
+    which rejects archives (zip's `PK\\x03\\x04`) and other opaque blobs while
+    accepting real config/yaml/text uploads.
+    """
+    try:
+        with open(path, "rb") as f:
+            sample = f.read(_SNIFF_BYTES)
+    except OSError:
+        return False
+    if not sample:
+        return True  # empty file — treat as (empty) text so the turn proceeds
+    for b in sample:
+        if b == 0x7f or (b < 0x20 and b not in (0x09, 0x0a, 0x0c, 0x0d)):
+            return False
+    return True
+
+
 def _extract_pdf(path: Path) -> str:
     from pypdf import PdfReader
     reader = PdfReader(str(path))
@@ -131,6 +161,13 @@ def extract_text_from_file(path: Path, mime: Optional[str] = None) -> str:
             return _truncate(_extract_docx(path))
         if ext == ".xlsx":
             return _truncate(_extract_xlsx(path))
+        # Unknown extension (no suffix, or one not explicitly listed) and a
+        # non-text mime: sniff the content. Kubeconfigs and other configs are
+        # often uploaded with no extension + `application/octet-stream`. If it
+        # reads as text, treat it as such; otherwise surface the unsupported
+        # error below.
+        if _sniff_is_text(path):
+            return _truncate(_extract_text_file(path))
         # Legacy .xls is not supported by openpyxl — return "" so the handler
         # surfaces a friendly error rather than crashing.
         logger.info("Unsupported file type", path=str(path), ext=ext, mime=mime)

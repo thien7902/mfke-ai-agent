@@ -44,6 +44,38 @@ def test_unknown_type_returns_empty(tmp_upload):
     assert extract_text_from_file(p) == ""
 
 
+def test_no_extension_yaml_sniffed_as_text(tmp_upload):
+    # Kubeconfigs uploaded to Telegram often arrive with no `.yaml` suffix
+    # and an `application/octet-stream` mime — must still be read as text.
+    kubeconfig = (
+        b"apiVersion: v1\n"
+        b"kind: Config\n"
+        b"clusters:\n"
+        b"- name: bm-ope267\n"
+        b"  cluster:\n"
+        b"    server: https://10.0.0.1:6443\n"
+        b"users:\n"
+        b"- name: admin\n"
+        b"  user:\n"
+        b"    token: abc123\n"
+    )
+    p = tmp_upload("bm-ope267-v2-eidhtfaj-kubeconfig", kubeconfig)
+    result = extract_text_from_file(p, mime="application/octet-stream")
+    assert "apiVersion: v1" in result
+    assert "kind: Config" in result
+
+
+def test_no_extension_binary_still_unsupported(tmp_upload):
+    # A binary file with no extension should not be sniffed as text.
+    p = tmp_upload("random-blob", bytes(range(256)) * 32)
+    assert extract_text_from_file(p) == ""
+
+
+def test_empty_no_extension_treated_as_text(tmp_upload):
+    p = tmp_upload("empty-upload", b"")
+    assert extract_text_from_file(p) == ""
+
+
 def test_image_returns_sentinel(tmp_upload):
     p = tmp_upload("pic.png", b"\x89PNG\r\n\x1a\n")
     assert extract_text_from_file(p) == IMAGE_SENTINEL

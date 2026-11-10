@@ -1185,7 +1185,7 @@ class CommandHandler:
             # scanned PDF, empty sheet) and gave no prompt of their own.
             await update.message.reply_text(
                 f"❌ Couldn't extract text from {attachment_name}. "
-                "Supported: txt/code, csv, pdf, docx, xlsx, images.",
+                "Supported: txt/code, yaml/json, csv, pdf, docx, xlsx, images.",
                 message_thread_id=topic_id or None,
             )
             try:
