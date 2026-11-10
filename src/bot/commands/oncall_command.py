@@ -112,7 +112,7 @@ class OncallCommand:
         if not docs:
             await update.message.reply_text(
                 "ℹ️ You have no registered on-call shifts.\n"
-                "Usage: `/oncall add <YYYY-MM-DD> <morning|night>`"
+                "Usage: /oncall add YYYY-MM-DD morning|night"
             )
             return
         lines = []
@@ -120,11 +120,10 @@ class OncallCommand:
         for doc in docs:
             date_str = doc.get("date", "?")
             shift = doc.get("shift", "?")
-            marker = " *" if date_str >= today else ""
-            lines.append(f"- `{date_str}` ({shift}){marker}")
+            marker = " (today)" if date_str >= today else ""
+            lines.append(f"- {date_str} ({shift}){marker}")
         await update.message.reply_text(
             "📋 Your on-call shifts:\n" + "\n".join(lines),
-            parse_mode="Markdown",
         )
 
     async def _handle_rm(self, update: Update, rest: list[str]) -> None:
@@ -200,29 +199,29 @@ class OncallCommand:
         """Returns (date_str, shift, error_message). On success, error is None."""
         if len(rest) < 2:
             return (None, None,
-                    "ℹ️ Usage: `/oncall add <YYYY-MM-DD> <morning|night>`")
+                    "ℹ️ Usage: /oncall add YYYY-MM-DD morning|night")
         date_str, shift = rest[0], rest[1].lower()
         if not _DATE_RE.match(date_str):
             return (None, None,
-                    f"❌ Invalid date `{date_str}`. Format: YYYY-MM-DD")
+                    f"❌ Invalid date {date_str}. Format: YYYY-MM-DD")
         if shift not in _VALID_SHIFTS:
             return (None, None,
-                    f"❌ Invalid shift `{shift}`. Must be morning or night.")
+                    f"❌ Invalid shift {shift}. Must be morning or night.")
         return (date_str, shift, None)
 
     @staticmethod
     async def _reply_usage(update: Update) -> None:
         await update.message.reply_text(
-            "ℹ️ *On-call precheck* usage:\n"
-            "• `/oncall add 2026-11-10 morning` — register your shift\n"
-            "• `/oncall list` — see your upcoming shifts\n"
-            "• `/oncall rm 2026-11-10 morning` — remove a shift\n"
-            "• `/oncall purge` — remove all your shifts\n"
-            "• `/oncall test` — fire precheck now (debug)\n\n"
-            "At the configured shift-start hour (08:00 morning / 19:00 "
-            "night), the bot lists all k8s Jira tickets in category 'Cloud "
-            "FKE (K8S)' updated since the lookback window, creates one "
-            "forum topic per NEW ticket, and auto-investigates each with "
-            "Holmes on the main model in READ-ONLY mode (no mutations).",
-            parse_mode="Markdown",
+            "ℹ️ On-call precheck usage:\n"
+            "• /oncall add 2026-11-10 morning — register your shift\n"
+            "• /oncall list — see your upcoming shifts\n"
+            "• /oncall rm 2026-11-10 morning — remove a shift\n"
+            "• /oncall purge — remove all your shifts\n"
+            "• /oncall test — fire precheck now (debug)\n\n"
+            "The worker polls every 120s while a shift is active "
+            "(08:00-19:00 morning, 19:00-08:00 night). It fetches all "
+            "k8s Jira tickets in category 'Cloud FKE (K8S)' created since "
+            "the shift start, creates one forum topic per NEW ticket, "
+            "and auto-investigates each with Holmes on the main model in "
+            "READ-ONLY mode (no mutations).",
         )

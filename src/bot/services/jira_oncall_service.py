@@ -345,7 +345,8 @@ class JiraOncallService:
         header = (
             f"🚨 On-call precheck ({shift} shift, {date_str})\n"
             f"On-call: {html.escape(oncall_mentions) or '(no registrants)'}\n"
-            f"Ticket: [{key}]({url})\n"
+            f"Ticket: {key}\n"
+            f"URL: {url}\n"
             f"Summary: {summary}\n"
             f"Priority: {priority}  Status: {status}\n"
             f"Auto-investigating with Holmes (main model, READ-ONLY)..."
@@ -355,7 +356,6 @@ class JiraOncallService:
                 chat_id=config.oncall_chat_id,
                 text=header,
                 message_thread_id=topic_id,
-                parse_mode="Markdown",
                 disable_web_page_preview=True,
             )
         except Exception as e:
