@@ -405,6 +405,7 @@ async def test_process_ticket_creates_topic_then_calls_holmes_then_replies_then_
     svc._conversation_service = MagicMock()
     conv = MagicMock()
     svc._conversation_service.get_or_create_for_topic = AsyncMock(return_value=conv)
+    svc._conversation_service.save_conversation = AsyncMock()
     svc._holmes = MagicMock()
     svc._holmes.chat = AsyncMock(return_value="all good — only read kubectl")
 
@@ -421,6 +422,9 @@ async def test_process_ticket_creates_topic_then_calls_holmes_then_replies_then_
     assert kwargs.get("user_permissions") == []
     # READ-ONLY rule in extra_prompt_additions
     assert "READ-ONLY" in kwargs.get("extra_prompt_additions", "")
+    # Conversation persisted so follow-up chats from the on-call human have
+    # context of the auto-investigation.
+    svc._conversation_service.save_conversation.assert_awaited_once_with(conv)
     # mark fired in oncall_tickets
     collections["oncall_tickets"].update_one.assert_called()
     up_kwargs = collections["oncall_tickets"].update_one.call_args

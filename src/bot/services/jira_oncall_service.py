@@ -30,6 +30,7 @@ import structlog
 from src.bot.utils.config import config
 from src.bot.utils.mcp_client import McpJiraClient
 from src.bot.utils.mongodb import MongoDB
+from src.bot.utils.rich_message import send_rich_reply
 
 logger = structlog.get_logger(__name__)
 
@@ -394,11 +395,42 @@ class JiraOncallService:
                 user_display_name="oncall-precheck (auto)",
                 extra_prompt_additions=_READ_ONLY_RULE,
             )
-            await self._bot.send_message(
-                chat_id=config.oncall_chat_id,
-                text=str(response)[:4000] or "(empty response)",
-                message_thread_id=topic_id,
-            )
+            # Persist conversation so on-call humans can chat follow-ups
+            # in this topic and Holmes sees the prior investigation. Without
+            # this, HolmesService.chat only mutates the in-memory Conversation
+            # object — the actual save happens in MessageHandler, which the
+            # oncall flow bypasses. ConversationService uses (chat_id,
+            # topic_id) as the unique key for forum topics, so the same
+            # conversation is fetched when a real user replies in the topic.
+            try:
+                await self._conversation_service.save_conversation(conversation)
+            except Exception as save_err:
+                logger.warning(
+                    "oncall_conversation_save_failed",
+                    key=key, error=str(save_err),
+                )
+            # Rich text render — Holmes responses frequently contain GFM
+            # tables (kubectl output, yaml diffs, ticket field listings) so
+            # route through send_rich_reply which auto-detects tables and
+            # renders HTML/Markdown. Plain bot.send_message would dump raw
+            # markdown into Telegram.
+            try:
+                await send_rich_reply(
+                    self._bot,
+                    chat_id=config.oncall_chat_id,
+                    text=str(response)[:4000] or "(empty response)",
+                    message_thread_id=topic_id,
+                )
+            except Exception as send_err:
+                logger.warning(
+                    "oncall_rich_reply_failed_falling_back",
+                    key=key, error=str(send_err),
+                )
+                await self._bot.send_message(
+                    chat_id=config.oncall_chat_id,
+                    text=str(response)[:4000] or "(empty response)",
+                    message_thread_id=topic_id,
+                )
         except Exception as e:
             logger.warning(
                 "oncall_holmes_failed",
