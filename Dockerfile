@@ -10,6 +10,10 @@ LABEL description="Telegram Bot with HolmesGPT, MongoDB, and all required tools"
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
+# Container timezone — oncall shift detection uses datetime.now() (local),
+# so this MUST be Asia/Ho_Chi_Minh for VN morning=08:00/night=19:00 to
+# match real shifts. tzdata is installed via apt below.
+ENV TZ=Asia/Ho_Chi_Minh
 
 # Install additional Python packages and tools.
 # Acquire options below work around clock-drift against Ubuntu's
@@ -40,6 +44,8 @@ RUN apt-get update \
         tzdata \
         tesseract-ocr \
         tesseract-ocr-eng \
+    && ln -fs /usr/share/zoneinfo/Asia/Ho_Chi_Minh /etc/localtime \
+    && dpkg-reconfigure --frontend noninteractive tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade pip and install pipx.
