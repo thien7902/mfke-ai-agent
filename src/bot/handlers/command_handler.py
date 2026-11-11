@@ -312,6 +312,9 @@ class CommandHandler:
         else:
             command = " ".join(context.args)
 
+        import re as _re
+        command = _re.sub(r'\\\s+', ' ', command).strip()
+
         if not command.strip():
             await update.message.reply_text(
                 "❌ Empty command.",
@@ -510,6 +513,14 @@ class CommandHandler:
             )
             return
         command = " ".join(context.args[1:]).strip()
+        # Strip backslash line-continuations that Telegram inserts when users
+        # copy-paste multi-line shell commands. PTB splits on whitespace so
+        # each `\` appears as a trailing char on the preceding token; joining
+        # them back produces `foo \ bar` which bash reads as a literal `\`.
+        # Collapse `<token>\ <next>` → `<token> <next>` (and handle the case
+        # where the backslash is attached to the preceding word with a space).
+        import re as _re
+        command = _re.sub(r'\\\s+', ' ', command).strip()
         if not command:
             await update.message.reply_text(
                 "❌ Empty command.",
