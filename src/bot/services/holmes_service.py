@@ -1718,6 +1718,18 @@ class HolmesService:
             stopped = True
             logger.info("Stream chat interrupted by user, persisting partial state", user_id=user_id)
             raise
+        except KeyboardInterrupt:
+            # Force-abort path: `thread_abort.abort()` injected this
+            # into the worker thread because /stop couldn't reach the
+            # cooperative cancel_event while litellm was blocked in
+            # httpx.recv. Translate to LLMInterruptedError so the rest
+            # of the stack (chat() wrapper, message_handler) treats it
+            # as a graceful stop — without this, KeyboardInterrupt
+            # propagates through asyncio.run_polling and shuts the bot
+            # down entirely.
+            stopped = True
+            logger.info("Stream chat force-killed by /stop, persisting partial state", user_id=user_id)
+            raise LLMInterruptedError("stream force-killed by /stop")
         finally:
             # Persist whatever we accumulated — even on interrupt or error.
             # Without this, /stop drops all tool results that already ran.
