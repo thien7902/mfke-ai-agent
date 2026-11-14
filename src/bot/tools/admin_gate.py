@@ -288,19 +288,21 @@ _PYTHON_INVOCATION_RE = re.compile(
     r"^python3?\s+",
     re.IGNORECASE,
 )
-# `python3 <anything>.py` (run a script file) is BLOCKED — the script's
-# source isn't visible in the bash command so Pattern G (K8s mutation
-# scan on `python3 -c "..."` source) cannot reach it. The LLM could
-# write a malicious script into the outbox then run it, bypassing all
-# pattern regexes. Closing this gap: only allow the inline `-c` form,
-# where source IS in the command and Pattern G can scan it.
+# `python3 <args>` is allowed ONLY in inline `-c "..."` form. Running
+# a script file — whether `python3 outbox/x.py`, `python3 /tmp/x` (no
+# extension), `python3 -m http.server`, or `./run.sh`-style launcher —
+# makes the script's source invisible to Pattern G (K8s mutation scan on
+# `python3 -c "..."` source). The LLM could write a malicious script
+# into the outbox then run it, bypassing every regex pattern. Closing
+# this gap: only the inline form, where source IS in the command and
+# Pattern G can scan it, passes Pattern I/H. Everything else must run
+# via `/shell` after operator review.
 #
-# Path token allows slash/word/dash/dot: `x.py`, `outbox/x.py`,
-# `./x.py`, `outbox/build.py`. The `.py` extension anchor prevents
-# matching `python3 -c 'print(1)'` (which has no `.py` token).
-_PYTHON_FILE_RUN_RE = re.compile(
-    r"^python3?\s+(?:-[A-Za-z]+\s+)*"  # optional flags like -O -B
-    r"(?:[\w./\\][\w./\\-]*\.py\b)",
+# Match shape: `python3` (or `python`), optional non-`-c` flags, `-c`.
+# `-c` must be a flag — not a value for another flag, not a substring
+# of a path token — so we anchor on `\-c\b` after whitespace.
+_PYTHON_INLINE_ONLY_RE = re.compile(
+    r"^python3?\s+(?:-(?!c\b)[A-Za-z]+\s+)*-c\b",
     re.IGNORECASE,
 )
 # Recognize `pip <query-verb>` and `python3 -m pip <query-verb>` forms
@@ -459,35 +461,13 @@ def _mutation_reason(cmd: Any, *, hard_block_only: bool = False) -> Optional[str
     # apply the Python pattern against the raw command up-front.
     if _PYTHON_INVOCATION_RE.match(_strip_env_prefix(cmd)) and _PYTHON_K8S_MUTATION_RE.search(cmd):
         return "hard_block_python_k8s_mutation"
-    # Pattern I: `python3 <file>.py` is hard-blocked — running a script
-    # file (even one the LLM wrote into the outbox) makes the script
-    # source invisible to Pattern G's source-scan, so the LLM could
-    # smuggle kubernetes mutations / requests.post to /api/v1/... by
-    # writing into a file and running it. Pattern G can only scan
-    # inline `python3 -c "..."` source; for file runs there is no
-    # source visible in the bash command. Block the file form totally
-    # — admins too — so the LLM must inline what it wants to run.
-    if _PYTHON_FILE_RUN_RE.match(_strip_env_prefix(cmd)):
-        return "hard_block_python_file_run"
-    # Pattern H: `python3 ...` without any reference to the outbox dir is
-    # hard-blocked. The bot policy is: python is allowed ONLY for producing
-    # deliverable files (xlsx, json, csv, ...), and those MUST land in the
-    # configured outbox dir. Anything else — running arbitrary scripts,
-    # ad-hoc computation, REPL-style inspection — is unreviewed shell access
-    # from inside a chat.
-    #
-    # The check fires on the RAW command (before per-segment split) for
-    # the same reason Pattern G does — quoting-blind splitting mangles
-    # `python3 -c "..."` mid-string. The allowlist string is the outbox
-    # dir resolved at runtime; if it can't be resolved we fail-open
-    # (block) so a missing config never silently permits python.
-    #
-    # IMPORTANT: Pattern E (package manager install) takes priority over
-    # Pattern H. `python3 -m pip install kubernetes` should report as
-    # `hard_block_package_manager`, not `hard_block_python_no_outbox`,
-    # so the user-facing message points at the right fix (don't try to
-    # install packages) instead of "write to outbox". We test Pattern E
-    # up-front and return its reason before Pattern H fires.
+    # Pattern E: package-manager install. Checked BEFORE Pattern I/H
+    # because `python3 -m pip install kubernetes` is also a "python3
+    # invocation that isn't `-c`" — Pattern I would catch it, but the
+    # user-facing message would point at "don't run scripts" instead
+    # of the more accurate "don't install packages". Read-only
+    # `pip list` / `pip show` is NOT a Pattern E match and falls
+    # through to the pip-readonly exception in Pattern I/H below.
     if _PACKAGE_MANAGER_INSTALL_RE.match(_strip_env_prefix(cmd)):
         return "hard_block_package_manager"
     # Pattern F: curl with a mutating HTTP method AND a K8s-shaped URL.
@@ -497,14 +477,25 @@ def _mutation_reason(cmd: Any, *, hard_block_only: bool = False) -> Optional[str
     # quote-naive like Pattern G's case.
     if _CURL_MUTATING_METHOD_RE.search(cmd) and _K8S_API_URL_RE.search(cmd):
         return "hard_block_curl_k8s_api"
-    # Pattern H: `python3 ...` without any reference to the outbox dir is
-    # hard-blocked — EXCEPT read-only `pip list` / `pip show` / etc which
-    # Holmes may want for introspection. Pattern E already hard-blocks
-    # install/uninstall etc; the read-only exception keeps Pattern H
-    # from firing on those.
+    # Pattern I/H together: restrict ALL python3 invocations to the
+    # inline `-c "..."` form. Pattern G only sees source that's
+    # literally in the bash command; running `python3 outbox/x.py` (or
+    # `/tmp/x` with no extension, or `python3 -m http.server`) hides
+    # the source from Pattern G — the LLM could write a malicious
+    # script into the outbox then run it, bypassing every regex. So
+    # anything that ISN'T `python3 -c "..."` is hard-blocked, admins
+    # included. The inline form is further gated by Pattern H (must
+    # reference the outbox — only exception is read-only `pip list` /
+    # `pip show` etc, which Pattern E doesn't catch but we want to
+    # allow for introspection). Pattern E was already checked above
+    # so install/uninstall verbs are routed to the package-manager
+    # message, not the inline-only message.
     if _PYTHON_INVOCATION_RE.match(_strip_env_prefix(cmd)):
-        if not _PYTHON_PIP_READONLY_RE.match(_strip_env_prefix(cmd)) and not _cmd_references_outbox(cmd):
-            return "hard_block_python_no_outbox"
+        if not _PYTHON_PIP_READONLY_RE.match(_strip_env_prefix(cmd)):
+            if not _PYTHON_INLINE_ONLY_RE.match(_strip_env_prefix(cmd)):
+                return "hard_block_python_file_run"
+            if not _cmd_references_outbox(cmd):
+                return "hard_block_python_no_outbox"
     for stripped in segments:
         if not stripped:
             continue
@@ -802,30 +793,33 @@ _HARD_BLOCK_MESSAGES = {
         "to apply any change via /shell manually."
     ),
     "hard_block_python_no_outbox": (
-        "Running arbitrary `python3` commands from inside a chat is "
-        "blocked by the bot's safety policy — python is only permitted "
-        "for producing deliverable FILES (xlsx, json, csv, txt, yaml, "
-        "...) and the resulting file MUST be written under the bot's "
-        "configured outbox directory (the same directory "
-        "`chat_send_file` accepts). Do NOT retry with `python3 -c`, "
-        "`python3 /tmp/x.py`, or any other variant that doesn't target "
-        "the outbox. To produce a deliverable: write the file to the "
-        "outbox dir then call `chat_send_file` with the path. For any "
-        "other use (debug inspect, scope-state check, ad-hoc "
-        "computation), instruct the user to run it via /shell manually."
+        "Running `python3 -c \"...\"` from inside a chat is blocked "
+        "by the bot's safety policy when it doesn't target the bot's "
+        "configured outbox directory. Python is only permitted for "
+        "producing deliverable FILES (xlsx, json, csv, txt, yaml, ...) "
+        "that MUST be written under the outbox (same directory "
+        "`chat_send_file` accepts). Do NOT retry with a `python3 -c` "
+        "that writes outside the outbox. To produce a deliverable: "
+        "write the file to the outbox dir in the inline `-c` one-liner "
+        "then call `chat_send_file` with the path. For any other use "
+        "(debug inspect, scope-state check, ad-hoc computation), "
+        "instruct the user to run it via /shell manually."
     ),
     "hard_block_python_file_run": (
-        "Running a Python script FILE (`python3 <x>.py`) from inside "
-        "a chat is blocked by the bot's safety policy — the source "
-        "code of a script file is not visible in the bash command, "
-        "so the bot cannot inspect it for kubernetes mutations or "
-        "apiserver calls. Do NOT retry with `.py` files, do NOT "
-        "write a script to the outbox and then run it. To execute "
-        "Python code, inline the source with `python3 -c \"...\"` "
-        "(the bot scans the inline source for mutating calls). To "
-        "produce a deliverable file, write it directly in the inline "
-        "script and call `chat_send_file` with the path. For longer "
-        "scripts the user must run them via /shell manually."
+        "Running `python3 <anything>` in non-inline form from inside a "
+        "chat is blocked by the bot's safety policy — only `python3 "
+        "-c \"<source>\"` is allowed because the inline source IS "
+        "visible in the bash command and the bot can scan it for "
+        "kubernetes mutations and apiserver calls. File runs "
+        "(`python3 x.py`, `python3 outbox/x` without an extension), "
+        "module runs (`python3 -m http.server`), and any other form "
+        "hide the source from the bot. Do NOT retry with `.py` files, "
+        "do NOT write a script to the outbox and then run it, and do "
+        "NOT use `python3 -m <pkg>`. To execute Python code, inline the "
+        "source with `python3 -c \"...\"` and write any deliverable "
+        "file straight to the outbox in that one-liner, then call "
+        "`chat_send_file` with the path. For longer scripts the user "
+        "must run them via /shell manually."
     ),
 }
 

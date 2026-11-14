@@ -1065,12 +1065,12 @@ def _patch_outbox(monkeypatch, path):
 @pytest.mark.parametrize("cmd", [
     'python3 -c "print(\'hello\')"',
     'python3 -c "import requests; r=requests.get(\'https://k8s/api/v1/pods\')"',
-    'python3 -m http.server',
     'python3 -c "import os; os.chdir(\'/tmp\'); print(os.getcwd())"',
 ])
 def test_hard_block_python_no_outbox_blocks(monkeypatch, cmd):
-    """Pattern H: python3 invocation without any reference to the outbox
-    dir is hard-blocked. Admins too."""
+    """Pattern H: inline `python3 -c "..."` invocation without any
+    reference to the outbox dir is hard-blocked. Admins too. Non-inline
+    invocations (like `python3 -m http.server`) hit Pattern I first."""
     _patch_outbox(monkeypatch, "/root/.holmes/outbox")
     monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
     tool = FakeBashTool()
@@ -1085,13 +1085,11 @@ def test_hard_block_python_no_outbox_blocks(monkeypatch, cmd):
 
 @pytest.mark.parametrize("cmd", [
     'python3 -c "open(\'/root/.holmes/outbox/report.csv\', \'w\').write(\'hi\')"',
-    'python3 /root/.holmes/outbox/build_xlsx.py',
     'python3 -c "import os; os.chdir(\'/root/.holmes/outbox\'); ..."',
     'python3 -c "open(\'outbox/foo.txt\', \'w\').write(\'hi\')"',
-    'python3 outbox/generate_report.py',
 ])
 def test_hard_block_python_outbox_target_passes_pattern_h(monkeypatch, cmd):
-    """Pattern H: python3 invocations that reference the outbox dir
+    """Pattern H: inline `python3 -c "..."` that references the outbox
     (absolute path, basename, or relative `outbox/...`) pass Pattern H.
     Pattern G (K8s mutation) still applies independently."""
     _patch_outbox(monkeypatch, "/root/.holmes/outbox")
@@ -1147,11 +1145,25 @@ def test_hard_block_python_no_outbox_beats_admin(monkeypatch):
     "python3 -O x.py",  # has flags before arg
     "python3 -B outbox/x.py",
     "python /root/.holmes/outbox/generate_report.py",
+    # No .py extension — still a file run, source invisible to Pattern G.
+    "python3 outbox/build_xlsx",
+    "python3 /tmp/script",
+    "python /tmp/runme",
+    # Module form is also a non-inline invocation — source lives in an
+    # installed package, not in the bash command. Admins too.
+    "python3 -m http.server",
+    "python3 -m pip install kubernetes",  # Pattern E fires first — but
+                                           # also non-inline python3.
 ])
 def test_hard_block_python_file_run_blocks(monkeypatch, cmd):
-    """Pattern I: any `python3 <file>.py` is hard-blocked. The source
-    code in the file is not visible in the bash command so Pattern G
-    cannot scan it. Block totally — admins too."""
+    """Pattern I: any `python3 <non-inline>` invocation is hard-blocked.
+    Only `python3 -c "..."` (inline form) is allowed because that's the
+    only form where source is visible to Pattern G's K8s-mutation scan.
+    File runs (`python3 x.py`, `python3 outbox/build_xlsx` without
+    extension), module runs (`python3 -m http.server`), and pip-install
+    (`python3 -m pip install kubernetes` — Pattern E fires first with
+    a more specific message but is also non-inline) are all blocked.
+    Admins too."""
     _patch_outbox(monkeypatch, "/root/.holmes/outbox")
     monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
     tool = FakeBashTool()
@@ -1160,22 +1172,29 @@ def test_hard_block_python_file_run_blocks(monkeypatch, cmd):
     ctx = FakeCtx(request_context={"user_id": "12345"})
     r = tool.invoke({"command": cmd}, ctx)
     assert r.status.value == "error"
-    assert "hard_block_python_file_run" in r.error
+    # The pip-install case is routed to Pattern E first; everything else
+    # lands on Pattern I. Either is a hard-block.
+    if "pip install" in cmd:
+        assert "hard_block_package_manager" in r.error
+    else:
+        assert "hard_block_python_file_run" in r.error
     assert tool.last_params is None
 
 
 @pytest.mark.parametrize("cmd", [
-    'python3 -c "print(1)"',  # inline form passes Pattern I
+    'python3 -c "print(1)"',  # inline form passes Pattern I (Pattern H
+                              # may still block if outbox not referenced)
     'python3 -c "open(\'/root/.holmes/outbox/x.csv\', \'w\').write(\'hi\')"',
     'python3 -m pip list',  # read-only pip
     'pip3 list',
     'echo hello',
     'kubectl get pods',
 ])
-def test_hard_block_python_file_run_non_py_passes(monkeypatch, cmd):
-    """Pattern I matches only when the first positional arg ends
-    with `.py`. Inline `-c`, pip list, and non-python commands pass
-    through Pattern I (other patterns may still block)."""
+def test_hard_block_python_file_run_inline_passes(monkeypatch, cmd):
+    """Pattern I matches only the inline `-c` form (or pip-readonly /
+    non-python commands). Anything else is blocked. Inline `-c` may
+    still hit Pattern H (no outbox reference), but it does NOT trip
+    Pattern I — that's what we're asserting here."""
     _patch_outbox(monkeypatch, "/root/.holmes/outbox")
     monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
     tool = FakeBashTool()
@@ -1187,7 +1206,9 @@ def test_hard_block_python_file_run_non_py_passes(monkeypatch, cmd):
 
 
 def test_hard_block_python_file_run_beats_admin(monkeypatch):
-    """Admins too cannot run .py script files."""
+    """Admins too cannot run scripts via `python3 <file>` — the source
+    isn't visible to Pattern G, so the inline-only rule applies even
+    to admins."""
     _patch_outbox(monkeypatch, "/root/.holmes/outbox")
     monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
     tool = FakeBashTool()
