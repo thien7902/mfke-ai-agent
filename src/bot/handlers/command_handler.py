@@ -1432,10 +1432,10 @@ class CommandHandler:
         snapshot_script = r'''
 set -uo pipefail
 C="__CLUSTER_ID__"
-LINES="200"
+LINES="100"
 EMIN="120"
-BUDGET=30
-CMD_TMO=25
+BUDGET=10
+CMD_TMO=8
 
 KCFG="${KUBECONFIG:-/root/.kube/config}"
 if [ ! -f "$KCFG" ]; then echo "ERROR: no kubeconfig at $KCFG"; exit 1; fi
@@ -1583,10 +1583,10 @@ exit 0
         snapshot_script = snapshot_script.replace("__CLUSTER_ID__", cluster_id)
 
         import signal
-        # BUDGET=30 inside the bash script + headroom for collectors' final
+        # BUDGET=10 inside the bash script + headroom for collectors' final
         # cat() output flush. Without headroom, asyncio kills the process
         # right when it's about to flush, losing the snapshot.
-        TIMEOUT_SECONDS = 45
+        TIMEOUT_SECONDS = 20
 
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -1665,14 +1665,21 @@ exit 0
             "Không hỏi thêm thông tin."
         )
 
-        # Build message list: existing conversation history + analysis request.
-        lm_messages = [{"role": "system", "content": system_prompt}]
-        for m in conversation.messages:
-            lm_messages.append({"role": m.role, "content": m.content or ""})
-        lm_messages.append({
-            "role": "user",
-            "content": f"Phân tích snapshot control-plane cho cluster `{cluster_id}` ở trên.",
-        })
+        # Build message list for the LLM. Only send the snapshot directly —
+        # including conversation history would duplicate snapshot tokens and
+        # slow the first-token latency. History has been persisted to
+        # conversation.messages for follow-up chats with Holmes.
+        lm_messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"Phân tích snapshot control-plane cho cluster `{cluster_id}` "
+                    f"dưới đây (snapshot đã được thu thập bởi /check):\n\n"
+                    f"```\n{output}\n```"
+                ),
+            },
+        ]
 
         response_msg = await context.bot.send_message(
             chat_id=chat_id,
@@ -1688,7 +1695,7 @@ exit 0
                 "model": llm_model,
                 "messages": lm_messages,
                 "stream": True,
-                "timeout": 300,
+                "timeout": 120,
                 "tool_choice": "none",
             }
             if llm_api_key:
