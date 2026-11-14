@@ -1440,14 +1440,18 @@ CMD_TMO=25
 KCFG="${KUBECONFIG:-/root/.kube/config}"
 if [ ! -f "$KCFG" ]; then echo "ERROR: no kubeconfig at $KCFG"; exit 1; fi
 
-INFO=$(KUBECONFIG="$KCFG" kubectl --context=garden get shoot -A -o wide 2>/dev/null | grep -i "$C" | head -n1)
-if [ -z "$INFO" ]; then
+SHOOT_JSON=$(KUBECONFIG="$KCFG" kubectl --context=garden get shoot -A -o json 2>/dev/null \
+  | jq -r --arg c "$C" '
+      .items[] | select(.metadata.name == $c)
+      | "\(.metadata.namespace) \(.metadata.name) \(.spec.seedName)"
+    ' | head -n1)
+if [ -z "$SHOOT_JSON" ]; then
   echo "ERROR: shoot '$C' not found in garden context of $KCFG"
   exit 1
 fi
-GNS=$(echo "$INFO" | awk '{print $1}')
-SHOOT=$(echo "$INFO" | awk '{print $2}')
-SEED=$(echo "$INFO" | awk '{print $6}')
+GNS=$(echo "$SHOOT_JSON" | awk '{print $1}')
+SHOOT=$(echo "$SHOOT_JSON" | awk '{print $2}')
+SEED=$(echo "$SHOOT_JSON" | awk '{print $3}')
 NS="fke-${SHOOT}"
 
 if ! KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=10s get ns "$NS" >/dev/null 2>&1; then
