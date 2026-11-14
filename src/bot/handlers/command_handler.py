@@ -1432,10 +1432,10 @@ class CommandHandler:
         snapshot_script = r'''
 set -uo pipefail
 C="__CLUSTER_ID__"
-LINES="100"
+LINES="200"
 EMIN="120"
-BUDGET=10
-CMD_TMO=8
+BUDGET=30
+CMD_TMO=25
 
 KCFG="${KUBECONFIG:-/root/.kube/config}"
 if [ ! -f "$KCFG" ]; then echo "ERROR: no kubeconfig at $KCFG"; exit 1; fi
@@ -1583,10 +1583,10 @@ exit 0
         snapshot_script = snapshot_script.replace("__CLUSTER_ID__", cluster_id)
 
         import signal
-        # BUDGET=10 inside the bash script + headroom for collectors' final
+        # BUDGET=30 inside the bash script + headroom for collectors' final
         # cat() output flush. Without headroom, asyncio kills the process
         # right when it's about to flush, losing the snapshot.
-        TIMEOUT_SECONDS = 20
+        TIMEOUT_SECONDS = 45
 
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -1646,6 +1646,7 @@ exit 0
         # the new characters. Once streaming finishes, send a real message to
         # persist the final response.
         import litellm
+        import time as _time
 
         llm_cfg = self.holmes._get_llm_config()
         llm_model = llm_cfg["model"]
@@ -1692,13 +1693,16 @@ exit 0
             message_thread_id=topic_id or None,
         )
         _set_investigation_status(chat_id, topic_id, "🔍 Đang phân tích snapshot...")
+        full_response = ""
+        last_edit_len = 0
+        last_edit_ts = _time.time()
 
         try:
             litellm_kwargs: dict = {
                 "model": llm_model,
                 "messages": lm_messages,
-                "stream": False,
-                "timeout": 120,
+                "stream": True,
+                "timeout": 180,
                 "tool_choice": "none",
             }
             if llm_api_key:
@@ -1706,8 +1710,26 @@ exit 0
             if llm_api_base:
                 litellm_kwargs["api_base"] = llm_api_base
 
-            completion = await litellm.acompletion(**litellm_kwargs)
-            full_response = completion.choices[0].message.content or ""
+            # Throttle: only edit_message_text every 1.5s OR when 300+
+            # new chars arrived. Telegram tolerates ~1 edit/sec/message;
+            # this keeps us comfortably under that while still streaming.
+            stream_resp = await litellm.acompletion(**litellm_kwargs)
+            async for chunk in stream_resp:
+                try:
+                    delta = chunk.choices[0].delta.content or ""
+                except Exception:
+                    continue
+                if delta:
+                    full_response += delta
+                    now = _time.time()
+                    new_chars = len(full_response) - last_edit_len
+                    if now - last_edit_ts >= 1.5 and new_chars >= 50:
+                        last_edit_len = len(full_response)
+                        last_edit_ts = now
+                        try:
+                            await response_msg.edit_text(full_response[:3900] + "▌")
+                        except Exception:
+                            pass
         except Exception as e:
             logger.error("/check analysis failed", user_id=user.id, error=str(e))
             _clear_investigation(chat_id, topic_id)
