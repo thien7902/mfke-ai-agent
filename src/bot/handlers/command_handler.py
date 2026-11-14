@@ -1418,7 +1418,7 @@ class CommandHandler:
             user.id, topic_id=topic_id, chat_id=chat_id
         )
 
-        from src.bot.utils.rich_message import send_rich_reply, edit_or_send_rich
+        from src.bot.utils.rich_message import send_rich_reply, send_rich_message
         from src.bot.handlers.message_handler import _set_investigation_status, _clear_investigation
         from src.bot.models.conversation import Message
 
@@ -1682,11 +1682,6 @@ exit 0
         except Exception:
             pass
 
-        response_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text="🤔 Đang phân tích snapshot...",
-            message_thread_id=topic_id or None,
-        )
         _set_investigation_status(chat_id, topic_id, "🔍 Đang phân tích snapshot...")
 
         try:
@@ -1708,7 +1703,11 @@ exit 0
             logger.error("/check analysis failed", user_id=user.id, error=str(e))
             _clear_investigation(chat_id, topic_id)
             try:
-                await response_msg.edit_text(f"❌ /check analysis failed: {e}")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ /check analysis failed: {e}",
+                    message_thread_id=topic_id or None,
+                )
             except Exception:
                 pass
             return
@@ -1727,12 +1726,13 @@ exit 0
             full_response = "(no analysis)"
 
         try:
-            await edit_or_send_rich(
+            from src.bot.utils.rich_message import send_rich_message
+            await send_rich_message(
                 context.bot,
                 chat_id=chat_id,
-                message=response_msg,
                 text=full_response,
                 message_thread_id=topic_id or None,
+                prefer_rich=True,
             )
         except Exception as e:
             logger.warning("/check rich delivery failed, retrying plain", user_id=user.id, error=str(e))
