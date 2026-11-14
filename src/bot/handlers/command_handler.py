@@ -1330,3 +1330,266 @@ class CommandHandler:
                     )
                 except Exception:
                     pass
+
+    @admin_only
+    @rate_limit
+    async def check_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /check <kubeconfig_name> <cluster_id> — run gardener_controlplane_snapshot
+        via Holmes and stream root-cause analysis into the current topic.
+
+        Flow:
+          1. Decrypt <kubeconfig_name>.enc from /root/.holmes/kubeconfig-only-admin-can-run
+             to a 0600 tempfile (same path /kshell uses).
+          2. Set KUBECONFIG=<tempfile> in os.environ so the Holmes worker thread
+             (which inherits process env) sees it when running the tool script.
+          3. Build a prompt asking Holmes to call gardener_controlplane_snapshot
+             with the cluster_id, then produce a root-cause analysis.
+          4. Stream the response into the topic like a normal Holmes turn, so the
+             conversation persists for follow-up chats.
+          5. Restore the original KUBECONFIG env and shred the tempfile in finally.
+        """
+        if not update.message:
+            return
+
+        chat = update.effective_chat
+        topic_id = update.message.message_thread_id or 0
+
+        if chat.type == "private":
+            await update.message.reply_text(
+                "🚫 Private chats are disabled. Please use the bot in a group forum topic.",
+                message_thread_id=None,
+            )
+            return
+
+        if not (chat.type in ("group", "supergroup") and chat.is_forum and topic_id):
+            await update.message.reply_text(
+                "ℹ️ /check only works inside a forum topic.",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text(
+                "Usage: /check <kubeconfig_name> <cluster_id>\n"
+                "Example: /check hoa-lac-new-garden poc-dev-cluster-gsjle31i\n\n"
+                "Use /kshell alone to list available kubeconfigs.",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        kc_name = context.args[0].strip()
+        cluster_id = " ".join(context.args[1:]).strip()
+        if not cluster_id:
+            await update.message.reply_text(
+                "❌ Empty cluster_id.",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        import os
+        KCONFIG_DIR = "/root/.holmes/kubeconfig-only-admin-can-run"
+        kc_stem = kc_name[:-4] if kc_name.endswith(".enc") else kc_name
+        enc_path = os.path.join(KCONFIG_DIR, kc_stem + ".enc")
+        if not os.path.exists(enc_path):
+            await update.message.reply_text(
+                f"❌ Kubeconfig `{kc_stem}` not found.\n\n"
+                f"Use /kshell alone to list available names.",
+                message_thread_id=topic_id or None,
+                parse_mode="Markdown",
+            )
+            return
+
+        if self.holmes is None:
+            await update.message.reply_text(
+                "❌ Holmes service is not wired up. /check is unavailable.",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        user = update.effective_user
+        chat_id = chat.id
+
+        user_model = await self.permissions.get_or_create_user(
+            telegram_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+        )
+
+        if self.conversations is not None:
+            conv_service = self.conversations
+        else:
+            conv_service = ConversationService()
+        conversation = await conv_service.get_conversation(
+            user.id, topic_id=topic_id, chat_id=chat_id
+        )
+
+        from src.bot.handlers.message_handler import _set_investigation_status, _clear_investigation
+
+        try:
+            from holmes.core.tool_calling_llm import LLMInterruptedError as _LLMInterrupted
+        except Exception:
+            _LLMInterrupted = ()
+
+        ack = await update.message.reply_text(
+            f"🔍 Running control-plane snapshot for `{cluster_id}` via `{kc_stem}`...",
+            message_thread_id=topic_id or None,
+            parse_mode="Markdown",
+        )
+
+        tmp_kc = decrypt_to_tempfile(enc_path)
+        if tmp_kc is None:
+            await ack.edit_text(f"❌ Failed to decrypt kubeconfig `{kc_stem}`.")
+            return
+
+        # Set KUBECONFIG for the Holmes worker thread. Holmes' custom tool
+        # scripts inherit process env, so this is how the
+        # gardener_controlplane_snapshot script picks up the kubeconfig. The
+        # worker is a ThreadPoolExecutor (not subprocess), so os.environ is
+        # shared — restore in finally to avoid leaking across turns.
+        saved_kubeconfig = os.environ.get("KUBECONFIG")
+        os.environ["KUBECONFIG"] = tmp_kc
+
+        prompt = (
+            f"Investigate cluster '{cluster_id}' control-plane health.\n\n"
+            "Call the `gardener_controlplane_snapshot` tool with:\n"
+            f"  - cluster_identifier: \"{cluster_id}\"\n"
+            '  - log_lines: "200"\n'
+            '  - event_minutes: "120"\n\n'
+            "After you get the snapshot, produce a root-cause analysis:\n"
+            "  1. Summarize the cluster state (healthy / degraded / broken).\n"
+            "  2. List the most suspicious signals from pods / events / logs / etcd.\n"
+            "  3. Identify likely root cause(s) and rank by confidence.\n"
+            "  4. Suggest concrete next investigative steps or remediation.\n"
+            "Be concise; quote exact log/event lines that support each claim."
+        )
+
+        from src.bot.utils.rich_message import edit_or_send_rich
+
+        # Two-message streaming UI: main response message (live-edited) +
+        # status bar (shows current tool / progress), same pattern as
+        # _handle_streaming_response in message_handler.
+        response_msg = await ack.edit_text("🤔 Thinking...")
+        status_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text="📍 **Status**: 🔍 Control-plane snapshot...",
+            message_thread_id=topic_id or None,
+            parse_mode="Markdown",
+        )
+
+        _set_investigation_status(chat_id, topic_id, "🔍 Control-plane snapshot...")
+        cancel_event = threading.Event()
+        full_response = ""
+        stream_completed = False
+
+        async def _process_stream(async_gen):
+            nonlocal full_response, stream_completed
+            async for event in async_gen:
+                event_type = event.get("type", "unknown")
+                if event_type == "content":
+                    full_response += event.get("content", "")
+                    _set_investigation_status(chat_id, topic_id, response_preview=full_response[-300:])
+                    if len(full_response) % 100 == 0:
+                        try:
+                            await response_msg.edit_text(full_response + "▌")
+                        except Exception:
+                            pass
+                elif event_type == "task_update":
+                    _set_investigation_status(chat_id, topic_id, None, tasks=event.get("tasks", []))
+                elif event_type == "tool_call":
+                    tool_name = event.get("tool_name", "unknown")
+                    _set_investigation_status(
+                        chat_id, topic_id,
+                        status_text=f"🔧 Using {tool_name}...",
+                        last_tool=tool_name,
+                        last_activity=f"🔧 {tool_name}",
+                    )
+                    try:
+                        await status_msg.edit_text(f"📍 **Status**: 🔧 Using {tool_name}...", parse_mode="Markdown")
+                    except Exception:
+                        pass
+                elif event_type == "tool_result":
+                    tool_name = event.get("tool_name", "unknown")
+                    _set_investigation_status(
+                        chat_id, topic_id,
+                        status_text=f"✅ Completed {tool_name}",
+                        last_activity=f"✅ {tool_name}",
+                    )
+                    try:
+                        await status_msg.edit_text(f"📍 **Status**: ✅ Completed {tool_name}", parse_mode="Markdown")
+                    except Exception:
+                        pass
+            stream_completed = True
+
+        try:
+            async_gen = await self.holmes.chat(
+                user_id=user.id,
+                user_message=prompt,
+                conversation=conversation,
+                user_permissions=user_model.permissions,
+                stream=True,
+                telegram_context=context,
+                chat_id=chat_id,
+                topic_id=topic_id,
+                cancel_event=cancel_event,
+            )
+            try:
+                await asyncio.wait_for(_process_stream(async_gen), timeout=300.0)
+            except asyncio.TimeoutError:
+                logger.warning("/check timed out after 300s", user_id=user.id)
+                try:
+                    await status_msg.edit_text("📍 **Status**: ⏱️ Timed out", parse_mode="Markdown")
+                except Exception:
+                    pass
+                full_response += "\n\n⚠️ Timed out after 5 minutes. The snapshot may be very large; try with fewer components."
+            except _LLMInterrupted:
+                cancel_event.set()
+        except Exception as e:
+            logger.error("/check failed", user_id=user.id, error=str(e))
+            _clear_investigation(chat_id, topic_id)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            await response_msg.edit_text(f"❌ /check failed: {e}")
+            return
+        finally:
+            if saved_kubeconfig is None:
+                os.environ.pop("KUBECONFIG", None)
+            else:
+                os.environ["KUBECONFIG"] = saved_kubeconfig
+            cleanup_tempfile(tmp_kc)
+
+        if cancel_event.is_set() and "🛑" not in full_response:
+            full_response = (full_response or "") + "\n\n🛑 Stopped by user."
+
+        _clear_investigation(chat_id, topic_id)
+        await conv_service.save_conversation(conversation)
+
+        # Final status bar
+        try:
+            if stream_completed and not cancel_event.is_set():
+                await status_msg.edit_text("📍 **Status**: ✅ Done", parse_mode="Markdown")
+            elif cancel_event.is_set():
+                await status_msg.edit_text("📍 **Status**: 🛑 Stopped", parse_mode="Markdown")
+        except Exception:
+            pass
+
+        if not full_response.strip():
+            full_response = "(no output from Holmes)"
+
+        # Deliver final response via edit_or_send_rich (rich text, splits if needed)
+        try:
+            await edit_or_send_rich(
+                context.bot,
+                chat_id=chat_id,
+                message=response_msg,
+                text=full_response,
+                message_thread_id=topic_id or None,
+            )
+        except Exception as e:
+            logger.warning("/check rich delivery failed, retrying plain", user_id=user.id, error=str(e))
+            try:
+                await send_long_message(context.bot, chat_id, full_response, message_thread_id=topic_id or None)
+            except Exception as e2:
+                logger.error("/check delivery failed entirely", user_id=user.id, error=str(e2))

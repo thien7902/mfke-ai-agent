@@ -333,6 +333,7 @@ class TelegramBot:
         # model configured via CLAUDE_ENTERPRISE_MODEL (key in
         # ~/.holmes/model_list.yaml). See CommandHandler.claude_command.
         self.application.add_handler(TelegramCommandHandler("claude", cmd_handler.claude_command))
+        self.application.add_handler(TelegramCommandHandler("check", cmd_handler.check_command))
         # /addmemory — admin only; ingests replied message text or attached file
         # content as a knowledge episode into Graphiti (see src/bot/commands/add_memory.py)
         self.application.add_handler(TelegramCommandHandler("addmemory", add_memory_handler.handle))
