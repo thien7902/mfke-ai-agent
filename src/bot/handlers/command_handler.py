@@ -1331,14 +1331,15 @@ class CommandHandler:
                 except Exception:
                     pass
 
-    @admin_only
     @rate_limit
     async def check_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /check <cluster_id> — run gardener_controlplane_snapshot via Holmes
-        and stream root-cause analysis into the current topic.
+        """Handle /check <kubeconfig_name> <cluster_id>.
 
-        The tool reads $KUBECONFIG (or /root/.kube/config) already set in the
-        container — no kubeconfig argument needed.
+        Phase 1: Run the control-plane bash snapshot directly (no LLM) and
+        persist raw output into the topic conversation.
+        Phase 2: Ask Holmes to analyze the snapshot that is now in conversation
+        history. Holmes must NOT call any tool — it only reads the snapshot
+        already persisted.
         """
         if not update.message:
             return
@@ -1360,15 +1361,40 @@ class CommandHandler:
             )
             return
 
-        if not context.args:
+        if not context.args or len(context.args) < 2:
             await update.message.reply_text(
-                "Usage: /check <cluster_id>\n"
-                "Example: /check poc-dev-cluster-gsjle31i",
+                "Usage: /check <kubeconfig_name> <cluster_id>\n"
+                "Example: /check hoa-lac-new-garden poc-dev-cluster-gsjle31i",
                 message_thread_id=topic_id or None,
             )
             return
 
-        cluster_id = " ".join(context.args).strip()
+        import os
+        kc_name = context.args[0].strip()
+        cluster_id = " ".join(context.args[1:]).strip()
+        if not cluster_id:
+            await update.message.reply_text(
+                "❌ Empty cluster_id.",
+                message_thread_id=topic_id or None,
+            )
+            return
+
+        KCONFIG_DIR = "/root/kubeconfig"
+        candidates = [
+            os.path.join(KCONFIG_DIR, kc_name),
+            os.path.join(KCONFIG_DIR, kc_name + ".yml"),
+            os.path.join(KCONFIG_DIR, kc_name + ".yaml"),
+            os.path.join(KCONFIG_DIR, kc_name + ".config"),
+        ]
+        kc_path = next((p for p in candidates if os.path.isfile(p)), None)
+        if kc_path is None:
+            await update.message.reply_text(
+                f"❌ Kubeconfig `{kc_name}` not found under `{KCONFIG_DIR}`.\n\n"
+                f"Use /kshell alone to list available kubeconfigs.",
+                message_thread_id=topic_id or None,
+                parse_mode="Markdown",
+            )
+            return
 
         if self.holmes is None:
             await update.message.reply_text(
@@ -1392,43 +1418,251 @@ class CommandHandler:
             user.id, topic_id=topic_id, chat_id=chat_id
         )
 
+        from src.bot.utils.rich_message import send_rich_reply, edit_or_send_rich
         from src.bot.handlers.message_handler import _set_investigation_status, _clear_investigation
-        from src.bot.utils.rich_message import edit_or_send_rich
+        from src.bot.models.conversation import Message
+
+        # ── Phase 1: run bash snapshot ──────────────────────────────────────
+        ack = await update.message.reply_text(
+            f"🔍 Running control-plane snapshot for `{cluster_id}` via `{kc_name}`...",
+            message_thread_id=topic_id or None,
+            parse_mode="Markdown",
+        )
+
+        snapshot_script = r'''
+set -uo pipefail
+C="__CLUSTER_ID__"
+LINES="200"
+EMIN="120"
+BUDGET=30
+CMD_TMO=25
+
+KCFG="${KUBECONFIG:-/root/.kube/config}"
+if [ ! -f "$KCFG" ]; then echo "ERROR: no kubeconfig at $KCFG"; exit 1; fi
+
+INFO=$(KUBECONFIG="$KCFG" kubectl --context=garden get shoot -A -o wide 2>/dev/null | grep -i "$C" | head -n1)
+if [ -z "$INFO" ]; then
+  echo "ERROR: shoot '$C' not found in garden context of $KCFG"
+  exit 1
+fi
+GNS=$(echo "$INFO" | awk '{print $1}')
+SHOOT=$(echo "$INFO" | awk '{print $2}')
+SEED=$(echo "$INFO" | awk '{print $6}')
+NS="fke-${SHOOT}"
+
+if ! KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=10s get ns "$NS" >/dev/null 2>&1; then
+  echo "ERROR: seed '$SEED' unreachable or ns $NS missing."
+  exit 2
+fi
+
+TMP=$(mktemp -d /tmp/cpsnap.XXXXXX)
+trap 'rm -rf "$TMP"' EXIT
+START=$(date +%s)
+
+J() {
+  local slot="$1"; shift
+  ( timeout "$CMD_TMO" "$@" > "$TMP/$slot" 2>&1; echo $? > "$TMP/$slot.rc" ) &
+}
+
+J 01_shoot_yaml   env KUBECONFIG="$KCFG" kubectl --context=garden --request-timeout=20s get shoot "$SHOOT" -n "$GNS" -o yaml
+J 02_pods_wide    env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get pods -n "$NS" -o wide
+J 03_pods_yaml    env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get pods -n "$NS" -o yaml
+J 04_events       env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get events -n "$NS" --sort-by=.lastTimestamp
+J 05_mr_yaml      env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get managedresource -n "$NS" -o yaml
+J 06_machine_yaml env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get machine -n "$NS" -o yaml
+J 07_md_wide      env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get machinedeployment -n "$NS" -o wide
+J 08_sts_list     env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get statefulset -n "$NS" -o name
+
+for p in etcd-main-0 etcd-events-0; do
+  J "10_${p}_yaml" env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get pod "$p" -n "$NS" -o yaml
+  J "11_${p}_health" env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s exec -n "$NS" "$p" -c etcd -- sh -c 'ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/var/etcd/ssl/client/ca/bundle.crt --cert=/var/etcd/ssl/client/client/tls.crt --key=/var/etcd/ssl/client/client/tls.key endpoint health'
+  J "12_${p}_status" env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s exec -n "$NS" "$p" -c etcd -- sh -c 'ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/var/etcd/ssl/client/ca/bundle.crt --cert=/var/etcd/ssl/client/client/tls.crt --key=/var/etcd/ssl/client/client/tls.key endpoint status --cluster -w table'
+done
+
+COMPS="kube-apiserver kube-controller-manager kube-scheduler cloud-controller-manager machine-controller-manager gardener-resource-manager cluster-autoscaler vpn-seed-server etcd-druid kube-proxy node-problem-detector"
+for d in $COMPS; do
+  J "20_dep_$d" bash -c '
+  d="$1"; NS="$2"; LINES="$3"; export KUBECONFIG="$4"; CTX="$5"
+  JSON=$(kubectl --context="$CTX" --request-timeout=20s get deployment "$d" -n "$NS" -o json 2>/dev/null) || exit 0
+  [ -z "$JSON" ] && exit 0
+  SPEC=$(printf "%s" "$JSON" | jq -r '"'"'(.spec.template.spec.containers[]? | "C \(.name)"),
+                                      (.spec.template.spec.initContainers[]? | "I \(.name)")'"'"' 2>/dev/null)
+  [ -z "$SPEC" ] && exit 0
+  echo "--- deployment/$d ---"
+  while read -r kind cn; do
+    [ -z "$cn" ] && continue
+    if [ "$kind" = C ]; then echo ">>> container: $cn"; else echo ">>> initContainer: $cn"; fi
+    kubectl --context="$CTX" --request-timeout=20s logs "deployment/$d" -n "$NS" -c "$cn" --tail="$LINES" 2>&1
+    echo ""
+  done <<< "$SPEC"
+' _ "$d" "$NS" "$LINES" "$KCFG" "$SEED"
+done
+
+env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get pods -n "$NS" -o json > "$TMP/40_pods_json" 2>&1
+jq -r '.items[] as $p
+       | $p.spec.containers[]? as $c
+       | ([($p.status.containerStatuses // [])[] | select(.name==$c.name)] | first) as $st
+       | "\($p.metadata.name) \($c.name) \($st.state | keys[0] // "unknown") \($st.restartCount // 0) \($st.ready // false)"' \
+   "$TMP/40_pods_json" > "$TMP/_podlist" 2>/dev/null
+
+cat "$TMP/_podlist" | xargs -r -P 16 -L 1 bash -c '
+  KCFG="$1"; SEED="$2"; NS="$3"
+  pod="$4"; cn="$5"; phase="$6"; restarts="$7"; ready="$8"
+  [ -z "$pod" ] && exit 0
+  for tag in previous current; do
+    if [ "$tag" = previous ]; then
+      FLAG="--previous"
+      [ "${restarts:-0}" = "0" ] && continue
+    else
+      FLAG=""
+    fi
+    OUT=$(timeout 18 env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=15s \
+          logs "$pod" -n "$NS" -c "$cn" --tail=80 $FLAG 2>&1)
+    case "$OUT" in
+      *"previous terminated container"*|*"not found"*|"") continue ;;
+    esac
+    echo ">>> pod=$pod container=$cn"
+    echo "    state=$phase ready=$ready restarts=$restarts  (${tag})"
+    echo "$OUT"
+    echo ""
+  done
+' _ "$KCFG" "$SEED" "$NS" > "$TMP/30_prev_logs" 2>&1
+echo 0 > "$TMP/30_prev_logs.rc"
+
+while :; do
+  RUNNING=$(jobs -rp | wc -l)
+  ELAPSED=$(( $(date +%s) - START ))
+  [ "$RUNNING" -eq 0 ] && break
+  [ "$ELAPSED" -ge "$BUDGET" ] && break
+  sleep 0.2
+done
+
+STILL=$(jobs -rp | wc -l)
+if [ "$STILL" -gt 0 ]; then
+  echo "### NOTE: ${STILL} collector(s) still running after ${BUDGET}s, killing them."
+  jobs -rp | xargs -r kill -9 2>/dev/null
+fi
+ELAPSED=$(( $(date +%s) - START ))
+
+echo "############ CONTROL PLANE SNAPSHOT: $SHOOT ############"
+echo "garden_ns=$GNS  seed=$SEED  seed_ns=$NS  elapsed=${ELAPSED}s  budget=${BUDGET}s"
+echo ""
+
+hdr() { echo "===== $1 ====="; }
+cat_file() { local f="$TMP/$1"; [ -s "$f" ] && { cat "$f"; echo ""; } || echo "(no data)"; }
+
+hdr "1. SHOOT (garden, full yaml)";            cat_file 01_shoot_yaml
+hdr "2. PODS (wide)";                          cat_file 02_pods_wide
+hdr "3. PODS (full yaml)";                     cat_file 03_pods_yaml
+hdr "4. EVENTS";                               cat_file 04_events
+hdr "5. COMPONENT LOGS (per-container, tail ${LINES})"
+for f in "$TMP"/20_dep_*; do
+  case "$f" in *.rc) continue;; esac
+  [ -s "$f" ] && { cat "$f"; echo ""; }
+done
+hdr "6. ALL PODS / ALL CONTAINERS — state + current & previous logs"
+cat_file 30_prev_logs
+for p in etcd-main-0 etcd-events-0; do
+  hdr "7. ${p} — pod yaml";   cat_file "10_${p}_yaml"
+  hdr "7. ${p} — health";     cat_file "11_${p}_health"
+  hdr "7. ${p} — status";     cat_file "12_${p}_status"
+done
+hdr "8. MANAGEDRESOURCES";                     cat_file 05_mr_yaml
+hdr "9. MACHINES";                             cat_file 06_machine_yaml
+hdr "10. MACHINEDEPLOYMENTS";                  cat_file 07_md_wide
+hdr "11. STATEFULSETS";                        cat_file 08_sts_list
+
+for f in "$TMP"/*.rc; do
+  [ -f "$f" ] || continue
+  rc=$(cat "$f"); [ "$rc" = "0" ] && continue
+  [ "$rc" = "124" ] && echo "### TIMEOUT(25s): $(basename "$f" .rc)" || echo "### FAIL(rc=$rc): $(basename "$f" .rc)"
+done
+echo "############ END SNAPSHOT ############"
+exit 0
+'''
+
+        snapshot_script = snapshot_script.replace("__CLUSTER_ID__", cluster_id)
+
+        import signal
+        TIMEOUT_SECONDS = 120
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                snapshot_script,
+                executable="/bin/bash",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+                env={**os.environ, "KUBECONFIG": kc_path},
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    await ack.edit_text(f"⏱️ /check timed out after {TIMEOUT_SECONDS}s.")
+                except Exception:
+                    pass
+                return
+
+            output = stdout.decode("utf-8", errors="replace") if stdout else ""
+            output = output.strip()
+        except Exception as e:
+            logger.error("/check snapshot failed", cluster_id=cluster_id, error=str(e))
+            try:
+                await ack.edit_text(f"❌ /check failed: {e}")
+            except Exception:
+                pass
+            return
+
+        # Persist raw snapshot into conversation so Holmes can analyze it.
+        snapshot_msg = (
+            f"## Control-plane snapshot for `{cluster_id}` (kubeconfig: `{kc_name}`)\n\n"
+            f"```\n{output}\n```\n\n"
+            f"This snapshot was collected by /check. Use it as context for follow-up questions."
+        )
+        conversation.add_message(Message(role="assistant", content=snapshot_msg))
+        try:
+            await conv_service.save_conversation(conversation)
+        except Exception as save_err:
+            logger.warning("/check conversation save failed", error=str(save_err))
+
+        # ── Phase 2: Holmes analyzes the snapshot (no tool calls) ──────────
+        _ANALYZE_RULE = (
+            "RULE: A control-plane snapshot has just been collected and is the last message "
+            "in the conversation. Analyze it immediately. Do NOT call any tool. "
+            "In your response:\n"
+            "  1. Cluster state: healthy / degraded / broken.\n"
+            "  2. Key signals: suspicious pods, events, log lines, etcd status.\n"
+            "  3. Root cause(s) ranked by confidence with supporting evidence.\n"
+            "  4. Recommended next steps.\n"
+            "Be concise and quote exact lines from the snapshot."
+        )
+        analysis_prompt = (
+            f"Analyze the control-plane snapshot for cluster `{cluster_id}` "
+            f"that is now in the conversation. Do not call any tool."
+        )
 
         try:
             from holmes.core.tool_calling_llm import LLMInterruptedError as _LLMInterrupted
         except Exception:
             _LLMInterrupted = ()
 
-        ack = await update.message.reply_text(
-            f"🔍 Running control-plane snapshot for `{cluster_id}`...",
-            message_thread_id=topic_id or None,
-            parse_mode="Markdown",
-        )
-
-        prompt = (
-            f"Investigate cluster '{cluster_id}' control-plane health.\n\n"
-            "Call the `gardener_controlplane_snapshot` tool with:\n"
-            f'  - cluster_identifier: "{cluster_id}"\n'
-            '  - log_lines: "200"\n'
-            '  - event_minutes: "120"\n\n'
-            "After you get the snapshot, produce a root-cause analysis:\n"
-            "  1. Summarize the cluster state (healthy / degraded / broken).\n"
-            "  2. List the most suspicious signals from pods / events / logs / etcd.\n"
-            "  3. Identify likely root cause(s) and rank by confidence.\n"
-            "  4. Suggest concrete next investigative steps or remediation.\n"
-            "Be concise; quote exact log/event lines that support each claim."
-        )
-
-        response_msg = await ack.edit_text("🤔 Thinking...")
+        response_msg = await ack.edit_text("🤔 Analyzing snapshot...")
         status_msg = await context.bot.send_message(
             chat_id=chat_id,
-            text="📍 **Status**: 🔍 Control-plane snapshot...",
+            text="📍 **Status**: 🔍 Analyzing snapshot...",
             message_thread_id=topic_id or None,
             parse_mode="Markdown",
         )
 
-        _set_investigation_status(chat_id, topic_id, "🔍 Control-plane snapshot...")
+        _set_investigation_status(chat_id, topic_id, "🔍 Analyzing snapshot...")
         cancel_event = threading.Event()
         full_response = ""
         stream_completed = False
@@ -1445,27 +1679,14 @@ class CommandHandler:
                             await response_msg.edit_text(full_response + "▌")
                         except Exception:
                             pass
-                elif event_type == "task_update":
-                    _set_investigation_status(chat_id, topic_id, None, tasks=event.get("tasks", []))
                 elif event_type == "tool_call":
                     tool_name = event.get("tool_name", "unknown")
-                    _set_investigation_status(
-                        chat_id, topic_id,
-                        status_text=f"🔧 Using {tool_name}...",
-                        last_tool=tool_name,
-                        last_activity=f"🔧 {tool_name}",
-                    )
                     try:
                         await status_msg.edit_text(f"📍 **Status**: 🔧 Using {tool_name}...", parse_mode="Markdown")
                     except Exception:
                         pass
                 elif event_type == "tool_result":
                     tool_name = event.get("tool_name", "unknown")
-                    _set_investigation_status(
-                        chat_id, topic_id,
-                        status_text=f"✅ Completed {tool_name}",
-                        last_activity=f"✅ {tool_name}",
-                    )
                     try:
                         await status_msg.edit_text(f"📍 **Status**: ✅ Completed {tool_name}", parse_mode="Markdown")
                     except Exception:
@@ -1475,7 +1696,7 @@ class CommandHandler:
         try:
             async_gen = await self.holmes.chat(
                 user_id=user.id,
-                user_message=prompt,
+                user_message=analysis_prompt,
                 conversation=conversation,
                 user_permissions=user_model.permissions,
                 stream=True,
@@ -1483,26 +1704,27 @@ class CommandHandler:
                 chat_id=chat_id,
                 topic_id=topic_id,
                 cancel_event=cancel_event,
+                extra_prompt_additions=_ANALYZE_RULE,
             )
             try:
                 await asyncio.wait_for(_process_stream(async_gen), timeout=300.0)
             except asyncio.TimeoutError:
-                logger.warning("/check timed out after 300s", user_id=user.id)
+                logger.warning("/check analysis timed out", user_id=user.id)
                 try:
                     await status_msg.edit_text("📍 **Status**: ⏱️ Timed out", parse_mode="Markdown")
                 except Exception:
                     pass
-                full_response += "\n\n⚠️ Timed out after 5 minutes."
+                full_response += "\n\n⚠️ Analysis timed out after 5 minutes."
             except _LLMInterrupted:
                 cancel_event.set()
         except Exception as e:
-            logger.error("/check failed", user_id=user.id, error=str(e))
+            logger.error("/check analysis failed", user_id=user.id, error=str(e))
             _clear_investigation(chat_id, topic_id)
             try:
                 await status_msg.delete()
             except Exception:
                 pass
-            await response_msg.edit_text(f"❌ /check failed: {e}")
+            await response_msg.edit_text(f"❌ /check analysis failed: {e}")
             return
 
         if cancel_event.is_set() and "🛑" not in full_response:
@@ -1520,7 +1742,7 @@ class CommandHandler:
             pass
 
         if not full_response.strip():
-            full_response = "(no output from Holmes)"
+            full_response = "(no analysis from Holmes)"
 
         try:
             await edit_or_send_rich(
