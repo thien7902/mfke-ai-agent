@@ -1587,7 +1587,10 @@ exit 0
         snapshot_script = snapshot_script.replace("__CLUSTER_ID__", cluster_id)
 
         import signal
-        TIMEOUT_SECONDS = 30
+        # BUDGET=30 inside the bash script + headroom for collectors' final
+        # cat() output flush. Without headroom, asyncio kills the process
+        # right when it's about to flush, losing the snapshot.
+        TIMEOUT_SECONDS = 45
 
         try:
             proc = await asyncio.create_subprocess_shell(
