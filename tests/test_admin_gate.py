@@ -1042,8 +1042,9 @@ def test_hard_block_python_requests_put_delete_patch(monkeypatch):
     'python3 -c "redis.set(\'k\', 1)"',
 ])
 def test_hard_block_python_k8s_readonly_passes(monkeypatch, cmd):
-    """Read-only Python invocations should NOT trigger the Python K8s
-    block (they may still hit other patterns but not this one)."""
+    """Read-only Python invocations should NOT trigger Pattern G (K8s
+    mutation block). They MAY trigger Pattern H (no outbox policy) —
+    that's a separate block tested below."""
     monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
     tool = FakeBashTool()
     ex = FakeExecutor([FakeToolset([tool])])
@@ -1051,6 +1052,89 @@ def test_hard_block_python_k8s_readonly_passes(monkeypatch, cmd):
     ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
     r = tool.invoke({"command": cmd}, ctx)
     assert "hard_block_python_k8s_mutation" not in (r.error or "")
+
+
+# ---------- Pattern H: python3 outside outbox hard-block ----------
+
+def _patch_outbox(monkeypatch, path):
+    """Point file_sender.outbox_dir at the given path (str)."""
+    from src.bot.utils import file_sender
+    monkeypatch.setattr(file_sender, "outbox_dir", lambda: __import__("pathlib").Path(path))
+
+
+@pytest.mark.parametrize("cmd", [
+    'python3 -c "print(\'hello\')"',
+    'python3 -c "import requests; r=requests.get(\'https://k8s/api/v1/pods\')"',
+    'python3 /tmp/x.py',
+    'python3 -m http.server',
+    'python3 -c "import os; os.chdir(\'/tmp\'); print(os.getcwd())"',
+])
+def test_hard_block_python_no_outbox_blocks(monkeypatch, cmd):
+    """Pattern H: python3 invocation without any reference to the outbox
+    dir is hard-blocked. Admins too."""
+    _patch_outbox(monkeypatch, "/root/.holmes/outbox")
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_python_no_outbox" in r.error
+    assert tool.last_params is None
+
+
+@pytest.mark.parametrize("cmd", [
+    'python3 -c "open(\'/root/.holmes/outbox/report.csv\', \'w\').write(\'hi\')"',
+    'python3 /root/.holmes/outbox/build_xlsx.py',
+    'python3 -c "import os; os.chdir(\'/root/.holmes/outbox\'); ..."',
+    'python3 -c "open(\'outbox/foo.txt\', \'w\').write(\'hi\')"',
+    'python3 outbox/generate_report.py',
+])
+def test_hard_block_python_outbox_target_passes_pattern_h(monkeypatch, cmd):
+    """Pattern H: python3 invocations that reference the outbox dir
+    (absolute path, basename, or relative `outbox/...`) pass Pattern H.
+    Pattern G (K8s mutation) still applies independently."""
+    _patch_outbox(monkeypatch, "/root/.holmes/outbox")
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": cmd}, ctx)
+    assert "hard_block_python_no_outbox" not in (r.error or "")
+
+
+def test_hard_block_python_k8s_mutation_still_blocks_even_with_outbox(monkeypatch):
+    """Pattern G beats Pattern H: a python3 -c that references the
+    outbox AND mutates K8s is STILL hard-blocked. Outbox referencing
+    only clears Pattern H — Pattern G is independent."""
+    _patch_outbox(monkeypatch, "/root/.holmes/outbox")
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    cmd = ('python3 -c "import requests; '
+           'requests.post(\'https://k8s/api/v1/namespaces/default/pods\', '
+           'json={}); open(\'/root/.holmes/outbox/x.txt\', \'w\').write(\'done\')"')
+    r = tool.invoke({"command": cmd}, ctx)
+    assert "hard_block_python_k8s_mutation" in r.error
+
+
+def test_hard_block_python_no_outbox_beats_admin(monkeypatch):
+    """Pattern H applies to admins: a bare python3 from an admin is
+    blocked, never auto-approved."""
+    _patch_outbox(monkeypatch, "/root/.holmes/outbox")
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": 'python3 -c "print(1)"'}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_python_no_outbox" in r.error
+    assert ctx.user_approved is False
 
 
 def test_hard_block_python_k8s_beats_admin(monkeypatch):

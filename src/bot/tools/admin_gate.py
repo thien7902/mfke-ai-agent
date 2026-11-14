@@ -277,8 +277,27 @@ _K8S_API_URL_RE = re.compile(
 #      `patch_`, `replace_`) OR a raw `requests.post/put/delete/patch`
 #      / `httpx.post/put/delete/patch`. Read-only patterns
 #      (`requests.get`, `list_`) are NOT blocked.
+
+# Recognize `python3 <script.py>` or `python3 -c "..."` or `python3 -m pkg`
+# — anything starting with a python interpreter. This is broader than the
+# previous version that only matched `-c`. We use it for two purposes:
+# blocking K8s mutations (Pattern G — see _PYTHON_K8S_MUTATION_RE) and
+# blocking any python invocation that doesn't target the outbox dir
+# (Pattern H).
 _PYTHON_INVOCATION_RE = re.compile(
-    r"^python3?\s+(?:-[A-Za-z]+\s+)*(?:-c\s+|--\s*)",
+    r"^python3?\s+",
+    re.IGNORECASE,
+)
+# Recognize `pip <query-verb>` and `python3 -m pip <query-verb>` forms
+# that are READ-ONLY and should NOT trip Pattern H (python-without-
+# outbox block). The Holmes LLM evaluating this is allowed to query
+# "what Python packages are available" without first being told to
+# route through the outbox. Used to PRE-EMPT Pattern H — when the verb
+# is install/uninstall/etc Pattern E blocks; when the verb is list/
+# show/freeze/... this exception lets it pass through Pattern H.
+_PYTHON_PIP_READONLY_RE = re.compile(
+    r"^python3?\s+-m\s+pip\s+(?:list|show|freeze|search|index|inspect|debug|config|cache|verify|hash)\b"
+    r"|^pip3?\s+(?:list|show|freeze|search|index|inspect|debug|config|cache|verify|hash)\b",
     re.IGNORECASE,
 )
 _PYTHON_K8S_MUTATION_RE = re.compile(
@@ -425,6 +444,42 @@ def _mutation_reason(cmd: Any, *, hard_block_only: bool = False) -> Optional[str
     # apply the Python pattern against the raw command up-front.
     if _PYTHON_INVOCATION_RE.match(_strip_env_prefix(cmd)) and _PYTHON_K8S_MUTATION_RE.search(cmd):
         return "hard_block_python_k8s_mutation"
+    # Pattern H: `python3 ...` without any reference to the outbox dir is
+    # hard-blocked. The bot policy is: python is allowed ONLY for producing
+    # deliverable files (xlsx, json, csv, ...), and those MUST land in the
+    # configured outbox dir. Anything else — running arbitrary scripts,
+    # ad-hoc computation, REPL-style inspection — is unreviewed shell access
+    # from inside a chat.
+    #
+    # The check fires on the RAW command (before per-segment split) for
+    # the same reason Pattern G does — quoting-blind splitting mangles
+    # `python3 -c "..."` mid-string. The allowlist string is the outbox
+    # dir resolved at runtime; if it can't be resolved we fail-open
+    # (block) so a missing config never silently permits python.
+    #
+    # IMPORTANT: Pattern E (package manager install) takes priority over
+    # Pattern H. `python3 -m pip install kubernetes` should report as
+    # `hard_block_package_manager`, not `hard_block_python_no_outbox`,
+    # so the user-facing message points at the right fix (don't try to
+    # install packages) instead of "write to outbox". We test Pattern E
+    # up-front and return its reason before Pattern H fires.
+    if _PACKAGE_MANAGER_INSTALL_RE.match(_strip_env_prefix(cmd)):
+        return "hard_block_package_manager"
+    # Pattern F: curl with a mutating HTTP method AND a K8s-shaped URL.
+    # On raw command (not per-segment) so it survives `&&`-chained shell
+    # commands too — both halves of `curl -X POST ... && echo done`
+    # contain enough URL info for the pattern, and the splitter is
+    # quote-naive like Pattern G's case.
+    if _CURL_MUTATING_METHOD_RE.search(cmd) and _K8S_API_URL_RE.search(cmd):
+        return "hard_block_curl_k8s_api"
+    # Pattern H: `python3 ...` without any reference to the outbox dir is
+    # hard-blocked — EXCEPT read-only `pip list` / `pip show` / etc which
+    # Holmes may want for introspection. Pattern E already hard-blocks
+    # install/uninstall etc; the read-only exception keeps Pattern H
+    # from firing on those.
+    if _PYTHON_INVOCATION_RE.match(_strip_env_prefix(cmd)):
+        if not _PYTHON_PIP_READONLY_RE.match(_strip_env_prefix(cmd)) and not _cmd_references_outbox(cmd):
+            return "hard_block_python_no_outbox"
     for stripped in segments:
         if not stripped:
             continue
@@ -461,19 +516,11 @@ def _mutation_reason(cmd: Any, *, hard_block_only: bool = False) -> Optional[str
         # run them via /shell manually after review.
         if _OPENSTACK_MUTATING_VERB_RE.match(stripped) and not _OPENSTACK_FKE_RE.search(stripped):
             return "hard_block_openstack_non_fke"
-        # Pattern E: pip / pipx / apt / dpkg / snap — installing packages
-        # from inside a chat is a supply-chain vector. Blocked for ALL
-        # users (admins too) regardless of args.
-        if _PACKAGE_MANAGER_INSTALL_RE.match(stripped):
-            return "hard_block_package_manager"
-        # Pattern F: curl POST/PUT/DELETE/PATCH against a K8s API URL.
-        # Two signals together — a mutating method flag AND a URL
-        # shaped like `/api/v1/...` or `/apis/<group>/...`. Getting
-        # either alone (a curl POST to github.com, or a curl GET to
-        # /api/v1/pods) is fine. (curl commands don't usually contain
-        # quoted semicolons so the per-segment match works.)
-        if _CURL_MUTATING_METHOD_RE.search(stripped) and _K8S_API_URL_RE.search(stripped):
-            return "hard_block_curl_k8s_api"
+        # Pattern E (package manager) and Pattern F (curl K8s API) are
+        # checked UP-FRONT on the raw command (above the per-segment
+        # loop) so the priority over Pattern H is correct. Skipping
+        # them here avoids duplicate matches and keeps the loop body
+        # focused on per-segment patterns (kubectl/helm/openstack).
         if hard_block_only:
             continue
         # --- Admin-gate mutation rules (skip for admins) -----------
@@ -488,6 +535,41 @@ def _is_hard_blocked(cmd: Any) -> Optional[str]:
     ``None``. Used by `_wrap_one` to short-circuit before the admin check.
     """
     return _mutation_reason(cmd, hard_block_only=True)
+
+
+def _cmd_references_outbox(cmd: str) -> bool:
+    """True if ``cmd`` contains a reference to the configured outbox dir.
+
+    Used by Pattern H to allowlist `python3 ...` calls that target the
+    outbox — that's where the bot's file-output policy says deliverables
+    must land. Anything else is unreviewed shell access.
+
+    Lazy imports keep admin_gate importable without file_sender's
+    transitive deps. Resolves the outbox dir at call time.
+
+    Returns False on any error (config missing, path cannot resolve) —
+    we fail CLOSED, treating "couldn't resolve outbox" as "no outbox
+    reference" so a config bug never silently opens python up.
+    """
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        from src.bot.utils import file_sender
+        outbox = file_sender.outbox_dir()
+    except Exception:
+        return False
+    try:
+        candidates = {str(outbox), str(outbox).rstrip("/"), outbox.as_posix()}
+        # Relative `outbox/` prefix — the chat_send_file tool itself
+        # validates the resolved path against the outbox, so we accept
+        # the LLM's relative reference here.
+        try:
+            candidates.add(outbox.name + "/")
+        except Exception:
+            pass
+    except Exception:
+        return False
+    return any(c and c in cmd for c in candidates)
 
 
 def set_admin_check_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -693,6 +775,19 @@ _HARD_BLOCK_MESSAGES = {
         "different URL shape. Pivot to read-only investigation: "
         "`kubectl get` / `describe` / `logs`, then instruct the user "
         "to apply any change via /shell manually."
+    ),
+    "hard_block_python_no_outbox": (
+        "Running arbitrary `python3` commands from inside a chat is "
+        "blocked by the bot's safety policy — python is only permitted "
+        "for producing deliverable FILES (xlsx, json, csv, txt, yaml, "
+        "...) and the resulting file MUST be written under the bot's "
+        "configured outbox directory (the same directory "
+        "`chat_send_file` accepts). Do NOT retry with `python3 -c`, "
+        "`python3 /tmp/x.py`, or any other variant that doesn't target "
+        "the outbox. To produce a deliverable: write the file to the "
+        "outbox dir then call `chat_send_file` with the path. For any "
+        "other use (debug inspect, scope-state check, ad-hoc "
+        "computation), instruct the user to run it via /shell manually."
     ),
 }
 
