@@ -461,10 +461,6 @@ class TelegramBot:
         await self.application.updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,  # Clear any pending updates from other instances
-            pool_timeout=30,  # Connection timeout for long polling
-            connect_timeout=30,  # Initial connection timeout
-            read_timeout=30,  # Read timeout between updates
-            write_timeout=30,  # Write timeout for sending updates
         )
         health_checker.set_bot_alive(True)
         logger.info("Bot started successfully")
@@ -655,10 +651,6 @@ async def main():
                         await bot.application.updater.start_polling(
                             allowed_updates=Update.ALL_TYPES,
                             drop_pending_updates=False,  # Keep backlog — don't lose user messages
-                            pool_timeout=30,
-                            connect_timeout=30,
-                            read_timeout=30,
-                            write_timeout=30,
                         )
                         logger.info("Telegram polling restarted successfully")
                         # NOTE: do NOT reset last_update_time here. If the restart worked,
