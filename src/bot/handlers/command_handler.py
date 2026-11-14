@@ -1488,7 +1488,8 @@ for d in $COMPS; do
   while read -r kind cn; do
     [ -z "$cn" ] && continue
     if [ "$kind" = C ]; then echo ">>> container: $cn"; else echo ">>> initContainer: $cn"; fi
-    kubectl --context="$CTX" --request-timeout=20s logs "deployment/$d" -n "$NS" -c "$cn" --tail="$LINES" 2>&1
+    kubectl --context="$CTX" --request-timeout=20s logs "deployment/$d" -n "$NS" -c "$cn" --tail="$LINES" 2>&1 \
+    | grep -vE "rejected connection from \"(127\.0\.0\.1|localhost)|remote error: tls: bad certificate|read-only range request .* took too long|Linux route add command failed: .* already exists|Initialization Sequence Completed|scaleDownInCooldown=true|node group min size reached" || true
     echo ""
   done <<< "$SPEC"
 ' _ "$d" "$NS" "$LINES" "$KCFG" "$SEED"
@@ -1517,6 +1518,10 @@ cat "$TMP/_podlist" | xargs -r -P 16 -L 1 bash -c '
     case "$OUT" in
       *"previous terminated container"*|*"not found"*|"") continue ;;
     esac
+    # Strip Gardener known-noise lines so they dont fool the analyzer.
+    OUT=$(printf "%s" "$OUT" | grep -vE \
+      "rejected connection from \"(127\.0\.0\.1|localhost)|remote error: tls: bad certificate|read-only range request .* took too long|Linux route add command failed: .* already exists|Initialization Sequence Completed|scaleDownInCooldown=true|node group min size reached" || true)
+    [ -z "$(printf "%s" "$OUT" | tr -d " \n")" ] && continue
     echo ">>> pod=$pod container=$cn"
     echo "    state=$phase ready=$ready restarts=$restarts  (${tag})"
     echo "$OUT"
