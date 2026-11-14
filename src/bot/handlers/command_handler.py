@@ -1478,8 +1478,6 @@ J 08_sts_list     env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-tim
 
 for p in etcd-main-0 etcd-events-0; do
   J "10_${p}_yaml" env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get pod "$p" -n "$NS" -o yaml
-  J "11_${p}_health" env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s exec -n "$NS" "$p" -c etcd -- sh -c 'ETCDCTL_API=3 etcdctl --endpoints=https://localhost:2379 --cacert=/var/etcd/ssl/client/ca/bundle.crt --cert=/var/etcd/ssl/client/client/tls.crt --key=/var/etcd/ssl/client/client/tls.key endpoint health'
-  J "12_${p}_status" env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s exec -n "$NS" "$p" -c etcd -- sh -c 'ETCDCTL_API=3 etcdctl --endpoints=https://localhost:2379 --cacert=/var/etcd/ssl/client/ca/bundle.crt --cert=/var/etcd/ssl/client/client/tls.crt --key=/var/etcd/ssl/client/client/tls.key endpoint status --cluster -w table'
 done
 
 COMPS="kube-apiserver kube-controller-manager kube-scheduler cloud-controller-manager machine-controller-manager gardener-resource-manager cluster-autoscaler vpn-seed-server etcd-druid kube-proxy node-problem-detector"
@@ -1567,8 +1565,6 @@ hdr "6. ALL PODS / ALL CONTAINERS — state + current & previous logs"
 cat_file 30_prev_logs
 for p in etcd-main-0 etcd-events-0; do
   hdr "7. ${p} — pod yaml";   cat_file "10_${p}_yaml"
-  hdr "7. ${p} — health";     cat_file "11_${p}_health"
-  hdr "7. ${p} — status";     cat_file "12_${p}_status"
 done
 hdr "8. MANAGEDRESOURCES";                     cat_file 05_mr_yaml
 hdr "9. MACHINES";                             cat_file 06_machine_yaml
