@@ -211,6 +211,99 @@ _OPENSTACK_MUTATING_VERB_RE = re.compile(
 _OPENSTACK_FKE_RE = re.compile(r"fke", re.IGNORECASE)
 
 
+# Pattern E — pip / pipx / apt · package management is HARD-BLOCKED
+# regardless of admin status. Installing a wheel from inside a chat is
+# how supply-chain compromise happens on a perm-running bot, and apt
+# can replace system packages (incl. kubectl / helm themselves).
+# Covers: `pip`, `pip3`, `python3 -m pip`, `pipx`; apt, apt-get,
+# dpkg (reconfigure/purge), snap. Directions: install/uninstall/
+# upgrade/remove/purge/download. `pip list` / `pip show` are NOT
+# blocked — they are read-only.
+_PACKAGE_MANAGER_INSTALL_RE = re.compile(
+    r"^(?:"
+    r"pip3?\s+(?:install|uninstall|download|upgrade|wheel|build)\b"
+    r"|python3?\s+-m\s+pip\s+(?:install|uninstall|download|upgrade|wheel|build)\b"
+    r"|pipx\s+(?:install|uninstall|upgrade|inject|upgrade-all|install-all)\b"
+    r"|apt(?:-get)?\s+(?:install|remove|purge|update|upgrade|dist-upgrade|full-upgrade|autoremove|hold|unhold|mark|reinstall|source|build-dep|change|modify)\b"
+    r"|dpkg\s+(?:-i|--install|-r|--remove|-P|--purge|--configure|--update-avail|--clear-avail)\b"
+    r"|snap\s+(?:install|remove|refresh|rollback|switch|channel)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+# Pattern F — curl hitting the Kubernetes API server with a mutating
+# HTTP method. The LLM can bypass kubectl by curl'ing the apiserver
+# directly with a service-account token it found in a secret.
+# Detection: `curl` followed by `-X POST/PUT/DELETE/PATCH` (case-
+# insensitive) OR `--request POST/.../` OR a URL containing the
+# apiserver path signature (`/api/` or `/apis/`) combined with a POST/
+# PUT/DELETE/PATCH method (default GET is safe). We don't try to be
+# clever about it — if BOTH a K8s API URL and a mutating method are
+# present, block. Plain `curl https://kubernetes/api/v1/pods` (GET) is
+# fine.
+_CURL_MUTATING_METHOD_RE = re.compile(
+    r"\bcurl\b.*?(?:-X\s+|--request\s+)(POST|PUT|DELETE|PATCH|MERGE|APPLY)\b",
+    re.IGNORECASE,
+)
+_K8S_API_URL_RE = re.compile(
+    # K8s API URLs come in two shapes:
+    #   /api/v1/...              (core group, single version path)
+    #   /apis/<group>/<vN>/...   (named group, MUST be followed by /v\d+ to
+    #                            avoid matching /apis/webhook/foo which is
+    #                            not a K8s group).
+    r"/api/v\d+/|/apis/[A-Za-z][\w.]*/v\d+/",
+    re.IGNORECASE,
+)
+# Method may also be in `--data` with `--request` omitted when curl is
+# hit by `-d`. Match the `-X <METHOD>` flag OR `(POST|PUT|DELETE|PATCH)`
+# verb at start of method-flag value. (See _CURL_MUTATING_METHOD_RE
+# above.)
+
+
+# Pattern G — Python one-liner / script invocation that imports a
+# kubernetes client or builds a requests/httpx/aiohttp call with a
+# mutating HTTP verb against a K8s API URL. This is the LLM's bypass
+# when kubectl and curl are both blocked.
+#
+# We block on TWO signals together to keep false positives low:
+#   1. The command invokes a Python interpreter with an arbitrary
+#      inline script: `python3 -c "..."`. (Running a .py file the LLM
+#      wrote is treated the same — `python3 path/to/x.py` is blocked
+#      because Holmes could have written it first.)
+#   2. The script content contains BOTH a K8s API URL pattern
+#      (`/api/v1/`, `/apis/...`) AND a mutating-verb token from the
+#      kubernetes-client method family (`create_`, `delete_`,
+#      `patch_`, `replace_`) OR a raw `requests.post/put/delete/patch`
+#      / `httpx.post/put/delete/patch`. Read-only patterns
+#      (`requests.get`, `list_`) are NOT blocked.
+_PYTHON_INVOCATION_RE = re.compile(
+    r"^python3?\s+(?:-[A-Za-z]+\s+)*(?:-c\s+|--\s*)",
+    re.IGNORECASE,
+)
+_PYTHON_K8S_MUTATION_RE = re.compile(
+    r"(?:"
+    # Branch 1 — kubernetes-client SDK method call. The verb prefix
+    # plus at least one snake_case segment identifies a mutating
+    # client method (create_namespaced_pod, delete_namespaced_service,
+    # patch_cluster_role_binding, replace_namespaced_config_map,
+    # update_namespaced_pod, ...). The SDK builds the URL from
+    # kubeconfig so we DON'T also require a /api/v1/ URL here.
+    r"\b(?:create|delete|patch|replace|update)_[a-z]+(?:_[a-z]+)+\b"
+    r")"
+    r"|(?:"
+    # Branch 2 — raw HTTP mutating verb in requests/httpx/aiohttp/
+    # urllib3 calls AND a K8s API URL pattern. Both signals together
+    # keep false positives low (a generic `requests.post` to a
+    # webhook is NOT blocked, a `requests.get` to /api/v1/pods is
+    # NOT blocked).
+    r"\b(?:requests|httpx|aiohttp|urllib3)\.(?:post|put|delete|patch|request)\b"
+    r".*?(?:/api/v\d+/|/apis/[A-Za-z][\w.]*/v\d+/)"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
 # Shell command separators we tolerate before the kubectl/helm mutation.
 # `&&`, `||`, `;`, and single `|` (pipe). The LLM pipes manifests like
@@ -321,6 +414,17 @@ def _mutation_reason(cmd: Any, *, hard_block_only: bool = False) -> Optional[str
         return None
     if not segments:
         return None
+    # Pattern G: Python script + K8s mutation is checked on the WHOLE
+    # raw command, not on per-segment stripped forms. The shell
+    # separator splitter is naive about quoting and would split a
+    # `python3 -c "from kubernetes import client; ..."` script in
+    # the middle of a quoted string — the segment that lands on
+    # `python3 -c "from kubernetes import client` would lack the
+    # mutation token, and the segment that lands on `client.create_...
+    # body={})` would not be recognized as a Python invocation. So we
+    # apply the Python pattern against the raw command up-front.
+    if _PYTHON_INVOCATION_RE.match(_strip_env_prefix(cmd)) and _PYTHON_K8S_MUTATION_RE.search(cmd):
+        return "hard_block_python_k8s_mutation"
     for stripped in segments:
         if not stripped:
             continue
@@ -357,6 +461,19 @@ def _mutation_reason(cmd: Any, *, hard_block_only: bool = False) -> Optional[str
         # run them via /shell manually after review.
         if _OPENSTACK_MUTATING_VERB_RE.match(stripped) and not _OPENSTACK_FKE_RE.search(stripped):
             return "hard_block_openstack_non_fke"
+        # Pattern E: pip / pipx / apt / dpkg / snap — installing packages
+        # from inside a chat is a supply-chain vector. Blocked for ALL
+        # users (admins too) regardless of args.
+        if _PACKAGE_MANAGER_INSTALL_RE.match(stripped):
+            return "hard_block_package_manager"
+        # Pattern F: curl POST/PUT/DELETE/PATCH against a K8s API URL.
+        # Two signals together — a mutating method flag AND a URL
+        # shaped like `/api/v1/...` or `/apis/<group>/...`. Getting
+        # either alone (a curl POST to github.com, or a curl GET to
+        # /api/v1/pods) is fine. (curl commands don't usually contain
+        # quoted semicolons so the per-segment match works.)
+        if _CURL_MUTATING_METHOD_RE.search(stripped) and _K8S_API_URL_RE.search(stripped):
+            return "hard_block_curl_k8s_api"
         if hard_block_only:
             continue
         # --- Admin-gate mutation rules (skip for admins) -----------
@@ -545,6 +662,37 @@ _HARD_BLOCK_MESSAGES = {
         "to gather context, then instruct the user to run the change via "
         "/shell manually. FKE-targeted resources (name contains 'fke') "
         "pass through."
+    ),
+    "hard_block_package_manager": (
+        "Package installation / removal via pip / pipx / apt / dpkg / snap "
+        "is blocked by the bot's safety policy — installing a wheel or "
+        "replacing a system package from inside a chat is a supply-chain "
+        "vector and risks replacing kubectl/helm themselves. Do NOT retry "
+        "or attempt alternate package managers. If the user genuinely needs "
+        "a Python package or apt dependency, instruct them to install it "
+        "manually via /shell after review."
+    ),
+    "hard_block_curl_k8s_api": (
+        "curl with a mutating HTTP method (POST/PUT/DELETE/PATCH/...) "
+        "against a Kubernetes API URL (/api/v1/ or /apis/...) is blocked "
+        "by the bot's safety policy — a direct apiserver call bypasses "
+        "kubectl/helm and the admin-gate that protects them. Do NOT "
+        "retry with a different method flag or a different URL shape. "
+        "Pivot to read-only investigation: `kubectl get` / `describe` / "
+        "`logs`, then instruct the user to apply any change via /shell "
+        "manually."
+    ),
+    "hard_block_python_k8s_mutation": (
+        "Running a Python script that creates / deletes / patches / "
+        "replaces a Kubernetes resource via the kubernetes-client SDK "
+        "(create_namespaced_*/delete_*/patch_*/replace_*) or via "
+        "requests/httpx/aiohttp POST/PUT/DELETE/PATCH against a K8s API "
+        "URL is blocked by the bot's safety policy — calling the "
+        "apiserver from Python bypasses kubectl and the admin-gate that "
+        "protects it. Do NOT retry with a different SDK verb or a "
+        "different URL shape. Pivot to read-only investigation: "
+        "`kubectl get` / `describe` / `logs`, then instruct the user "
+        "to apply any change via /shell manually."
     ),
 }
 

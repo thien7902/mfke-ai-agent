@@ -839,3 +839,231 @@ def test_extension_namespace_not_false_positive_on_unrelated_ns(monkeypatch):
     ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
     r = tool.invoke({"command": "kubectl delete -n my-ns pod foo"}, ctx)
     assert "hard_block_protected_ns" not in (r.error or "")
+
+
+# ---------- Pattern E: package-manager hard-block ----------
+
+@pytest.mark.parametrize("cmd", [
+    "pip install kubernetes",
+    "pip3 install kubernetes",
+    "pip3 install -r requirements.txt",
+    "pip uninstall kubernetes",
+    "pip download kubernetes",
+    "python3 -m pip install kubernetes",
+    "python3 -m pip install -r requirements.txt",
+    "python -m pip install requests",
+    "pipx install kubernetes",
+    "pipx upgrade kubernetes",
+    "pipx uninstall kubernetes",
+    "pipx inject myenv kubernetes",
+    "apt install kubelet",
+    "apt install -y curl",
+    "apt-get install kubelet",
+    "apt-get install -y curl",
+    "apt remove kubelet",
+    "apt-get purge kubelet",
+    "apt update",
+    "apt upgrade",
+    "apt-get dist-upgrade",
+    "apt autoremove",
+    "dpkg -i pkg.deb",
+    "dpkg --install pkg.deb",
+    "dpkg -r pkg",
+    "dpkg --purge pkg",
+    "dpkg --configure -a",
+    "snap install kubectl --classic",
+    "snap remove kubectl",
+    "snap refresh kubectl",
+])
+def test_hard_block_package_manager_blocks(monkeypatch, cmd):
+    """Pattern E: any package-manager install/remove is hard-blocked
+    regardless of admin status."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "HARD-BLOCKED" in r.error
+    assert "hard_block_package_manager" in r.error
+    assert tool.last_params is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "pip list",
+    "pip show kubernetes",
+    "pip freeze",
+    "pip search kubernetes",
+    "python3 -m pip list",
+    "python3 -m pip show kubernetes",
+    "pipx list",
+    "apt list",
+    "apt list --installed",
+    "apt show kubelet",
+    "apt-get --print-uris install kubelet",
+    "dpkg -l",
+    "dpkg -L kubelet",
+    "dpkg -s kubelet",
+    "snap list",
+    "snap info kubectl",
+])
+def test_hard_block_package_manager_readonly_passes(monkeypatch, cmd):
+    """Pattern E: read-only package-manager queries are NOT blocked."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": cmd}, ctx)
+    # admin pass-through ok → no HARD-BLOCKED string in error
+    assert "HARD-BLOCKED" not in (r.error or "")
+
+
+# ---------- Pattern F: curl K8s API hard-block ----------
+
+@pytest.mark.parametrize("cmd", [
+    "curl -X POST https://k8s/api/v1/namespaces/default/pods",
+    "curl -X POST https://kubernetes/apis/apps/v1/namespaces/default/deployments",
+    "curl -X PUT https://k8s/api/v1/namespaces/default/configmaps/cm",
+    "curl -X DELETE https://k8s/api/v1/namespaces/default/pods/foo",
+    "curl -X PATCH https://k8s/apis/rbac.authorization.k8s.io/v1/clusterroles/x",
+    "curl --request POST https://10.0.0.1/api/v1/pods",
+    "curl --request DELETE https://k8s/apis/apps/v1/deployments/foo",
+    "curl -k -X PATCH https://k8s/api/v1/namespaces/default/secrets/foo",
+])
+def test_hard_block_curl_k8s_api_blocks(monkeypatch, cmd):
+    """Pattern F: curl with mutating method against a K8s API URL is
+    hard-blocked. Bypass via direct apiserver HTTP call must not work."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_curl_k8s_api" in r.error
+    assert tool.last_params is None
+
+
+@pytest.mark.parametrize("cmd", [
+    "curl https://k8s/api/v1/namespaces/default/pods",  # default GET
+    "curl -X GET https://k8s/api/v1/pods",
+    "curl -X POST https://example.com/webhook",  # no k8s-shaped path
+    "curl -X POST https://example.com/apis/webhook/foo",  # /apis/<group>/... but no /v\d+/
+])
+def test_hard_block_curl_k8s_api_non_mutating_passes(monkeypatch, cmd):
+    r"""Pattern F: GET curl on K8s API URL passes; mutating method on
+    non-K8S URL passes; /apis/<group>/ path without /v\d+/ passes."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": cmd}, ctx)
+    assert "hard_block_curl_k8s_api" not in (r.error or "")
+
+
+# ---------- Pattern G: Python K8s mutation hard-block ----------
+
+def test_hard_block_python_kubernetes_client_method(monkeypatch):
+    """Pattern G: python3 -c with a kubernetes-client mutating method
+    (create_namespaced_pod, etc.) is hard-blocked — direct SDK bypass
+    must not be permitted."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    cmd = ('python3 -c "from kubernetes import client; '
+           'client.CoreV1Api().create_namespaced_pod(\'default\', body={})"')
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_python_k8s_mutation" in r.error
+    assert tool.last_params is None
+
+
+@pytest.mark.parametrize("cmd", [
+    ('python3 -c "from kubernetes import client; '
+     'client.CoreV1Api().delete_namespaced_pod(\'foo\', \'default\')"'),
+    ('python3 -c "from kubernetes import client; '
+     'client.AppsV1Api().patch_namespaced_deployment(\'d\', \'default\')"'),
+    ('python3 -c "from kubernetes import client; '
+     'client.RbacAuthorizationV1Api().replace_cluster_role(\'x\', body={})"'),
+    ('python3 -c "from kubernetes import client; '
+     'client.AppsV1Api().update_namespaced_deployment_scale(\'d\', \'default\')"'),
+])
+def test_hard_block_python_k8s_all_mutating_verbs(monkeypatch, cmd):
+    """All mutating kubernetes-client verb prefixes (create/delete/
+    patch/replace/update) + snake_case identifier trigger the block."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert "hard_block_python_k8s_mutation" in r.error
+
+
+def test_hard_block_python_requests_post_to_k8s(monkeypatch):
+    """python3 -c with requests.post to a K8s API URL is hard-blocked."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    cmd = ('python3 -c "import requests; '
+           'requests.post(\'https://k8s/api/v1/namespaces/default/pods\', json={})"')
+    r = tool.invoke({"command": cmd}, ctx)
+    assert "hard_block_python_k8s_mutation" in r.error
+
+
+def test_hard_block_python_requests_put_delete_patch(monkeypatch):
+    """All mutating HTTP verbs against a K8s URL trigger block."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    for verb in ("put", "delete", "patch"):
+        cmd = (f'python3 -c "import requests; '
+               f'requests.{verb}(\'https://k8s/api/v1/namespaces/default/pods\')"')
+        r = tool.invoke({"command": cmd}, ctx)
+        assert "hard_block_python_k8s_mutation" in r.error
+
+
+@pytest.mark.parametrize("cmd", [
+    'python3 -c "print(\'hello\')"',
+    'python3 -c "import requests; r=requests.get(\'https://k8s/api/v1/pods\')"',
+    'python3 -c "import kubernetes; client.list_namespaced_pod(\'default\')"',
+    'python3 -c "import requests; requests.post(\'https://example.com/webhook\')"',
+    'python3 -c "import os; os.remove(\'/tmp/x\')"',
+    'python3 /tmp/legit_script.py',
+    'python3 -c "redis.set(\'k\', 1)"',
+])
+def test_hard_block_python_k8s_readonly_passes(monkeypatch, cmd):
+    """Read-only Python invocations should NOT trigger the Python K8s
+    block (they may still hit other patterns but not this one)."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": cmd}, ctx)
+    assert "hard_block_python_k8s_mutation" not in (r.error or "")
+
+
+def test_hard_block_python_k8s_beats_admin(monkeypatch):
+    """Hard-block applies to admins: a Python K8s mutation from an
+    admin is still blocked, never auto-approved."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    cmd = ('python3 -c "from kubernetes import client; '
+           'client.CoreV1Api().create_namespaced_pod(\'default\', body={})"')
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_python_k8s_mutation" in r.error
+    assert ctx.user_approved is False
