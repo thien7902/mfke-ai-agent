@@ -1465,6 +1465,7 @@ J() {
 
 J 01_shoot_yaml   env KUBECONFIG="$KCFG" kubectl --context=garden --request-timeout=20s get shoot "$SHOOT" -n "$GNS" -o yaml
 J 02_pods_wide    env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get pods -n "$NS" -o wide
+J 03_pods_yaml    env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get pods -n "$NS" -o yaml
 J 04_events       env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get events -n "$NS" --sort-by=.lastTimestamp
 J 05_mr_yaml      env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get managedresource -n "$NS" -o yaml
 J 06_machine_yaml env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get machine -n "$NS" -o yaml
@@ -1554,7 +1555,8 @@ cat_file() { local f="$TMP/$1"; [ -s "$f" ] && { cat "$f"; echo ""; } || echo "(
 
 hdr "1. SHOOT (garden, full yaml)";            cat_file 01_shoot_yaml
 hdr "2. PODS (wide)";                          cat_file 02_pods_wide
-hdr "3. EVENTS";                               cat_file 04_events
+hdr "3. PODS (full yaml)";                     cat_file 03_pods_yaml
+hdr "4. EVENTS";                               cat_file 04_events
 hdr "5. COMPONENT LOGS (per-container, tail ${LINES})"
 for f in "$TMP"/20_dep_*; do
   case "$f" in *.rc) continue;; esac
