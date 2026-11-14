@@ -1660,6 +1660,22 @@ exit 0
         llm_api_key = llm_cfg.get("api_key")
         llm_api_base = llm_cfg.get("api_base")
 
+        # /check uses its own model when CHECK_MODEL is set, falling back to
+        # the main Holmes model otherwise. CHECK_API_BASE lets /check target a
+        # different endpoint (e.g. a faster local model). Recommended: a
+        # cheap/fast model — the snapshot is structured and max_tokens=1500
+        # already caps output volume.
+        from src.bot.utils.config import config as _cfg
+        if _cfg.check_model:
+            cm = _cfg.check_model
+            # Auto-prepend "openai/" if the caller set a bare model id (no
+            # known litellm prefix like anthropic/ / openai/ / gemini/ ...).
+            if "/" not in cm and not cm.startswith(("anthropic", "openai", "gemini", "bedrock", "azure")):
+                cm = f"openai/{cm}"
+            llm_model = cm
+            if _cfg.check_api_base:
+                llm_api_base = _cfg.check_api_base
+
         system_prompt = (
             "Bạn là chuyên gia Kubernetes/Gardener control-plane. "
             "Phân tích snapshot và đưa ra phân tích nguyên nhân gốc rễ. "

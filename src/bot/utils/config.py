@@ -169,6 +169,16 @@ class Config:
     # rules. Falls back to CONSOLIDATOR_MODEL if unset. Recommended: a
     # cheap/gp-fast model — the distill runs strictly offline at ingest
     # time, ~329 calls total.
+    # Model used for /check (control-plane snapshot analysis). Falls back to
+    # the main Holmes model (OPENAI_MODEL or anthropic default) when unset.
+    # Recommendation: a fast/cheap model — the snapshot is structured and the
+    # prompt is tight (max_tokens=1500). A cheaper model slashes latency on
+    # the /check path without touching the main chat model.
+    check_model: Optional[str] = None
+    # Optional api_base override for /check (lets /check target a different
+    # endpoint than Holmes, e.g. a faster local model). When unset, falls
+    # back to OPENAI_API_BASE (or Anthropic default).
+    check_api_base: Optional[str] = None
     kb_distill_model: Optional[str] = None
 
     # On-call precheck (admin-configured). Bot is an MCP HTTP/SSE client to
@@ -265,6 +275,8 @@ def load_config() -> Config:
         kb_enabled=os.getenv("KB_ENABLED", "").lower() in ("1", "true", "yes", "on"),
         kb_top_k=int(os.getenv("KB_TOP_K", "50")),
         kb_distill_model=os.getenv("KB_DISTILL_MODEL") or os.getenv("CONSOLIDATOR_MODEL") or None,
+        check_model=os.getenv("CHECK_MODEL") or None,
+        check_api_base=os.getenv("CHECK_API_BASE") or None,
         oncall_enabled=os.getenv("ONCALL_ENABLED", "").lower() in ("1", "true", "yes", "on"),
         oncall_chat_id=int(os.getenv("ONCALL_CHAT_ID")) if os.getenv("ONCALL_CHAT_ID") else None,
         oncall_mcp_url=os.getenv("ONCALL_MCP_URL") or None,
