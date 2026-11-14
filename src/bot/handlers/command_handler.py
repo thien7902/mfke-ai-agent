@@ -1432,7 +1432,7 @@ class CommandHandler:
         snapshot_script = r'''
 set -uo pipefail
 C="__CLUSTER_ID__"
-LINES="200"
+LINES="100"
 EMIN="120"
 BUDGET=30
 CMD_TMO=25
@@ -1514,7 +1514,7 @@ cat "$TMP/_podlist" | xargs -r -P 16 -L 1 bash -c '
       FLAG=""
     fi
     OUT=$(timeout 18 env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=15s \
-          logs "$pod" -n "$NS" -c "$cn" --tail=80 $FLAG 2>&1)
+          logs "$pod" -n "$NS" -c "$cn" --tail=40 $FLAG 2>&1)
     case "$OUT" in
       *"previous terminated container"*|*"not found"*|"") continue ;;
     esac
