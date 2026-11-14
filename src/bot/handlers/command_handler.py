@@ -1683,6 +1683,32 @@ exit 0
             "`HibernationPossible=False` (khiến maintenance/hibernate bị chặn)."
         )
 
+        # Inject distilled knowledge (same source Holmes uses) — facts from
+        # prior conversations that the background consolidator extracted. If
+        # they conflict with the live snapshot, trust the snapshot.
+        distilled_store = getattr(self.holmes, "_distilled_store", None)
+        if distilled_store is not None:
+            try:
+                distilled_facts = distilled_store.get_injectable_facts()
+            except Exception as e:
+                logger.warning("/check distilled_facts_load_failed", error=str(e))
+                distilled_facts = []
+            if distilled_facts:
+                bullet_lines = "\n".join(
+                    f"- {f.get('text', '')}".strip()
+                    for f in distilled_facts
+                    if f.get("text")
+                )
+                if bullet_lines:
+                    system_prompt += (
+                        "\n\n--- DISTILLED KNOWLEDGE (từ hội thoại trước, "
+                        "ưu tiên cao nhưng phải nhường cho snapshot trực tiếp) ---\n"
+                        "Các fact dưới đây được trích từ lịch sử chat trước. "
+                        "Dùng để giải thích/giả định lỗi khi snapshot khớp. "
+                        "Nếu xung đột với snapshot trực tiếp thì tin snapshot.\n"
+                        + bullet_lines
+                    )
+
         # Build message list for the LLM. Only send the snapshot directly —
         # including conversation history would duplicate snapshot tokens and
         # slow the first-token latency. History has been persisted to
