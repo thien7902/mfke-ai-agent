@@ -27,6 +27,7 @@ from src.bot.services.memory_service import MemoryService
 from src.bot.tools.search_memory_tool import SearchMemoryTool
 from src.bot.tools.send_file_tool import SendFileTool, ListChatFilesTool
 from src.bot.tools.loop_guard import wrap_tools_with_loop_guard
+from src.bot.utils.thread_abort import register as _register_thread_abort, unregister as _unregister_thread_abort
 from src.bot.tools.admin_gate import (
     wrap_tools_with_admin_gate,
     set_admin_check_loop,
@@ -1622,18 +1623,26 @@ class HolmesService:
                     enable_approval=enable_approval,
                     features=features)
 
+        def _call_llm(approval_callback=None):
+            thread_key = (chat_id, topic_id)
+            _register_thread_abort(thread_key)
+            try:
+                return llm.call(
+                    messages=messages,
+                    request_context=_request_context(user_id, chat_id, topic_id, extra=extra_request_context),
+                    approval_callback=approval_callback,
+                    cancel_event=cancel_event,
+                )
+            finally:
+                _unregister_thread_abort(thread_key)
+
         if enable_approval:
             approval_callback = self._create_approval_callback(user_id, chat_id, topic_id, telegram_context)
             logger.warning("Created approval callback", user_id=user_id)
             try:
                 result: LLMResult = await loop.run_in_executor(
                     _holmes_executor,
-                    lambda: llm.call(
-                        messages=messages,
-                        request_context=_request_context(user_id, chat_id, topic_id, extra=extra_request_context),
-                        approval_callback=approval_callback,
-                        cancel_event=cancel_event,
-                    ),
+                    lambda: _call_llm(approval_callback),
                 )
             except LLMInterruptedError:
                 logger.info("Non-stream chat interrupted by user", user_id=user_id)
@@ -1645,14 +1654,21 @@ class HolmesService:
             try:
                 result: LLMResult = await loop.run_in_executor(
                     _holmes_executor,
-                    lambda: llm.call(
-                        messages=messages,
-                        request_context=_request_context(user_id, chat_id, topic_id, extra=extra_request_context),
-                        cancel_event=cancel_event,
-                    ),
+                    lambda: _call_llm(),
                 )
             except LLMInterruptedError:
                 logger.info("Non-stream chat interrupted by user", user_id=user_id)
+                return "🛑 Stopped by user.", _empty_llm_result()
+            except KeyboardInterrupt:
+                # _register_thread_abort injects this into the worker
+                # thread when /stop can't reach the cooperative cancel
+                # (litellm blocked in httpx.recv). Holmes propagates
+                # the KeyboardInterrupt uncaught (no blanket catch in
+                # tool_calling_llm.py), so the executor surfaces it and
+                # asyncio re-raises. Translate to the user-facing flag
+                # so the chat() wrapper treats it as a stop — same UX
+                # as LLMInterruptedError.
+                logger.info("Non-stream chat force-killed by /stop", user_id=user_id)
                 return "🛑 Stopped by user.", _empty_llm_result()
 
         return result.result or "I apologize, but I couldn't generate a response.", result
@@ -1862,10 +1878,20 @@ class HolmesService:
         stream_iter = iter(stream) if not hasattr(stream, "__next__") else stream
 
         def _next_event():
+            # Register THIS worker thread on every pull so /stop can
+            # break a hung litellm call via PyThreadState_SetAsyncExc.
+            # The executor may schedule `_next_event` on different
+            # workers across calls; registering per-call keeps the entry
+            # fresh. Unregister in finally so a stale thread id never
+            # survives past the call.
+            thread_key = (chat_id, topic_id)
+            _register_thread_abort(thread_key)
             try:
                 return next(stream_iter)
             except StopIteration:
                 return None
+            finally:
+                _unregister_thread_abort(thread_key)
 
         while True:
             event = await loop.run_in_executor(_holmes_executor, _next_event)
