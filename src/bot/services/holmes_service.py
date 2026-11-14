@@ -27,7 +27,6 @@ from src.bot.services.memory_service import MemoryService
 from src.bot.tools.search_memory_tool import SearchMemoryTool
 from src.bot.tools.send_file_tool import SendFileTool, ListChatFilesTool
 from src.bot.tools.loop_guard import wrap_tools_with_loop_guard
-from src.bot.utils.thread_abort import register as _register_thread_abort, unregister as _unregister_thread_abort
 from src.bot.tools.admin_gate import (
     wrap_tools_with_admin_gate,
     set_admin_check_loop,
@@ -1623,75 +1622,40 @@ class HolmesService:
                     enable_approval=enable_approval,
                     features=features)
 
-        def _call_llm(approval_callback=None):
-            thread_key = (chat_id, topic_id)
-            _register_thread_abort(thread_key)
-            try:
-                return llm.call(
-                    messages=messages,
-                    request_context=_request_context(user_id, chat_id, topic_id, extra=extra_request_context),
-                    approval_callback=approval_callback,
-                    cancel_event=cancel_event,
-                )
-            finally:
-                _unregister_thread_abort(thread_key)
-
-        async def _run_chat(approval_callback):
-            """Returns (response_text, llm_result, was_interrupted) tuple.
-            On success, response_text=`None` (filled in by caller) so they
-            can derive `response_text` from `llm_result.result` directly
-            without losing the llm_result for history persistence. The
-            was_interrupted flag signals "exited via /stop" so caller
-            knows to skip the convert-and-persist path the error version
-            of LLMResult represents.
-            """
-            try:
-                result = await loop.run_in_executor(
-                    _holmes_executor,
-                    lambda: _call_llm(approval_callback),
-                )
-                return None, result, False
-            except LLMInterruptedError:
-                logger.info("Non-stream chat interrupted by user", user_id=user_id)
-                return "🛑 Stopped by user.", _empty_llm_result(), True
-            except KeyboardInterrupt:
-                logger.info("Non-stream chat force-killed by /stop", user_id=user_id)
-                return "🛑 Stopped by user.", _empty_llm_result(), True
-            except Exception as e:
-                # If the user pressed /stop, the abort flow force-closed
-                # every cached litellm httpx.Client -> recv() raises
-                # httpx.ReadError -> litellm wraps as APIConnectionError.
-                # All such errors are subclasses of Exception. Translate
-                # them to the same "🛑 Stopped by user." sentinel IF the
-                # cancel_event was set — otherwise fall through to the
-                # natural error handler located upstream in `chat()`.
-                if cancel_event is not None and cancel_event.is_set():
-                    logger.info(
-                        "Non-stream chat broke on aborted socket",
-                        user_id=user_id, error_type=type(e).__name__,
-                    )
-                    return "🛑 Stopped by user.", _empty_llm_result(), True
-                raise
-
         if enable_approval:
             approval_callback = self._create_approval_callback(user_id, chat_id, topic_id, telegram_context)
             logger.warning("Created approval callback", user_id=user_id)
-            response_text, llm_result, _was_interrupted = await _run_chat(approval_callback)
+            try:
+                result: LLMResult = await loop.run_in_executor(
+                    _holmes_executor,
+                    lambda: llm.call(
+                        messages=messages,
+                        request_context=_request_context(user_id, chat_id, topic_id, extra=extra_request_context),
+                        approval_callback=approval_callback,
+                        cancel_event=cancel_event,
+                    ),
+                )
+            except LLMInterruptedError:
+                logger.info("Non-stream chat interrupted by user", user_id=user_id)
+                return "🛑 Stopped by user.", _empty_llm_result()
         else:
             # No interactive approval
             logger.warning("Skipping approval callback - reason: tool_approval=%s, telegram_context=%s",
                           features.get("tool_approval", False), telegram_context is not None)
-            response_text, llm_result, _was_interrupted = await _run_chat(None)
+            try:
+                result: LLMResult = await loop.run_in_executor(
+                    _holmes_executor,
+                    lambda: llm.call(
+                        messages=messages,
+                        request_context=_request_context(user_id, chat_id, topic_id, extra=extra_request_context),
+                        cancel_event=cancel_event,
+                    ),
+                )
+            except LLMInterruptedError:
+                logger.info("Non-stream chat interrupted by user", user_id=user_id)
+                return "🛑 Stopped by user.", _empty_llm_result()
 
-        # On success path, response_text is None and we derive it from
-        # llm_result.result so tests/check code paths see the real LLM
-        # reply. On abort path, response_text is the "🛑 Stopped by user."
-        # sentinel already and llm_result is an empty placeholder.
-        if response_text is None:
-            response_text = (llm_result.result if llm_result is not None else None) \
-                            or "I apologize, but I couldn't generate a response."
-
-        return response_text, llm_result
+        return result.result or "I apologize, but I couldn't generate a response.", result
 
     async def _stream_chat(
         self, messages: List[Dict[str, Any]], features: Dict[str, bool], user_id: int, conversation: Conversation = None,
@@ -1737,34 +1701,6 @@ class HolmesService:
         except LLMInterruptedError:
             stopped = True
             logger.info("Stream chat interrupted by user, persisting partial state", user_id=user_id)
-            raise
-        except KeyboardInterrupt:
-            # Force-abort path: `thread_abort.abort()` injected this
-            # into the worker thread because /stop couldn't reach the
-            # cooperative cancel_event while litellm was blocked in
-            # httpx.recv. Translate to LLMInterruptedError so the rest
-            # of the stack (chat() wrapper, message_handler) treats it
-            # as a graceful stop — without this, KeyboardInterrupt
-            # propagates through asyncio.run_polling and shuts the bot
-            # down entirely.
-            stopped = True
-            logger.info("Stream chat force-killed by /stop, persisting partial state", user_id=user_id)
-            raise LLMInterruptedError("stream force-killed by /stop")
-        except Exception as e:
-            # Force-close path: thread_abort closes every cached httpx
-            # client so recv() raises httpx.ReadError -> litellm wraps
-            # it as APIConnectionError. If /stop set the cancel_event,
-            # translate ANY such exception to LLMInterruptedError so the
-            # user sees the consistent "🛑 Stopped by user." UX.
-            # Without this catch the caller's `except Exception:` in
-            # chat() would surface a generic error reply.
-            if cancel_event is not None and cancel_event.is_set():
-                stopped = True
-                logger.info(
-                    "Stream chat broke on aborted socket, translating",
-                    user_id=user_id, error_type=type(e).__name__,
-                )
-                raise LLMInterruptedError("stream force-killed by /stop (socket)")
             raise
         finally:
             # Persist whatever we accumulated — even on interrupt or error.
@@ -1926,20 +1862,10 @@ class HolmesService:
         stream_iter = iter(stream) if not hasattr(stream, "__next__") else stream
 
         def _next_event():
-            # Register THIS worker thread on every pull so /stop can
-            # break a hung litellm call via PyThreadState_SetAsyncExc.
-            # The executor may schedule `_next_event` on different
-            # workers across calls; registering per-call keeps the entry
-            # fresh. Unregister in finally so a stale thread id never
-            # survives past the call.
-            thread_key = (chat_id, topic_id)
-            _register_thread_abort(thread_key)
             try:
                 return next(stream_iter)
             except StopIteration:
                 return None
-            finally:
-                _unregister_thread_abort(thread_key)
 
         while True:
             event = await loop.run_in_executor(_holmes_executor, _next_event)

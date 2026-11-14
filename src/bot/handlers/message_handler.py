@@ -26,7 +26,6 @@ from src.bot.utils.file_extractor import (
     IMAGE_SENTINEL,
 )
 from src.bot.services import vision_service
-from src.bot.utils.thread_abort import abort as _force_abort_thread
 
 logger = structlog.get_logger(__name__)
 
@@ -664,25 +663,8 @@ class MessageHandler:
             return
 
         if batch.cancel_event is not None:
-            # A dispatch is in flight — signal Holmes to abort between
-            # iterations (cooperative cancel). This handles the case
-            # where Holmes is currently executing a tool or between
-            # stream chunks where it polls the event.
+            # A dispatch is in flight — signal Holmes to abort between iterations.
             batch.cancel_event.set()
-            # FORCE-abort the worker thread for the case where Holmes
-            # is blocked inside litellm's httpx.recv on a hung LLM
-            # HTTP call. `cancel_event` will never be polled until
-            # recv() returns (litellm timeout, often 600s) — the user
-            # would otherwise wait up to that whole window. Aborts the
-            # worker thread with KeyboardInterrupt via
-            # `PyThreadState_SetAsyncExc`; httpx catches it mid-recv
-            # and litellm surfaces the resulting exception back up
-            # through Holmes. The chat() wrapper translates
-            # KeyboardInterrupt to "🛑 Stopped by user." for the user.
-            # If the registration entry is gone (request already
-            # completed between batch check and here), `abort` is a
-            # no-op — the cooperative cancel will still land.
-            _force_abort_thread(key)
             await update.message.reply_text("🛑 Stopping current request…", message_thread_id=topic_id)
             return
 
