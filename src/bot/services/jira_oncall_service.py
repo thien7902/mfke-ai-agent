@@ -21,12 +21,17 @@ the ticket — never break the bot.
 
 import asyncio
 import html
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Optional
 
 import structlog
 
+from src.bot.tools.admin_gate import (
+    register_block_observer,
+    unregister_block_observer,
+)
 from src.bot.utils.config import config
 from src.bot.utils.mcp_client import McpJiraClient
 from src.bot.utils.mongodb import MongoDB
@@ -36,6 +41,13 @@ logger = structlog.get_logger(__name__)
 
 SHIFTS_COLLECTION = "oncall_shifts"
 TICKETS_COLLECTION = "oncall_tickets"
+
+# Threshold: after this many policy-violation blocks (hard OR soft)
+# from admin_gate, abort the investigation and report the ticket as
+# SUSPECT/REFUSED. Two strikes catches transient mis-steps without
+# nuking the whole turn on a single accidental block — but a bot
+# that's pushing policy repeatedly deserves to be stopped.
+VIOLATION_ABORT_THRESHOLD = 2
 
 _READ_ONLY_RULE = """⚠️ READ-ONLY ON-CALL PRECHECK — DO NOT MODIFY ANY RESOURCE.
 
@@ -106,6 +118,16 @@ class JiraOncallService:
         self._conversation_service = None
         self._task: Optional[asyncio.Task] = None
         self._mcp: Optional[McpJiraClient] = None
+        # Per-topic investigation state, populated by _process_ticket and
+        # consumed by the admin_gate block observer. The observer is a
+        # sync callable (runs in Holmes' worker thread) so the values it
+        # touches are simple mutable primitives only.
+        #   key=topic_id (str), value={"ticket_key": str, "count": int,
+        #     "abort": bool, "cancel_event": threading.Event,
+        #     "last_reason": str, "last_kind": str, "last_preview": str}
+        self._active_investigations: dict = {}
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._observer_registered = False
 
     def set_holmes(self, holmes_service) -> None:
         self._holmes = holmes_service
@@ -137,6 +159,10 @@ class JiraOncallService:
             )
             return
         self._mcp = McpJiraClient(config.oncall_mcp_url)
+        self._loop = asyncio.get_running_loop()
+        if not self._observer_registered:
+            register_block_observer(self._on_block)
+            self._observer_registered = True
         self._task = asyncio.create_task(self._oncall_loop())
         logger.info(
             "oncall_started",
@@ -146,6 +172,9 @@ class JiraOncallService:
         )
 
     async def stop(self) -> None:
+        if self._observer_registered:
+            unregister_block_observer(self._on_block)
+            self._observer_registered = False
         if self._task:
             self._task.cancel()
             try:
@@ -278,9 +307,22 @@ class JiraOncallService:
                 key = issue.get("key")
                 if not key:
                     continue
-                if tickets_col.find_one({"ticket_key": key}):
+                existing = tickets_col.find_one({"ticket_key": key})
+                if not existing:
+                    new_issues.append(issue)
                     continue
-                new_issues.append(issue)
+                # Skip tickets previously REFUSED for policy violations —
+                # the oncall engineer has to manually intervene and we
+                # must not auto-fire them again, even across a shift
+                # change or a dedup-collection miss.
+                if existing.get("blocked"):
+                    logger.info(
+                        "oncall_skip_blocked_ticket",
+                        key=key, violation_count=existing.get("violation_count"),
+                    )
+                    continue
+                # Non-blocked existing doc = already processed successfully.
+                continue
         except Exception as e:
             logger.warning(
                 "oncall_dedup_failed_processing_all",
@@ -386,6 +428,24 @@ class JiraOncallService:
         # extra_prompt_additions so it sits at the TOP of the system prompt
         # additions stack (highest priority).
         prompt = self._build_investigation_prompt(issue)
+        # Policy-violation guard: register this topic in the admin_gate
+        # block observer so hard/soft blocks during this investigation bump
+        # a per-ticket counter, persisted to oncall_tickets. On the SECOND
+        # violation the observer sets the threading.Event — Holmes' LLM
+        # polls cancel_event between tool iterations, raises
+        # LLMInterruptedError, and chat() returns the "🛑 Stopped by user."
+        # sentinel. _process_ticket's finally posts the SUSPECT/REFUSED
+        # notice into the forum topic.
+        cancel_event = threading.Event()
+        inv_state = {
+            "ticket_key": key,
+            "count": 0,
+            "abort": False,
+            "cancel_event": cancel_event,
+            "topic_id_int": topic_id,
+        }
+        self._active_investigations[str(topic_id)] = inv_state
+        investigation_aborted = False
         try:
             response = await self._holmes.chat(
                 user_id=config.oncall_bot_user_id,
@@ -398,6 +458,10 @@ class JiraOncallService:
                 topic_id=topic_id,
                 user_display_name="oncall-precheck (auto)",
                 extra_prompt_additions=_READ_ONLY_RULE,
+                cancel_event=cancel_event,
+                extra_request_context={
+                    "_oncall_cancel_event": cancel_event,
+                },
             )
             # Persist conversation so on-call humans can chat follow-ups
             # in this topic and Holmes sees the prior investigation. Without
@@ -424,6 +488,17 @@ class JiraOncallService:
             # investigations (often >4k chars) arrive as multiple Telegram
             # messages instead of being cut mid-sentence.
             response_text = str(response) or "(empty response)"
+            # If any block observer signaled abort, replace the partial
+            # response with the abort sentinel so the oncall engineer sees
+            # the refusal rather than a half-finished analysis.
+            if inv_state.get("abort") or cancel_event.is_set():
+                investigation_aborted = True
+                response_text = (
+                    "🛑 Auto-investigation aborted: bot attempted 2+ "
+                    f"policy-violating commands on ticket {html.escape(key)}. "
+                    "See the SUSPECT/REFUSED notice in this topic for details. "
+                    f"Manual review required: {url}"
+                )
             try:
                 await send_rich_reply(
                     self._bot,
@@ -458,6 +533,27 @@ class JiraOncallService:
             except Exception:
                 pass
             return
+        finally:
+            # Always clean up the investigation registry so future chats
+            # in the same topic aren't mis-attributed to a stale ticket.
+            self._active_investigations.pop(str(topic_id), None)
+        # If the observer set the abort flag mid-turn, post the SUSPECT/
+        # REFUSED report into the forum topic. This covers the case where
+        # Holmes exited via LLMInterruptedError (cancel event set between
+        # tool iterations) AND the case where chat() simply returned
+        # after the second block but the scheduled-coroutine report from
+        # _on_block didn't land yet.
+        if investigation_aborted or inv_state.get("abort"):
+            try:
+                await self._post_violation_report(
+                    topic_id, key,
+                    inv_state.get("last_kind") or "unknown",
+                    inv_state.get("last_reason") or "unknown",
+                    inv_state.get("last_preview") or "",
+                )
+            except Exception as e:
+                logger.warning("oncall_violation_report_failed_finally",
+                              ticket_key=key, error=str(e))
         # e) mark ticket as fired so future shift-starts don't re-process
         # (GLOBAL dedup — key is the only unique identifier).
         try:
@@ -474,6 +570,129 @@ class JiraOncallService:
             )
         except Exception as e:
             logger.warning("oncall_ticket_mark_failed", key=key, error=str(e))
+
+    # ------------------------------------------------------------------
+    # Policy-violation observer (called synchronously from admin_gate)
+    # ------------------------------------------------------------------
+    def _on_block(self, topic_id, kind, reason, cmd_preview) -> bool:
+        """admin_gate calls this (sync, in Holmes worker thread) on every
+        hard or soft block. Increments a per-topic counter persisted to
+        MongoDB. On the SECOND violation, marks the ticket `blocked=True`
+        and signals the running chat() to abort. Returns True iff abort
+        should fire — admin_gate then sets the `_oncall_cancel_event`
+        stashed in `request_context`, which causes Holmes to raise
+        `LLMInterruptedError` on the next iteration between tool calls.
+
+        NOTE: cannot post to Telegram directly from here — this is on
+        a sync worker thread. We schedule `_post_violation_report` on
+        the bot event loop via `run_coroutine_threadsafe` and return.
+        Chat() then unwinds via `LLMInterruptedError`; a finally block
+        in `_process_ticket` calls `_post_violation_report` again to
+        cover the case where the LLM exits by raising before the
+        scheduled coroutine lands.
+        """
+        inv = self._active_investigations.get(str(topic_id))
+        if inv is None:
+            # Not an oncall investigation (regular user chat). admin_gate
+            # uses topic_id as the lookup key, and oncall investigations
+            # register under their created topic_id; this branch means
+            # no investigation is running for that topic.
+            return False
+        inv["count"] = int(inv.get("count", 0)) + 1
+        inv["last_kind"] = kind
+        inv["last_reason"] = reason
+        inv["last_preview"] = cmd_preview or ""
+        ticket_key = inv["ticket_key"]
+        logger.warning(
+            "oncall_policy_violation",
+            ticket_key=ticket_key,
+            kind=kind, reason=reason, count=inv["count"],
+        )
+        # Persist counter + last-violation to the tickets doc. The doc
+        # might not exist yet (created at the END of _process_ticket);
+        # upsert makes this safe in either order. blocked=True flags
+        # the ticket so future shift-starts can't re-fire it.
+        blocked_now = inv["count"] >= VIOLATION_ABORT_THRESHOLD
+        try:
+            MongoDB.get_collection(TICKETS_COLLECTION).update_one(
+                {"ticket_key": ticket_key},
+                {"$set": {
+                    "ticket_key": ticket_key,
+                    "violation_count": inv["count"],
+                    "blocked": blocked_now,
+                    "last_violation_kind": kind,
+                    "last_violation_reason": reason,
+                    "last_violation_preview": (cmd_preview or "")[:500],
+                    "last_violation_at": datetime.utcnow(),
+                }},
+                upsert=True,
+            )
+        except Exception as e:
+            logger.warning("oncall_violation_persist_failed",
+                          ticket_key=ticket_key, error=str(e))
+        if not blocked_now:
+            return False
+        # Second strike — abort the investigation.
+        inv["abort"] = True
+        cancel_event = inv.get("cancel_event")
+        if cancel_event is not None and hasattr(cancel_event, "set"):
+            try:
+                cancel_event.set()
+            except Exception as e:
+                logger.warning("oncall_cancel_event_set_failed",
+                              ticket_key=ticket_key, error=str(e))
+        # Schedule the report on the bot loop; if the loop isn't
+        # available, _process_ticket's finally block will pick up.
+        loop = self._loop
+        topic_id_int = inv.get("topic_id_int")
+        if loop is not None and topic_id_int is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._post_violation_report(topic_id_int, ticket_key,
+                                                kind, reason, cmd_preview),
+                    loop,
+                )
+            except Exception as e:
+                logger.warning("oncall_report_schedule_failed",
+                              ticket_key=ticket_key, error=str(e))
+        return True
+
+    async def _post_violation_report(self, topic_id: int, ticket_key: str,
+                                      kind: str, reason: str,
+                                      cmd_preview: Optional[str]) -> None:
+        """Post the 'ticket malformed / refused' notice to the oncall
+        forum topic so the on-call engineer sees the policy violation
+        and can take over manually. Idempotent in `_process_ticket`'s
+        finally block: posting twice is safe — Telegram will accept
+        duplicate messages with the same text (no client-side dedup).
+        """
+        if self._bot is None:
+            return
+        url = f"https://servicedesk.fci.vn/browse/{ticket_key}"
+        msg = (
+            "⛔⛔ TICKET ĐÁNH DẤU SUSPECT / REFUSED — bot từ chối tiếp tục\n"
+            f"Ticket: {html.escape(ticket_key)}\n"
+            f"URL: {url}\n\n"
+            "Bot đã cố ý vi phạm policy an toàn lần thứ 2 trong quá trình "
+            "auto-investigate ticket này. Quyền thực thi đã bị thu hồi "
+            "ngay lập tức để tránh nguy cơ phá hủy tài nguyên cluster.\n"
+            f"Lần vi phạm cuối: loại={html.escape(kind or '?')}, "
+            f"lý do={html.escape(reason or '?')}.\n"
+            f"Lệnh gần nhất (bị block): {html.escape((cmd_preview or '')[:400])}\n\n"
+            "On-call engineer cần vào ticket, review tình trạng cluster "
+            "thủ công, và nếu thấy bất thường thì escalate. KHÔNG yêu cầu "
+            "bot auto-investigate lại ticket này nữa."
+        )
+        try:
+            await self._bot.send_message(
+                chat_id=config.oncall_chat_id,
+                text=msg,
+                message_thread_id=topic_id,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.warning("oncall_violation_report_failed",
+                          ticket_key=ticket_key, error=str(e))
 
     # ------------------------------------------------------------------
     # Helpers

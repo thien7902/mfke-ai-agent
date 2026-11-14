@@ -31,6 +31,68 @@ _ADMIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 _ADMIN_LOOKUP_TIMEOUT_S = 1.5
 
 
+# Block-observer registry. Each observer is a sync callable
+# `(topic_id: str, kind: str, reason: str, cmd_preview: str) -> bool`.
+# `kind` is "hard" or "soft". Returns True to signal "abort the
+# investigation": observers are expected to set the `cancel_event`
+# found in `request_context["_oncall_cancel_event"]` themselves, but
+# we also reach into the context right here to do it.
+#
+# Used by JiraOncallService to count policy violations per ticket and
+# abort Holmes when the bot keeps trying mutating commands after a
+# first block. Sync (runs from inside the Holmes worker thread) so the
+# observer must NOT await async work directly — `asyncio.run_coroutine_threadsafe`
+# is the supported bridge back to the bot loop.
+_BLOCK_OBSERVERS: list = []
+
+
+def register_block_observer(fn) -> None:
+    """Register a sync callable to fire on every admin_gate hard/soft block.
+
+    Idempotent per-fn; registering the same bound method twice is a no-op.
+    """
+    if fn in _BLOCK_OBSERVERS:
+        return
+    _BLOCK_OBSERVERS.append(fn)
+
+
+def unregister_block_observer(fn) -> None:
+    try:
+        _BLOCK_OBSERVERS.remove(fn)
+    except ValueError:
+        pass
+
+
+def _dispatch_block(request_ctx: dict, kind: str, reason: str,
+                     cmd_preview: str) -> None:
+    """Fire all registered block observers for the given context, then
+    best-effort set the cancel_event if any observer returned True.
+
+    `request_ctx` is the Holmes ToolInvokeContext.request_context dict.
+    On regular Telegram chats (no oncall investigation running) the
+    observers look up by `topic_id` and ESI-no-op when unknown.
+    """
+    if not _BLOCK_OBSERVERS:
+        return
+    topic_id = request_ctx.get("topic_id")
+    if topic_id is None:
+        return
+    abort = False
+    for fn in _BLOCK_OBSERVERS:
+        try:
+            if fn(topic_id, kind, reason, cmd_preview):
+                abort = True
+        except Exception as e:
+            logger.warning("block_observer_failed", error=str(e))
+    if abort:
+        cancel_event = request_ctx.get("_oncall_cancel_event")
+        if cancel_event is not None and hasattr(cancel_event, "set"):
+            try:
+                cancel_event.set()
+            except Exception as e:
+                logger.warning("block_observer_cancel_set_failed", error=str(e))
+
+
 # Kubectl / Helm global flag prefix. Matches zero-or-more flag tokens
 # between `kubectl`/`helm` and the verb. Each flag is `-X` or `--xxx`,
 # optionally followed by `=value` in the SAME token AND a separate value
@@ -686,6 +748,8 @@ def _wrap_one(tool) -> None:
                 command_preview=str(cmd)[:200],
                 reason=hard_block_reason,
             )
+            request_ctx = getattr(context, "request_context", None) or {}
+            _dispatch_block(request_ctx, "hard", hard_block_reason, str(cmd)[:200])
             return _build_hard_block_result(cmd, hard_block_reason)
 
         if not _is_mutation(cmd):
@@ -717,6 +781,8 @@ def _wrap_one(tool) -> None:
             user_id=user_id_str,
             reason="mutation_prefix_non_admin",
         )
+        request_ctx = getattr(context, "request_context", None) or {}
+        _dispatch_block(request_ctx, "soft", "mutation_prefix_non_admin", str(cmd)[:120])
         return _build_block_result(cmd)
 
     object.__setattr__(tool, "invoke", wrapped_invoke)

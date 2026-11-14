@@ -629,3 +629,157 @@ async def test_fire_now_explicit_shift_no_fallback(fake_config, fake_mongo):
     assert result.get("error")
     assert "no oncall shifts" in result["error"]
     assert result.get("shift") == "morning"
+
+
+# ---------------------------------------------------------------------------
+# Policy-violation guard (admin_gate block observer + abort)
+# ---------------------------------------------------------------------------
+
+async def test_on_block_first_violation_does_not_abort(fake_config, fake_mongo):
+    """First hard-block increments the counter but doesn't fire abort."""
+    mock_mongo, collections = fake_mongo
+    svc = JiraOncallService()
+    cancel_event = MagicMock()
+    cancel_event.set = MagicMock()
+    svc._active_investigations["9991"] = {
+        "ticket_key": "ISD-500",
+        "count": 0,
+        "abort": False,
+        "cancel_event": cancel_event,
+        "topic_id_int": 9991,
+    }
+    should_abort = svc._on_block("9991", "hard", "hard_block_apply", "kubectl apply -f x")
+    assert should_abort is False
+    state = svc._active_investigations["9991"]
+    assert state["count"] == 1
+    assert state["abort"] is False
+    cancel_event.set.assert_not_called()
+    # persisted carriers
+    collections["oncall_tickets"].update_one.assert_called()
+    args, kwargs = collections["oncall_tickets"].update_one.call_args
+    assert args[0] == {"ticket_key": "ISD-500"}
+    assert args[1]["$set"]["violation_count"] == 1
+    assert args[1]["$set"]["blocked"] is False
+
+
+async def test_on_block_second_violation_aborts_and_sets_cancel_event(fake_config, fake_mongo):
+    """Second violation sets abort flag, persists blocked=True, sets the
+    threading.Event that Holmes' ToolCallingLLM polls between tool iters."""
+    mock_mongo, collections = fake_mongo
+    svc = JiraOncallService()
+    cancel_event = MagicMock()
+    cancel_event.set = MagicMock()
+    svc._active_investigations["9992"] = {
+        "ticket_key": "ISD-501",
+        "count": 1,  # already had one violation
+        "abort": False,
+        "cancel_event": cancel_event,
+        "topic_id_int": 9992,
+    }
+    should_abort = svc._on_block("9992", "soft", "mutation_prefix_non_admin", "kubectl delete pod x")
+    assert should_abort is True
+    state = svc._active_investigations["9992"]
+    assert state["count"] == 2
+    assert state["abort"] is True
+    cancel_event.set.assert_called_once()
+    args, kwargs = collections["oncall_tickets"].update_one.call_args
+    assert args[1]["$set"]["violation_count"] == 2
+    assert args[1]["$set"]["blocked"] is True
+    assert args[1]["$set"]["last_violation_reason"] == "mutation_prefix_non_admin"
+
+
+async def test_on_block_unknown_topic_returns_false(fake_config, fake_mongo):
+    """Block observers fire for every Telegram chat (admin_gate dispatches
+    on topic_id), but oncall only registers the topic of the live
+    investigation. Unknown topics just return False without touching state."""
+    svc = JiraOncallService()
+    assert svc._on_block("99999", "hard", "hard_block_apply", "kubectl apply") is False
+    assert svc._active_investigations == {}
+
+
+async def test_fire_for_shift_skips_blocked_tickets(fake_config, fake_mongo):
+    """A ticket flagged `blocked=True` in oncall_tickets (previously REFUSED)
+    is NOT re-fired to Holmes even if it reappears in JQL results."""
+    mock_mongo, collections = fake_mongo
+    svc = JiraOncallService()
+    svc._bot = _Bot()
+    svc._telegram_bot = _TelegramBot()
+    svc._mcp = MagicMock()
+    svc._mcp.search_issues = AsyncMock(return_value=[
+        _make_issue(key="ISD-700"),
+        _make_issue(key="ISD-701"),
+    ])
+    svc._process_ticket = AsyncMock()
+    # ISD-700: blocked → skip. ISD-701: already fired (not blocked) → skip.
+    collections["oncall_tickets"].find_one.side_effect = [
+        {"ticket_key": "ISD-700", "violation_count": 2, "blocked": True},
+        {"ticket_key": "ISD-701", "violation_count": 0, "blocked": False},
+    ]
+    await svc._fire_for_shift("2026-11-10", "morning",
+                              datetime(2026, 11, 10, 8, 0), [_make_shift()])
+    svc._process_ticket.assert_not_awaited()
+
+
+async def test_process_ticket_passes_cancel_event_into_holmes(fake_config, fake_mongo):
+    """The chat() call is invoked with `cancel_event` and an
+    `extra_request_context` containing the `_oncall_cancel_event` key so
+    admin_gate's wrapper can set it when the observer returns True."""
+    mock_mongo, collections = fake_mongo
+    issue = _make_issue(key="ISD-600")
+    svc = JiraOncallService()
+    svc._bot = _Bot()
+    svc._telegram_bot = _TelegramBot()
+    svc._conversation_service = MagicMock()
+    svc._conversation_service.get_or_create_for_topic = AsyncMock(return_value=MagicMock())
+    svc._conversation_service.save_conversation = AsyncMock()
+    svc._holmes = MagicMock()
+    svc._holmes.chat = AsyncMock(return_value="ok")
+    await svc._process_ticket(issue, "2026-11-10", "morning", [12345])
+    _, kwargs = svc._holmes.chat.await_args
+    # cancel_event passed through
+    assert "cancel_event" in kwargs
+    assert hasattr(kwargs["cancel_event"], "set")
+    # extra_request_context carries the event so admin_gate can set it
+    extra_ctx = kwargs.get("extra_request_context") or {}
+    assert "_oncall_cancel_event" in extra_ctx
+    assert extra_ctx["_oncall_cancel_event"] is kwargs["cancel_event"]
+    # Investigation state cleaned up after.
+    assert svc._active_investigations == {}
+
+
+async def test_process_ticket_reports_abort_when_observer_fires(fake_config, fake_mongo):
+    """When _on_block fires twice during chat(), the bot should replace the
+    Holmes response with the abort sentinel and post a SUSPECT/REFUSED notice
+    into the forum topic."""
+    mock_mongo, collections = fake_mongo
+    issue = _make_issue(key="ISD-650")
+    svc = JiraOncallService()
+    svc._bot = _Bot()
+    svc._telegram_bot = _TelegramBot()
+    svc._conversation_service = MagicMock()
+    svc._conversation_service.get_or_create_for_topic = AsyncMock(return_value=MagicMock())
+    svc._conversation_service.save_conversation = AsyncMock()
+    svc._holmes = MagicMock()
+
+    async def _chat(**kwargs):
+        # Simulate admin_gate's hard-block firing twice during the
+        # Holmes conversation: pretend the LLM tried kubectl apply,
+        # got blocked, retried, got blocked again.
+        # _on_block runs synchronously from a worker thread in real
+        # usage; in this test we invoke it directly inside chat().
+        # The topic_id here is whatever _process_ticket created above.
+        topic_id = kwargs.get("topic_id")
+        svc._on_block(str(topic_id), "hard", "hard_block_apply", "kubectl apply")
+        svc._on_block(str(topic_id), "hard", "hard_block_delete_critical", "kubectl delete pod x")
+        return "(partial analysis)"
+
+    svc._holmes.chat = AsyncMock(side_effect=_chat)
+    await svc._process_ticket(issue, "2026-11-10", "morning", [12345])
+    # The replaced response should mention abort and the SUSPECT report
+    # was posted.
+    sent_texts = [c.kwargs["text"] for c in svc._bot.send_message.await_args_list]
+    # Header, aborted response (via rich_reply fallback or send_message),
+    # violation report
+    texts_concat = "\n".join(sent_texts)
+    assert "aborted" in texts_concat.lower() or "SUSPECT" in texts_concat
+    assert "ISD-650" in texts_concat

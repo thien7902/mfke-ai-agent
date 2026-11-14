@@ -284,19 +284,26 @@ def _get_kb_store_singleton():
 _CLI_REQUEST_CONTEXT = {"user_id": DEFAULT_CLI_USER}
 
 
-def _request_context(user_id: int, chat_id: int = 0, topic_id: int = 0) -> Dict[str, Any]:
+def _request_context(user_id: int, chat_id: int = 0, topic_id: int = 0,
+                     extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Per-turn request context handed to Holmes and on to every tool.
 
     `chat_id` / `topic_id` are what lets the `chat_send_file` tool deliver a
     generated file back into the conversation the turn came from (see
     src/bot/tools/send_file_tool.py). They are absent for CLI-ish paths
     (`execute_agent`), where the tool refuses instead of guessing a chat.
+
+    `extra` is an optional per-turn merge — used by JiraOncallService to
+    stash a `threading.Event` so admin_gate block observers can signal
+    an abort mid-investigation. Keys passed here override the defaults.
     """
     ctx: Dict[str, Any] = {**_CLI_REQUEST_CONTEXT, "user_id": str(user_id)}
     if chat_id:
         ctx["chat_id"] = str(chat_id)
     if topic_id:
         ctx["topic_id"] = str(topic_id)
+    if extra:
+        ctx.update(extra)
     return ctx
 
 
@@ -1116,6 +1123,7 @@ class HolmesService:
         images: Optional[List[Dict[str, Any]]] = None,
         user_display_name: Optional[str] = None,
         extra_prompt_additions: Optional[str] = None,
+        extra_request_context: Optional[Dict[str, Any]] = None,
     ) -> str | AsyncGenerator[str, None]:
         """
         Send a message to Holmes and get response.
@@ -1141,6 +1149,12 @@ class HolmesService:
                 JiraOncallService to inject a READ-ONLY rule for auto-investigations
                 without touching the global env var. Existing human-user callers
                 pass None and behave identically.
+            extra_request_context: Optional dict merged into the Holmes
+                `request_context` for this turn — used by JiraOncallService
+                to stash a `threading.Event` under `"_oncall_cancel_event"`
+                so admin_gate block observers can force-abort the
+                investigation if the bot hits a policy violation twice.
+                Keys override the defaults.
 
         Returns:
             Response text or async generator for streaming
@@ -1229,6 +1243,7 @@ class HolmesService:
                 response_text, llm_result = await self._non_stream_chat_with_memory(
                     holmes_messages, features, user_id, telegram_context, chat_id, topic_id,
                     cancel_event=cancel_event,
+                    extra_request_context=extra_request_context,
                 )
 
                 # Save Holmes response with tool calls and metadata to conversation
@@ -1592,6 +1607,7 @@ class HolmesService:
         topic_id: int = 0,
         cancel_event: Optional[threading.Event] = None,
         tcll: Optional[ToolCallingLLM] = None,
+        extra_request_context: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, LLMResult]:
         """Non-streaming chat with Holmes, returning full result for memory storage."""
         loop = asyncio.get_event_loop()
@@ -1614,7 +1630,7 @@ class HolmesService:
                     _holmes_executor,
                     lambda: llm.call(
                         messages=messages,
-                        request_context=_request_context(user_id, chat_id, topic_id),
+                        request_context=_request_context(user_id, chat_id, topic_id, extra=extra_request_context),
                         approval_callback=approval_callback,
                         cancel_event=cancel_event,
                     ),
@@ -1631,7 +1647,7 @@ class HolmesService:
                     _holmes_executor,
                     lambda: llm.call(
                         messages=messages,
-                        request_context=_request_context(user_id, chat_id, topic_id),
+                        request_context=_request_context(user_id, chat_id, topic_id, extra=extra_request_context),
                         cancel_event=cancel_event,
                     ),
                 )
