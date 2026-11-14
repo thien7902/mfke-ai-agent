@@ -1465,7 +1465,6 @@ J() {
 
 J 01_shoot_yaml   env KUBECONFIG="$KCFG" kubectl --context=garden --request-timeout=20s get shoot "$SHOOT" -n "$GNS" -o yaml
 J 02_pods_wide    env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get pods -n "$NS" -o wide
-J 03_pods_yaml    env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get pods -n "$NS" -o yaml
 J 04_events       env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get events -n "$NS" --sort-by=.lastTimestamp
 J 05_mr_yaml      env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get managedresource -n "$NS" -o yaml
 J 06_machine_yaml env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get machine -n "$NS" -o yaml
@@ -1550,8 +1549,7 @@ cat_file() { local f="$TMP/$1"; [ -s "$f" ] && { cat "$f"; echo ""; } || echo "(
 
 hdr "1. SHOOT (garden, full yaml)";            cat_file 01_shoot_yaml
 hdr "2. PODS (wide)";                          cat_file 02_pods_wide
-hdr "3. PODS (full yaml)";                     cat_file 03_pods_yaml
-hdr "4. EVENTS";                               cat_file 04_events
+hdr "3. EVENTS";                               cat_file 04_events
 hdr "5. COMPONENT LOGS (per-container, tail ${LINES})"
 for f in "$TMP"/20_dep_*; do
   case "$f" in *.rc) continue;; esac
@@ -1650,15 +1648,15 @@ exit 0
 
         system_prompt = (
             "Bạn là chuyên gia Kubernetes/Gardener control-plane. "
-            "Hãy phân tích snapshot control-plane được cung cấp và đưa ra phân tích nguyên nhân gốc rễ. "
-            "Trả lời HOÀN TOÀN bằng tiếng Việt. "
-            "Cấu trúc câu trả lời như sau:\n"
-            "  1. Trạng thái cluster: healthy / degraded / broken.\n"
-            "  2. Tín hiệu quan trọng: pod bất thường, events, log lines, trạng thái etcd.\n"
-            "  3. Nguyên nhân gốc rễ xếp hạng theo độ tin cậy kèm bằng chứng từ snapshot.\n"
-            "  4. Các bước điều tra hoặc khắc phục tiếp theo.\n"
-            "Trích dẫn trực tiếp các dòng log/event từ snapshot để làm bằng chứng. "
-            "Không hỏi thêm thông tin."
+            "Phân tích snapshot và đưa ra phân tích nguyên nhân gốc rễ. "
+            "Trả lời HOÀN TOÀN bằng tiếng Việt, SÚC TÍCH, dưới 4000 ký tự. "
+            "Chỉ nêu các mục sau, KHÔNG lời dẫn, KHÔNG lặp lại câu hỏi:\n"
+            "  1. Trạng thái: healthy / degraded / broken — 1 dòng.\n"
+            "  2. Tín hiệu quan trọng: bullet ngắn về pod/event/log/etcd bất thường.\n"
+            "  3. Nguyên nhân gốc rễ xếp hạng (1-3): bằng chứng trích xuất trực tiếp từ snapshot.\n"
+            "  4. Hành động tiếp theo: bullet ngắn.\n"
+            "Trích dòng log/event quan trọng trực tiếp (`...`). "
+            "Không câu phụ, không giới hạn trang, không hỏi thêm."
         )
 
         # Build message list for the LLM. Only send the snapshot directly —
@@ -1689,8 +1687,9 @@ exit 0
                 "model": llm_model,
                 "messages": lm_messages,
                 "stream": False,
-                "timeout": 180,
+                "timeout": 120,
                 "tool_choice": "none",
+                "max_tokens": 1500,
             }
             if llm_api_key:
                 litellm_kwargs["api_key"] = llm_api_key
