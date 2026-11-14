@@ -99,13 +99,23 @@ def test_force_close_litellm_clients_handles_missing_cache(monkeypatch):
     assert ta._force_close_litellm_clients() == 0
 
 
-def test_force_close_litellm_clients_closes_cached_handlers(monkeypatch):
-    """When httpx clients are cached, force-close iterates and calls close()
-    on each sync HTTPHandler. Async handlers are skipped (can't await from
-    sync context)."""
+def test_force_close_litellm_clients_closes_sync_handlers_only(monkeypatch):
+    """force-close iterates in_memory_llm_clients_cache and calls close()
+    on every entry whose close() is a sync (non-coroutine) function. Async
+    handlers (close() is `async def`) are skipped — can't await from sync
+    context.
+
+    IMPORTANT: detection MUST be by close() signature, NOT by cache-key
+    substring. The real sync OpenAI SDK client's cache key is
+    "hashed_api_key=...,is_async=False,..." — it contains the substring
+    "async_" from "is_async=False". A substring-based skip would
+    accidentally skip the very client Holmes is using, leaving recv()
+    blocked forever — that was the v2.4.6 regression.
+    """
+    import asyncio
     import litellm
 
-    class _FakeHandler:
+    class _SyncHandler:
         def __init__(self, name):
             self.name = name
             self.closed = False
@@ -113,20 +123,60 @@ def test_force_close_litellm_clients_closes_cached_handlers(monkeypatch):
         def close(self):
             self.closed = True
 
-    sync1 = _FakeHandler("sync1")
-    sync2 = _FakeHandler("sync2")
-    async_h = _FakeHandler("async")  # _naïme doesn't have async_ but we'll
-    # Patch the cache_dict attr with a custom dict.
+    class _AsyncHandler:
+        def __init__(self, name):
+            self.name = name
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    sync_h = _SyncHandler("sync_httpx")
+    openai_sdk = _SyncHandler("openai-sdk-real-cache-key")
+    async_h = _AsyncHandler("async_httpx")
 
     class _FakeCache:
+        # The OpenAI SDK key naturally contains "is_async=False" — must
+        # NOT be filtered out by an "async_" substring check.
         cache_dict = {
-            "httpx_client_openai_timeout_600": sync1,
-            "httpx_clienttimeout_600.0vertex_ai": sync2,
-            "async_httpx_clientvertex_ai": async_h,
+            "hashed_api_key=abc,is_async=False,timeout=600": openai_sdk,
+            "httpx_clienttimeout_600.0vertex_ai": sync_h,
+            "async_httpx_clientvertex_ai": async_h,  # genuinely async
         }
 
     monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", _FakeCache(), raising=False)
     closed = ta._force_close_litellm_clients()
-    assert closed == 2  # only sync handlers
-    assert sync1.closed and sync2.closed
-    assert not async_h.closed
+    # Both sync handlers closed — including the OpenAI SDK one whose key
+    # contains "is_async=False". Async handler skipped.
+    assert closed == 2
+    assert sync_h.closed
+    assert openai_sdk.closed
+    assert not async_h.closed  # coroutine close — skipped
+
+
+def test_force_close_litellm_clients_handles_inner_client_close(monkeypatch):
+    """Some cached wrappers expose .client.close (raw HTTPHandler holding
+    an httpx.Client) rather than a top-level close(). Fallback path
+    covers both shapes."""
+    import litellm
+
+    class _InnerClient:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class _HTTPHandler:
+        def __init__(self):
+            self.client = _InnerClient()
+
+    handler = _HTTPHandler()
+
+    class _FakeCache:
+        cache_dict = {"httpx_clienttimeout_600": handler}
+
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", _FakeCache(), raising=False)
+    closed = ta._force_close_litellm_clients()
+    assert closed == 1
+    assert handler.client.closed

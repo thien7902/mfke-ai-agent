@@ -34,6 +34,7 @@ running `next(stream_iter)` blocks on `recv()` similarly, so the
 same injection works there.
 """
 import ctypes
+import inspect
 import threading
 from typing import Optional
 
@@ -174,16 +175,23 @@ def _force_close_litellm_clients() -> int:
     if not cache_dict:
         return 0
     # Iterate over a snapshot — close() may mutate cache (TTL eviction).
+    #
+    # Detection by cache_key substring ("async_") is WRONG: the sync OpenAI
+    # SDK client's cache key is "hashed_api_key=...,is_async=False,..." which
+    # naturally contains the substring "async_" — so a substring filter
+    # accidentally skips the very client Holmes is actively using. Skip by
+    # inspecting the value's close() method instead: async clients have a
+    # coroutine close() (can't await from sync context); sync clients
+    # (OpenAI / AzureOpenAI / HTTPHandler) have a regular function close().
     for cache_key, handler in list(cache_dict.items()):
-        # Skip async handlers — they have a coroutine close that can't
-        # be synchronously awaited from here, and we only target sync
-        # HTTPHandlers (which is what Holmes uses).
-        if "async_" in str(cache_key):
-            continue
-        close = getattr(handler, "close", None) or getattr(
-            getattr(handler, "client", None), "close", None
-        )
+        close = getattr(handler, "close", None)
         if close is None or not callable(close):
+            # Fall back to inner .client.close (used by raw HTTPHandler wrappers).
+            inner = getattr(handler, "client", None)
+            close = getattr(inner, "close", None)
+        if close is None or not callable(close):
+            continue
+        if inspect.iscoroutinefunction(close):
             continue
         try:
             close()
