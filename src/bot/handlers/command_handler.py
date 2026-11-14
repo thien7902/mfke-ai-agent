@@ -1587,7 +1587,7 @@ exit 0
         snapshot_script = snapshot_script.replace("__CLUSTER_ID__", cluster_id)
 
         import signal
-        TIMEOUT_SECONDS = 120
+        TIMEOUT_SECONDS = 30
 
         try:
             proc = await asyncio.create_subprocess_shell(
