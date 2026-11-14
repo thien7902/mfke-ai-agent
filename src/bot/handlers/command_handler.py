@@ -1681,20 +1681,23 @@ exit 0
             },
         ]
 
+        try:
+            await ack.delete()
+        except Exception:
+            pass
+
         response_msg = await context.bot.send_message(
             chat_id=chat_id,
             text="🤔 Đang phân tích snapshot...",
             message_thread_id=topic_id or None,
         )
         _set_investigation_status(chat_id, topic_id, "🔍 Đang phân tích snapshot...")
-        full_response = ""
-        last_edit_len = 0
 
         try:
             litellm_kwargs: dict = {
                 "model": llm_model,
                 "messages": lm_messages,
-                "stream": True,
+                "stream": False,
                 "timeout": 120,
                 "tool_choice": "none",
             }
@@ -1703,20 +1706,8 @@ exit 0
             if llm_api_base:
                 litellm_kwargs["api_base"] = llm_api_base
 
-            stream_resp = await litellm.acompletion(**litellm_kwargs)
-            async for chunk in stream_resp:
-                try:
-                    delta = chunk.choices[0].delta.content or ""
-                except Exception:
-                    continue
-                if delta:
-                    full_response += delta
-                    if len(full_response) - last_edit_len >= 100:
-                        last_edit_len = len(full_response)
-                        try:
-                            await response_msg.edit_text(full_response + "▌")
-                        except Exception:
-                            pass
+            completion = await litellm.acompletion(**litellm_kwargs)
+            full_response = completion.choices[0].message.content or ""
         except Exception as e:
             logger.error("/check analysis failed", user_id=user.id, error=str(e))
             _clear_investigation(chat_id, topic_id)
