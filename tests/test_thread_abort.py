@@ -88,3 +88,45 @@ def test_re_register_replaces_previous_entry():
     t2 = ta._THREADS.get("dup")
     assert t1 is t2  # same Thread object — overwrite
     ta.unregister("dup")
+
+
+def test_force_close_litellm_clients_handles_missing_cache(monkeypatch):
+    """_force_close_litellm_clients is safe when litellm / cache / dict is
+    absent. Returns 0, doesn't raise."""
+    # Force litellm module attribute to None.
+    import litellm
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", None, raising=False)
+    assert ta._force_close_litellm_clients() == 0
+
+
+def test_force_close_litellm_clients_closes_cached_handlers(monkeypatch):
+    """When httpx clients are cached, force-close iterates and calls close()
+    on each sync HTTPHandler. Async handlers are skipped (can't await from
+    sync context)."""
+    import litellm
+
+    class _FakeHandler:
+        def __init__(self, name):
+            self.name = name
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    sync1 = _FakeHandler("sync1")
+    sync2 = _FakeHandler("sync2")
+    async_h = _FakeHandler("async")  # _naïme doesn't have async_ but we'll
+    # Patch the cache_dict attr with a custom dict.
+
+    class _FakeCache:
+        cache_dict = {
+            "httpx_client_openai_timeout_600": sync1,
+            "httpx_clienttimeout_600.0vertex_ai": sync2,
+            "async_httpx_clientvertex_ai": async_h,
+        }
+
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", _FakeCache(), raising=False)
+    closed = ta._force_close_litellm_clients()
+    assert closed == 2  # only sync handlers
+    assert sync1.closed and sync2.closed
+    assert not async_h.closed

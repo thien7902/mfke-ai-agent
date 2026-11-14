@@ -71,24 +71,35 @@ def unregister(key) -> None:
 
 def abort(key) -> bool:
     """Inject `KeyboardInterrupt` into the worker thread registered for
-    `key`, if any. Returns True on successful injection.
+    `key`, if any, AND force-close every cached litellm httpx.Client so
+    the worker's blocked recv() syscall returns immediately.
 
-    `PyThreadState_SetAsyncExc(tid, exc_type)` raises `exc_type` in the
-    thread identified by `tid`. The API leaves the exception "pending"
-    on the target thread — it'll surface at the next bytecode boundary.
-    Passing `None` as the second arg CLEARs a pending async exception
-    (used as a safety belt after a failed raise), followed by re-trying
-    the raise; this is the recommended pattern from CPython's docs.
+    Returns True on successful thread injection. The litellm client
+    force-close runs unconditionally — even if the worker key is gone,
+    a hung litellm call on any worker benefits from the socket
+    shutdown, and `close()` is a no-op on already-closed handlers.
 
-    Multiple concurrent calls are safe in the sense that the worker
-    thread will receive at most one `KeyboardInterrupt` (the second
-    call's pending exc overrides the first), but /stop should be
-    idempotent at the caller level anyway.
+    Why both: `PyThreadState_SetAsyncExc` only fires at the next Python
+    bytecode boundary — there is NO bytecode boundary inside
+    `socket.recv()`, which is a C-level blocking syscall. So the
+    injected `KeyboardInterrupt` can sit pending for up to the litellm
+    HTTP_TIMEOUT (default 600s) while the worker is stuck in recv().
+    Force-closing the cached httpx.Client (close() shuts the socket)
+    makes the syscall return immediately with ConnectionRefused, which
+    httpx translates into an exception and propagates up through
+    litellm → Holmes → asyncio.run_in_executor — before the pending
+    KeyboardInterrupt ever needs to fire.
     """
+    closed = _force_close_litellm_clients()
+    if closed:
+        logger.info("litellm_clients_force_closed", count=closed, key=str(key))
+
     with _LOCK:
         thread = _THREADS.get(key)
     if thread is None or not thread.is_alive():
-        return False
+        # The litellm close may still have freed the worker — return True
+        # if we closed anything so the caller knows an abort signal was sent.
+        return closed > 0
     tid = thread.ident
     if tid is None:
         return False
@@ -110,7 +121,7 @@ def abort(key) -> bool:
         return False
     if rc == 0:
         # Invalid thread id — thread exited concurrently. Not an error.
-        return False
+        return closed > 0
     if rc > 1:
         # rc > 1 means multiple thread states were affected — a sign of
         # corrupt state. The CPython docs say to clear the pending
@@ -131,3 +142,54 @@ def abort(key) -> bool:
         key=str(key), tid=tid, name=thread.name,
     )
     return True
+
+
+def _force_close_litellm_clients() -> int:
+    """Close every cached httpx.Client in litellm's module-level cache.
+    Returns count of clients closed (diagnostic; not load-bearing).
+
+    httpx.Client.close() synchronously shuts underlying sockets: the
+    blocked recv() in the worker thread wakes up almost immediately
+    and raises ConnectionClosed -> httpx raises -> litellm surfaces ->
+    Holmes unwinds. This is the ONLY mechanism that breaches the C
+    syscall boundary — `PyThreadState_SetAsyncExc` won't fire until
+    the next Python bytecode boundary, and there's none inside
+    `socket.recv()`.
+
+    Side effect: every concurrent litellm call in the bot loses its
+    httpx.Client connection. litellm's `_get_httpx_client` lazily
+    reconstructs on the next call, so subsequent chats re-establish
+    TCP/TLS without impact.
+    """
+    closed = 0
+    try:
+        import litellm  # local import — keeps top-level import-time light
+    except Exception as e:
+        logger.warning("litellm_unavailable_for_force_close", error=str(e))
+        return 0
+    cache = getattr(litellm, "in_memory_llm_clients_cache", None)
+    if cache is None:
+        return 0
+    cache_dict = getattr(cache, "cache_dict", None)
+    if not cache_dict:
+        return 0
+    # Iterate over a snapshot — close() may mutate cache (TTL eviction).
+    for cache_key, handler in list(cache_dict.items()):
+        # Skip async handlers — they have a coroutine close that can't
+        # be synchronously awaited from here, and we only target sync
+        # HTTPHandlers (which is what Holmes uses).
+        if "async_" in str(cache_key):
+            continue
+        close = getattr(handler, "close", None) or getattr(
+            getattr(handler, "client", None), "close", None
+        )
+        if close is None or not callable(close):
+            continue
+        try:
+            close()
+            closed += 1
+        except Exception as e:
+            logger.warning(
+                "litellm_client_close_failed", cache_key=cache_key, error=str(e),
+            )
+    return closed
