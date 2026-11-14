@@ -1646,7 +1646,6 @@ exit 0
         # the new characters. Once streaming finishes, send a real message to
         # persist the final response.
         import litellm
-        import time as _time
 
         llm_cfg = self.holmes._get_llm_config()
         llm_model = llm_cfg["model"]
@@ -1693,15 +1692,12 @@ exit 0
             message_thread_id=topic_id or None,
         )
         _set_investigation_status(chat_id, topic_id, "🔍 Đang phân tích snapshot...")
-        full_response = ""
-        last_edit_len = 0
-        last_edit_ts = _time.time()
 
         try:
             litellm_kwargs: dict = {
                 "model": llm_model,
                 "messages": lm_messages,
-                "stream": True,
+                "stream": False,
                 "timeout": 180,
                 "tool_choice": "none",
             }
@@ -1710,26 +1706,8 @@ exit 0
             if llm_api_base:
                 litellm_kwargs["api_base"] = llm_api_base
 
-            # Throttle: only edit_message_text every 1.5s OR when 300+
-            # new chars arrived. Telegram tolerates ~1 edit/sec/message;
-            # this keeps us comfortably under that while still streaming.
-            stream_resp = await litellm.acompletion(**litellm_kwargs)
-            async for chunk in stream_resp:
-                try:
-                    delta = chunk.choices[0].delta.content or ""
-                except Exception:
-                    continue
-                if delta:
-                    full_response += delta
-                    now = _time.time()
-                    new_chars = len(full_response) - last_edit_len
-                    if now - last_edit_ts >= 1.5 and new_chars >= 50:
-                        last_edit_len = len(full_response)
-                        last_edit_ts = now
-                        try:
-                            await response_msg.edit_text(full_response[:3900] + "▌")
-                        except Exception:
-                            pass
+            completion = await litellm.acompletion(**litellm_kwargs)
+            full_response = completion.choices[0].message.content or ""
         except Exception as e:
             logger.error("/check analysis failed", user_id=user.id, error=str(e))
             _clear_investigation(chat_id, topic_id)
