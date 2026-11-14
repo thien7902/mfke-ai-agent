@@ -1656,7 +1656,17 @@ exit 0
             "  3. Nguyên nhân gốc rễ xếp hạng (1-3): bằng chứng trích xuất trực tiếp từ snapshot.\n"
             "  4. Hành động tiếp theo: bullet ngắn.\n"
             "Trích dòng log/event quan trọng trực tiếp (`...`). "
-            "Không câu phụ, không giới hạn trang, không hỏi thêm."
+            "Không câu phụ, không giới hạn trang, không hỏi thêm.\n\n"
+            "BỎ QUA các log noise được biết là bình thường:\n"
+            "- etcd `tls: bad certificate` / `rejected connection from 127.0.0.1` "
+            "(health-probe nội bộ của backup-restore).\n"
+            "- `etcd read-only range request ... took too long` dưới 500ms.\n"
+            "- openvpn `Linux route add command failed: ... already exists` "
+            "nếu sau đó có `Initialization Sequence Completed`.\n"
+            "- cluster-autoscaler `Scale down status: scaleDownInCooldown=true` "
+            "hoặc `node group min size reached`.\n"
+            "- Gardener webhook `RemediatedWebhooks` chỉ đáng chú ý nếu "
+            "`HibernationPossible=False` (khiến maintenance/hibernate bị chặn)."
         )
 
         # Build message list for the LLM. Only send the snapshot directly —
