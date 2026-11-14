@@ -1641,7 +1641,14 @@ exit 0
         # with zero tools registered, so the LLM cannot loop regardless of what
         # it wants to do. The snapshot is passed as the last user message; prior
         # conversation history is included so the analysis lands in context.
+        #
+        # Streaming uses Telegram's native "live draft" (sendMessageDraft) API:
+        # we ping incremental text with the same draft_id so Telegram animates
+        # the new characters. Once streaming finishes, send a real message to
+        # persist the final response.
         import litellm
+        import time as _time
+        import random as _random
 
         llm_cfg = self.holmes._get_llm_config()
         llm_model = llm_cfg["model"]
@@ -1670,10 +1677,19 @@ exit 0
             "content": f"Phân tích snapshot control-plane cho cluster `{cluster_id}` ở trên.",
         })
 
-        response_msg = await ack.edit_text("🤔 Đang phân tích snapshot...")
+        try:
+            await ack.delete()
+        except Exception:
+            pass
+
+        # draft_id must be unique per stream and non-zero. Telegram animates
+        # drafts that share the same draft_id, so we fix it for the whole turn.
+        draft_id = _random.randint(1, 2_000_000_000)
+
         _set_investigation_status(chat_id, topic_id, "🔍 Đang phân tích snapshot...")
         full_response = ""
-        last_edit_len = 0
+        last_draft_len = 0
+        last_draft_ts = 0.0
 
         try:
             litellm_kwargs: dict = {
@@ -1688,6 +1704,17 @@ exit 0
             if llm_api_base:
                 litellm_kwargs["api_base"] = llm_api_base
 
+            # Initial empty draft — shows "Thinking..." placeholder on the client.
+            try:
+                await context.bot.send_message_draft(
+                    chat_id=chat_id,
+                    draft_id=draft_id,
+                    text="",
+                    message_thread_id=topic_id or None,
+                )
+            except Exception as e:
+                logger.warning("/check send_message_draft init failed", error=str(e))
+
             stream_resp = await litellm.acompletion(**litellm_kwargs)
             async for chunk in stream_resp:
                 try:
@@ -1696,16 +1723,34 @@ exit 0
                     continue
                 if delta:
                     full_response += delta
-                    if len(full_response) - last_edit_len >= 100:
-                        last_edit_len = len(full_response)
+                    # Telegram rate limit: 20 calls / 5s / peer. Throttle to
+                    # ~4 updates/sec max, with a 100-char minimum batch.
+                    now = _time.time()
+                    ready = (len(full_response) - last_draft_len >= 100)
+                    throttled = (now - last_draft_ts) < 0.25
+                    if ready and not throttled:
+                        last_draft_len = len(full_response)
+                        last_draft_ts = now
                         try:
-                            await response_msg.edit_text(full_response + "▌")
+                            await context.bot.send_message_draft(
+                                chat_id=chat_id,
+                                draft_id=draft_id,
+                                text=full_response,
+                                message_thread_id=topic_id or None,
+                            )
                         except Exception:
                             pass
         except Exception as e:
             logger.error("/check analysis failed", user_id=user.id, error=str(e))
             _clear_investigation(chat_id, topic_id)
-            await response_msg.edit_text(f"❌ /check analysis failed: {e}")
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ /check analysis failed: {e}",
+                    message_thread_id=topic_id or None,
+                )
+            except Exception:
+                pass
             return
 
         _clear_investigation(chat_id, topic_id)
@@ -1722,16 +1767,10 @@ exit 0
             full_response = "(no analysis)"
 
         try:
-            await edit_or_send_rich(
-                context.bot,
-                chat_id=chat_id,
-                message=response_msg,
-                text=full_response,
+            # Final send_message persists the response; the draft disappears.
+            await send_long_message(
+                context.bot, chat_id, full_response,
                 message_thread_id=topic_id or None,
             )
         except Exception as e:
-            logger.warning("/check rich delivery failed, retrying plain", user_id=user.id, error=str(e))
-            try:
-                await send_long_message(context.bot, chat_id, full_response, message_thread_id=topic_id or None)
-            except Exception as e2:
-                logger.error("/check delivery failed entirely", user_id=user.id, error=str(e2))
+            logger.error("/check delivery failed entirely", user_id=user.id, error=str(e))

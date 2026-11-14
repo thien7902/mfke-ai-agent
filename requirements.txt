@@ -1,5 +1,5 @@
 # Core dependencies
-python-telegram-bot==21.4
+python-telegram-bot==22.8
 pymongo==4.8.0
 python-dotenv==1.0.1
 
