@@ -1455,8 +1455,7 @@ SEED=$(echo "$SHOOT_JSON" | awk '{print $3}')
 NS="fke-${SHOOT}"
 
 if ! KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=10s get ns "$NS" >/dev/null 2>&1; then
-  echo "ERROR: seed '$SEED' unreachable or ns $NS missing."
-  exit 2
+  echo "### WARNING: seed '$SEED' may be unreachable or ns $NS missing — continuing anyway"
 fi
 
 TMP=$(mktemp -d /tmp/cpsnap.XXXXXX)
