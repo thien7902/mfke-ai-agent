@@ -1756,16 +1756,16 @@ exit 0
                 "timeout": 120,
                 "tool_choice": "none",
                 "max_tokens": 1500,
+                # Disable thinking for vLLM OpenAI-compatible Qwen/Llama
+                # thinking templates. No-op on endpoints that don't read it.
+                # We DID try litellm's top-level `thinking_budget=0` for Gemini
+                # too, but at least one OpenAI-compatible endpoint rejected
+                # the request with "Bad request", so we keep the disable
+                # scoped to extra_body only.
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
             }
-            # Disable thinking/reasoning where the endpoint supports it:
-            # - vLLM OpenAI-compatible (Qwen/Llama thinking templates):
-            #   `extra_body.chat_template_kwargs.enable_thinking=false`
-            # - Gemini 2.5 Flash via litellm: `thinking_budget=0`
-            # Both are no-ops for endpoints that don't recognize them.
-            litellm_kwargs["extra_body"] = {
-                "chat_template_kwargs": {"enable_thinking": False},
-            }
-            litellm_kwargs["thinking_budget"] = 0
             if llm_api_key:
                 litellm_kwargs["api_key"] = llm_api_key
             if llm_api_base:
