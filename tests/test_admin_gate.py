@@ -1065,7 +1065,6 @@ def _patch_outbox(monkeypatch, path):
 @pytest.mark.parametrize("cmd", [
     'python3 -c "print(\'hello\')"',
     'python3 -c "import requests; r=requests.get(\'https://k8s/api/v1/pods\')"',
-    'python3 /tmp/x.py',
     'python3 -m http.server',
     'python3 -c "import os; os.chdir(\'/tmp\'); print(os.getcwd())"',
 ])
@@ -1134,6 +1133,70 @@ def test_hard_block_python_no_outbox_beats_admin(monkeypatch):
     r = tool.invoke({"command": 'python3 -c "print(1)"'}, ctx)
     assert r.status.value == "error"
     assert "hard_block_python_no_outbox" in r.error
+    assert ctx.user_approved is False
+
+
+# ---------- Pattern I: python3 <file>.py hard-block ----------
+
+@pytest.mark.parametrize("cmd", [
+    "python3 x.py",
+    "python3 outbox/build_xlsx.py",
+    "python3 /tmp/script.py",
+    "python3 /root/.holmes/outbox/build.py",
+    "python3 ./x.py",
+    "python3 -O x.py",  # has flags before arg
+    "python3 -B outbox/x.py",
+    "python /root/.holmes/outbox/generate_report.py",
+])
+def test_hard_block_python_file_run_blocks(monkeypatch, cmd):
+    """Pattern I: any `python3 <file>.py` is hard-blocked. The source
+    code in the file is not visible in the bash command so Pattern G
+    cannot scan it. Block totally — admins too."""
+    _patch_outbox(monkeypatch, "/root/.holmes/outbox")
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_python_file_run" in r.error
+    assert tool.last_params is None
+
+
+@pytest.mark.parametrize("cmd", [
+    'python3 -c "print(1)"',  # inline form passes Pattern I
+    'python3 -c "open(\'/root/.holmes/outbox/x.csv\', \'w\').write(\'hi\')"',
+    'python3 -m pip list',  # read-only pip
+    'pip3 list',
+    'echo hello',
+    'kubectl get pods',
+])
+def test_hard_block_python_file_run_non_py_passes(monkeypatch, cmd):
+    """Pattern I matches only when the first positional arg ends
+    with `.py`. Inline `-c`, pip list, and non-python commands pass
+    through Pattern I (other patterns may still block)."""
+    _patch_outbox(monkeypatch, "/root/.holmes/outbox")
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert "hard_block_python_file_run" not in (r.error or "")
+
+
+def test_hard_block_python_file_run_beats_admin(monkeypatch):
+    """Admins too cannot run .py script files."""
+    _patch_outbox(monkeypatch, "/root/.holmes/outbox")
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": "python3 /root/.holmes/outbox/build.py"}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_python_file_run" in r.error
     assert ctx.user_approved is False
 
 
