@@ -1633,116 +1633,83 @@ exit 0
         except Exception as save_err:
             logger.warning("/check conversation save failed", error=str(save_err))
 
-        # ── Phase 2: Holmes analyzes the snapshot (no tool calls) ──────────
-        _ANALYZE_RULE = (
-            "RULE: A control-plane snapshot has just been collected and is the last message "
-            "in the conversation. Analyze it immediately. Do NOT call any tool. "
-            "In your response:\n"
+        # ── Phase 2: LLM analyzes the snapshot directly (no tool executor) ──
+        # We call litellm.acompletion directly — same backend Holmes uses but
+        # with zero tools registered, so the LLM cannot loop regardless of what
+        # it wants to do. The snapshot is passed as the last user message; prior
+        # conversation history is included so the analysis lands in context.
+        import litellm
+
+        llm_cfg = self.holmes._get_llm_config()
+        llm_model = llm_cfg["model"]
+        llm_api_key = llm_cfg.get("api_key")
+        llm_api_base = llm_cfg.get("api_base")
+
+        system_prompt = (
+            "You are a Kubernetes/Gardener control-plane expert. "
+            "Analyze the control-plane snapshot provided and produce a root-cause analysis. "
+            "Structure your response as:\n"
             "  1. Cluster state: healthy / degraded / broken.\n"
             "  2. Key signals: suspicious pods, events, log lines, etcd status.\n"
             "  3. Root cause(s) ranked by confidence with supporting evidence.\n"
             "  4. Recommended next steps.\n"
-            "Be concise and quote exact lines from the snapshot."
-        )
-        analysis_prompt = (
-            f"Analyze the control-plane snapshot for cluster `{cluster_id}` "
-            f"that is now in the conversation. Do not call any tool."
+            "Be concise and quote exact lines from the snapshot. "
+            "Do not ask for more information."
         )
 
-        try:
-            from holmes.core.tool_calling_llm import LLMInterruptedError as _LLMInterrupted
-        except Exception:
-            _LLMInterrupted = ()
+        # Build message list: existing conversation history + analysis request.
+        lm_messages = [{"role": "system", "content": system_prompt}]
+        for m in conversation.messages:
+            lm_messages.append({"role": m.role, "content": m.content or ""})
+        lm_messages.append({
+            "role": "user",
+            "content": f"Analyze the control-plane snapshot for cluster `{cluster_id}` above.",
+        })
 
         response_msg = await ack.edit_text("🤔 Analyzing snapshot...")
-        status_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text="📍 **Status**: 🔍 Analyzing snapshot...",
-            message_thread_id=topic_id or None,
-            parse_mode="Markdown",
-        )
-
         _set_investigation_status(chat_id, topic_id, "🔍 Analyzing snapshot...")
-        cancel_event = threading.Event()
         full_response = ""
-        stream_completed = False
 
-        async def _process_stream(async_gen):
-            nonlocal full_response, stream_completed
-            async for event in async_gen:
-                event_type = event.get("type", "unknown")
-                if event_type == "content":
-                    full_response += event.get("content", "")
-                    _set_investigation_status(chat_id, topic_id, response_preview=full_response[-300:])
+        try:
+            litellm_kwargs: dict = {
+                "model": llm_model,
+                "messages": lm_messages,
+                "stream": True,
+                "timeout": 300,
+            }
+            if llm_api_key:
+                litellm_kwargs["api_key"] = llm_api_key
+            if llm_api_base:
+                litellm_kwargs["api_base"] = llm_api_base
+
+            stream_resp = await litellm.acompletion(**litellm_kwargs)
+            async for chunk in stream_resp:
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    full_response += delta
                     if len(full_response) % 100 == 0:
                         try:
                             await response_msg.edit_text(full_response + "▌")
                         except Exception:
                             pass
-                elif event_type == "tool_call":
-                    tool_name = event.get("tool_name", "unknown")
-                    try:
-                        await status_msg.edit_text(f"📍 **Status**: 🔧 Using {tool_name}...", parse_mode="Markdown")
-                    except Exception:
-                        pass
-                elif event_type == "tool_result":
-                    tool_name = event.get("tool_name", "unknown")
-                    try:
-                        await status_msg.edit_text(f"📍 **Status**: ✅ Completed {tool_name}", parse_mode="Markdown")
-                    except Exception:
-                        pass
-            stream_completed = True
-
-        try:
-            async_gen = await self.holmes.chat(
-                user_id=user.id,
-                user_message=analysis_prompt,
-                conversation=conversation,
-                user_permissions=user_model.permissions,
-                stream=True,
-                telegram_context=context,
-                chat_id=chat_id,
-                topic_id=topic_id,
-                cancel_event=cancel_event,
-                extra_prompt_additions=_ANALYZE_RULE,
-            )
-            try:
-                await asyncio.wait_for(_process_stream(async_gen), timeout=300.0)
-            except asyncio.TimeoutError:
-                logger.warning("/check analysis timed out", user_id=user.id)
-                try:
-                    await status_msg.edit_text("📍 **Status**: ⏱️ Timed out", parse_mode="Markdown")
-                except Exception:
-                    pass
-                full_response += "\n\n⚠️ Analysis timed out after 5 minutes."
-            except _LLMInterrupted:
-                cancel_event.set()
         except Exception as e:
             logger.error("/check analysis failed", user_id=user.id, error=str(e))
             _clear_investigation(chat_id, topic_id)
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
             await response_msg.edit_text(f"❌ /check analysis failed: {e}")
             return
 
-        if cancel_event.is_set() and "🛑" not in full_response:
-            full_response = (full_response or "") + "\n\n🛑 Stopped by user."
-
         _clear_investigation(chat_id, topic_id)
-        await conv_service.save_conversation(conversation)
 
+        # Persist the analysis into conversation for follow-up chats.
+        from src.bot.models.conversation import Message as _Msg
+        conversation.add_message(_Msg(role="assistant", content=full_response))
         try:
-            if stream_completed and not cancel_event.is_set():
-                await status_msg.edit_text("📍 **Status**: ✅ Done", parse_mode="Markdown")
-            elif cancel_event.is_set():
-                await status_msg.edit_text("📍 **Status**: 🛑 Stopped", parse_mode="Markdown")
-        except Exception:
-            pass
+            await conv_service.save_conversation(conversation)
+        except Exception as save_err:
+            logger.warning("/check analysis save failed", error=str(save_err))
 
         if not full_response.strip():
-            full_response = "(no analysis from Holmes)"
+            full_response = "(no analysis)"
 
         try:
             await edit_or_send_rich(
