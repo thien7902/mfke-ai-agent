@@ -1757,13 +1757,48 @@ exit 0
                 "tool_choice": "none",
                 "max_tokens": 1500,
             }
+            # Disable thinking/reasoning where the endpoint supports it:
+            # - vLLM OpenAI-compatible (Qwen/Llama thinking templates):
+            #   `extra_body.chat_template_kwargs.enable_thinking=false`
+            # - Gemini 2.5 Flash via litellm: `thinking_budget=0`
+            # Both are no-ops for endpoints that don't recognize them.
+            litellm_kwargs["extra_body"] = {
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+            litellm_kwargs["thinking_budget"] = 0
             if llm_api_key:
                 litellm_kwargs["api_key"] = llm_api_key
             if llm_api_base:
                 litellm_kwargs["api_base"] = llm_api_base
 
             completion = await litellm.acompletion(**litellm_kwargs)
-            full_response = completion.choices[0].message.content or ""
+            msg = completion.choices[0].message
+            # Some OpenAI-compatible reasoning models (deepseek-R1,
+            # qwen-thinking, gemini thinking) put the answer in
+            # `reasoning_content` and leave `content` empty. Fall back to
+            # reasoning_content so /check does not return "(no analysis)".
+            full_response = (
+                getattr(msg, "content", None)
+                or getattr(msg, "reasoning_content", None)
+                or (msg.model_dump().get("reasoning_content") if hasattr(msg, "model_dump") else None)
+                or ""
+            )
+            finish_reason = getattr(completion.choices[0], "finish_reason", "?")
+            logger.info(
+                "/check analysis completed",
+                user_id=user.id,
+                content_len=len(full_response),
+                finish_reason=finish_reason,
+            )
+            if not full_response.strip():
+                # Surface what we DO have so we can diagnose (e.g. tool_calls,
+                # refusal, content_filter).
+                logger.warning(
+                    "/check empty_response",
+                    user_id=user.id,
+                    finish_reason=finish_reason,
+                    raw=str(msg)[:1000],
+                )
         except Exception as e:
             logger.error("/check analysis failed", user_id=user.id, error=str(e))
             _clear_investigation(chat_id, topic_id)
