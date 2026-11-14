@@ -1649,15 +1649,16 @@ exit 0
         llm_api_base = llm_cfg.get("api_base")
 
         system_prompt = (
-            "You are a Kubernetes/Gardener control-plane expert. "
-            "Analyze the control-plane snapshot provided and produce a root-cause analysis. "
-            "Structure your response as:\n"
-            "  1. Cluster state: healthy / degraded / broken.\n"
-            "  2. Key signals: suspicious pods, events, log lines, etcd status.\n"
-            "  3. Root cause(s) ranked by confidence with supporting evidence.\n"
-            "  4. Recommended next steps.\n"
-            "Be concise and quote exact lines from the snapshot. "
-            "Do not ask for more information."
+            "Bạn là chuyên gia Kubernetes/Gardener control-plane. "
+            "Hãy phân tích snapshot control-plane được cung cấp và đưa ra phân tích nguyên nhân gốc rễ. "
+            "Trả lời HOÀN TOÀN bằng tiếng Việt. "
+            "Cấu trúc câu trả lời như sau:\n"
+            "  1. Trạng thái cluster: healthy / degraded / broken.\n"
+            "  2. Tín hiệu quan trọng: pod bất thường, events, log lines, trạng thái etcd.\n"
+            "  3. Nguyên nhân gốc rễ xếp hạng theo độ tin cậy kèm bằng chứng từ snapshot.\n"
+            "  4. Các bước điều tra hoặc khắc phục tiếp theo.\n"
+            "Trích dẫn trực tiếp các dòng log/event từ snapshot để làm bằng chứng. "
+            "Không hỏi thêm thông tin."
         )
 
         # Build message list: existing conversation history + analysis request.
@@ -1666,12 +1667,13 @@ exit 0
             lm_messages.append({"role": m.role, "content": m.content or ""})
         lm_messages.append({
             "role": "user",
-            "content": f"Analyze the control-plane snapshot for cluster `{cluster_id}` above.",
+            "content": f"Phân tích snapshot control-plane cho cluster `{cluster_id}` ở trên.",
         })
 
-        response_msg = await ack.edit_text("🤔 Analyzing snapshot...")
-        _set_investigation_status(chat_id, topic_id, "🔍 Analyzing snapshot...")
+        response_msg = await ack.edit_text("🤔 Đang phân tích snapshot...")
+        _set_investigation_status(chat_id, topic_id, "🔍 Đang phân tích snapshot...")
         full_response = ""
+        last_edit_len = 0
 
         try:
             litellm_kwargs: dict = {
@@ -1679,6 +1681,7 @@ exit 0
                 "messages": lm_messages,
                 "stream": True,
                 "timeout": 300,
+                "tool_choice": "none",
             }
             if llm_api_key:
                 litellm_kwargs["api_key"] = llm_api_key
@@ -1687,10 +1690,14 @@ exit 0
 
             stream_resp = await litellm.acompletion(**litellm_kwargs)
             async for chunk in stream_resp:
-                delta = chunk.choices[0].delta.content or ""
+                try:
+                    delta = chunk.choices[0].delta.content or ""
+                except Exception:
+                    continue
                 if delta:
                     full_response += delta
-                    if len(full_response) % 100 == 0:
+                    if len(full_response) - last_edit_len >= 100:
+                        last_edit_len = len(full_response)
                         try:
                             await response_msg.edit_text(full_response + "▌")
                         except Exception:
