@@ -1471,6 +1471,7 @@ J 05_mr_yaml      env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-tim
 J 06_machine_yaml env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get machine -n "$NS" -o yaml
 J 07_md_wide      env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get machinedeployment -n "$NS" -o wide
 J 08_sts_list     env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get statefulset -n "$NS" -o name
+J 40_pods_json    env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get pods -n "$NS" -o json
 
 for p in etcd-main-0 etcd-events-0; do
   J "10_${p}_yaml" env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get pod "$p" -n "$NS" -o yaml
@@ -1496,7 +1497,13 @@ for d in $COMPS; do
 ' _ "$d" "$NS" "$LINES" "$KCFG" "$SEED"
 done
 
-env KUBECONFIG="$KCFG" kubectl --context="$SEED" --request-timeout=20s get pods -n "$NS" -o json > "$TMP/40_pods_json" 2>&1
+# 40_pods_json was started as a J() fan-out collector above. Wait for
+# its .rc file to appear (kubectl finished, success or not) before jq
+# parses it. Other J() collectors keep running in parallel meanwhile.
+while [ ! -f "$TMP/40_pods_json.rc" ]; do
+  sleep 0.1
+done
+
 jq -r '.items[] as $p
        | $p.spec.containers[]? as $c
        | ([($p.status.containerStatuses // [])[] | select(.name==$c.name)] | first) as $st
