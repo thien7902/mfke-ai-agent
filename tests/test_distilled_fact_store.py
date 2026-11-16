@@ -491,3 +491,125 @@ def test_search_respects_k_limit():
         out = store.search("query", k=2)
     assert len(out) == 2
 
+
+def _days_ago(days: int):
+    import datetime as _dt
+    return _dt.datetime.utcnow() - _dt.timedelta(days=days)
+
+
+def test_time_decay_no_penalty_for_recent_fact():
+    """Fact referenced 10 days ago → no time penalty."""
+    store = _store_with()
+    fact = {"text": "fresh", "created_at": _days_ago(10),
+            "last_referenced_at": _days_ago(10)}
+    assert store._time_decay_penalty(fact) == 0.0
+
+
+def test_time_decay_90d_penalized():
+    """Fact referenced 95 days ago → -0.05."""
+    store = _store_with()
+    fact = {"text": "stale", "created_at": _days_ago(200),
+            "last_referenced_at": _days_ago(95)}
+    assert abs(store._time_decay_penalty(fact) - 0.05) < 1e-6
+
+
+def test_time_decay_180d_penalized_cumulative():
+    """Fact 200 days old → -0.05 (90d) + -0.10 (180d) = -0.15."""
+    store = _store_with()
+    fact = {"text": "older", "created_at": _days_ago(200)}
+    assert abs(store._time_decay_penalty(fact) - 0.15) < 1e-6
+
+
+def test_time_decay_365d_penalized_cumulative():
+    """Fact 400 days old → -0.05 + -0.10 + -0.15 = -0.30."""
+    store = _store_with()
+    fact = {"text": "ancient", "created_at": _days_ago(400)}
+    assert abs(store._time_decay_penalty(fact) - 0.30) < 1e-6
+
+
+def test_time_decay_last_referenced_overrides_old_created():
+    """Last_referenced_at newer than created_at means fact is fresh even
+    if originally created long ago. Anchor = max of the two."""
+    store = _store_with()
+    fact = {"text": "revived", "created_at": _days_ago(400),
+            "last_referenced_at": _days_ago(10)}
+    assert store._time_decay_penalty(fact) == 0.0
+
+
+def test_time_decay_falls_back_to_created_when_no_last_referenced():
+    """Facts inserted before v2.5.2 don't have last_referenced_at yet.
+    Scoring must still work using created_at as anchor."""
+    store = _store_with()
+    fact = {"text": "old-school", "created_at": _days_ago(200)}
+    assert abs(store._time_decay_penalty(fact) - 0.15) < 1e-6
+
+
+def test_time_decay_no_anchor_returns_zero():
+    """Fact with neither last_referenced_at nor created_at → no penalty."""
+    store = _store_with()
+    fact = {"text": "ghost"}
+    assert store._time_decay_penalty(fact) == 0.0
+
+
+def test_scoring_with_decay_reorders_recent_above_stale():
+    """Two facts with identical cosine and kb_match — the recent one should
+    rank above the stale one because of time-decay."""
+    store = _store_with()
+    import numpy as np
+    facts = [
+        {"text": "stale", "embedding": [1.0, 0.0],
+         "created_at": _days_ago(200)},
+        {"text": "recent", "embedding": [1.0, 0.0],
+         "created_at": _days_ago(10)},
+    ]
+    matched_kb = [
+        {"rule_id": "kb1", "match_count": 0, "issue_title": "",
+         "embedding": np.array([1.0, 0.0], dtype="float32")},
+    ]
+    with patch.object(dfs_mod.bot_config, "distilled_inject_cross_topic_bonus", 0.0):
+        scored = store._score_facts_against_kb_rules(facts, matched_kb)
+    # Recent first (no penalty); stale last (penalty -0.15)
+    assert scored[0][0]["text"] == "recent"
+    assert scored[1][0]["text"] == "stale"
+    assert scored[0][1] > scored[1][1]
+
+
+def test_search_touches_last_referenced_on_returned_facts():
+    """When search() returns facts, it must bump last_referenced_at on
+    those fact docs so future scoring sees fresh activity."""
+    facts = MagicMock()
+    runs = MagicMock()
+    runs.find.return_value = [{"latest_run_id": "r1", "topic_id": 5}]
+    cursor = MagicMock()
+    cursor.sort.return_value = iter([
+        {"text": "fact-1", "embedding": [1.0, 0.0],
+         "source_run_id": "r1", "source_topic_id": 5, "source_chat_id": 1},
+        {"text": "fact-2", "embedding": [0.0, 1.0],
+         "source_run_id": "r1", "source_topic_id": 5, "source_chat_id": 1},
+    ])
+    facts.find.return_value = cursor
+    store = _store_with(facts=facts, runs=runs)
+    with patch.object(dfs_mod.bot_config, "distilled_dedup_cosine", 0.0), \
+         patch("src.bot.services.embedder.embed_text", return_value=[1.0, 0.0]):
+        out = store.search("query", k=2)
+    # update_many called once with text matches
+    facts.update_many.assert_called_once()
+    args, _ = facts.update_many.call_args
+    assert args[0] == {"text": {"$in": ["fact-1", "fact-2"]}}
+    assert "last_referenced_at" in args[1]["$set"]
+
+
+def test_add_seeds_last_referenced_at_equal_created_at():
+    """Newly inserted fact should have last_referenced_at = created_at so
+    scoring has an anchor even before search() ever returns the fact."""
+    facts = MagicMock()
+    facts.insert_one.return_value = MagicMock(inserted_id="oid")
+    store = _store_with(facts=facts)
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(
+        store.add("x", source_chat_id=1, source_topic_id=2, source_run_id="r1")
+    )
+    inserted = facts.insert_one.call_args[0][0]
+    assert "last_referenced_at" in inserted
+    assert inserted["last_referenced_at"] == inserted["created_at"]
+

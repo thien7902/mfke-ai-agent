@@ -182,6 +182,14 @@ class Config:
     distilled_inject_freq_bonus: float = 0.10
     distilled_inject_cross_topic_bonus: float = 0.05
     distilled_inject_cross_topic_cap: int = 5
+    # Time-decay penalty (additive steps) — facts not recently referenced
+    # lose priority. Applied AFTER cosine + bonuses; cosine still
+    # dominates (max penalty 0.15 << cosine range 0-1).
+    # Uses max(last_referenced_at, created_at) as anchor — last_referenced_at
+    # is updated by DistilledFactStore.search() each time a fact is returned.
+    distilled_inject_decay_90d: float = 0.05
+    distilled_inject_decay_180d: float = 0.10
+    distilled_inject_decay_365d: float = 0.15
 
     # Known-issues KB (FPT Container). Disabled by default. Enable after
     # running `python -m scripts.ingest_kb_docx <docx path>` once to seed
@@ -309,6 +317,9 @@ def load_config() -> Config:
         distilled_inject_freq_bonus=float(os.getenv("DISTILLED_INJECT_FREQ_BONUS", "0.10")),
         distilled_inject_cross_topic_bonus=float(os.getenv("DISTILLED_INJECT_CROSS_TOPIC_BONUS", "0.05")),
         distilled_inject_cross_topic_cap=int(os.getenv("DISTILLED_INJECT_CROSS_TOPIC_CAP", "5")),
+        distilled_inject_decay_90d=float(os.getenv("DISTILLED_INJECT_DECAY_90D", "0.05")),
+        distilled_inject_decay_180d=float(os.getenv("DISTILLED_INJECT_DECAY_180D", "0.10")),
+        distilled_inject_decay_365d=float(os.getenv("DISTILLED_INJECT_DECAY_365D", "0.15")),
         kb_enabled=os.getenv("KB_ENABLED", "").lower() in ("1", "true", "yes", "on"),
         kb_top_k=int(os.getenv("KB_TOP_K", "50")),
         kb_distill_model=os.getenv("KB_DISTILL_MODEL") or os.getenv("CONSOLIDATOR_MODEL") or None,

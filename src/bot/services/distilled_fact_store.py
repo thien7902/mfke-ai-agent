@@ -400,6 +400,48 @@ class DistilledFactStore:
         except Exception:
             return None
 
+    def _time_decay_penalty(self, fact: dict) -> float:
+        """Return cumulative time-decay penalty for `fact` (negative score
+        contribution). Anchor is max(last_referenced_at, created_at) — the
+        fact's most recent activity. Defaults: -0.05 if age>90d, -0.10 if
+        >180d, -0.15 if >365d (cumulative steps). Returns 0 if no anchor
+        field can be parsed. Cosine still dominates: max penalty 0.30 <
+        cosine range 0-1.
+        """
+        decay_90d = float(getattr(bot_config, "distilled_inject_decay_90d", 0.05))
+        decay_180d = float(getattr(bot_config, "distilled_inject_decay_180d", 0.10))
+        decay_365d = float(getattr(bot_config, "distilled_inject_decay_365d", 0.15))
+        if not fact:
+            return 0.0
+        lr = fact.get("last_referenced_at")
+        ca = fact.get("created_at")
+        # Use whichever is later — a fact referenced recently stays fresh
+        # even if created long ago.
+        candidates = [v for v in (lr, ca) if v is not None]
+        if not candidates:
+            return 0.0
+        try:
+            anchors = []
+            for v in candidates:
+                if isinstance(v, datetime.datetime):
+                    anchors.append(v)
+                else:
+                    import datetime as _dt
+                    anchors.append(_dt.datetime.fromisoformat(str(v)))
+            anchor = max(anchors)
+        except Exception:
+            return 0.0
+        now = datetime.datetime.utcnow()
+        age_days = (now - anchor).total_seconds() / 86400.0
+        penalty = 0.0
+        if age_days > 365:
+            penalty += decay_365d
+        if age_days > 180:
+            penalty += decay_180d
+        if age_days > 90:
+            penalty += decay_90d
+        return penalty
+
     def _score_facts_against_kb_rules(
         self, facts: List[dict], matched_kb: List[dict],
     ) -> List[Tuple[dict, float]]:
@@ -412,15 +454,13 @@ class DistilledFactStore:
             score = cosine_max_vs_matched_kb_rules
                   + freq_bonus * 1_if_nearest_kb_match_count_>=_frequent_threshold
                   + cross_topic_bonus * min(distinct_run_count, cross_topic_cap)
-
-        `distinct_run_count` here is approximated as: 1 (since each fact
-        documents only ONE source_run_id in DB). We treat single-fact as
-        run-count 1 by default; if the cosine dedup family exposed enough
-        metadata to estimate cross-topic spread we'd count it here. Today
-        the bonus is bounded at min(1, cap) — max +0.05 — consistent with
-        the plan's intent (cosine dominates, bonus is tie-breaker).
+                  - time_decay_penalty (additive steps, anchored on
+                    max(last_referenced_at, created_at))
 
         Vectorized via numpy single matmul (facts_matrix @ kb_matrix.T).
+        Penalty steps (defaults): -0.05 if age>90d, -0.10 if >180d,
+        -0.15 if >365d. Cumulative — a 400d-old fact gets all three.
+        Cosine still dominates (max penalty 0.15 << cosine range 0-1).
         """
         if not facts:
             return []
@@ -430,7 +470,12 @@ class DistilledFactStore:
         scored: List[Tuple[dict, float]] = []
         if not matched_kb:
             for f in facts:
-                scored.append((f, 0.0))
+                # Even with no kb anchor, apply time-decay so stale facts
+                # fall behind fresh ones in the no-trust-anchor case. Cosine
+                # term is 0 here, so penalty is the entire score (negative).
+                scored.append((f, -self._time_decay_penalty(f)))
+            # Sort desc so newer (penalty closer to 0) comes first.
+            scored.sort(key=lambda x: -x[1])
             return scored
 
         # Build fact matrix (n_facts x dim).
@@ -483,6 +528,7 @@ class DistilledFactStore:
                 score += freq_bonus
             # distinct_run_count ≈ 1 (single fact = single source). Min with cap.
             score += cross_topic_bonus * min(1, cross_topic_cap)
+            score -= self._time_decay_penalty(facts[orig_i])
             scored_by_idx[orig_i] = score
 
         for i, f in enumerate(facts):
@@ -647,6 +693,7 @@ class DistilledFactStore:
                 fact_preview=clean[:80],
             )
         try:
+            now = datetime.datetime.utcnow()
             self.facts.insert_one(
                 {
                     "text": clean,
@@ -654,7 +701,12 @@ class DistilledFactStore:
                     "source_chat_id": source_chat_id,
                     "source_topic_id": source_topic_id,
                     "source_run_id": source_run_id,
-                    "created_at": datetime.datetime.utcnow(),
+                    "created_at": now,
+                    # Seed last_referenced_at = created_at so time-decay
+                    # penalty in _score_facts_against_kb_rules has an
+                    # anchor before the fact is ever returned by search().
+                    # Updated by search() each time the fact is returned.
+                    "last_referenced_at": now,
                 }
             )
             return True
@@ -972,5 +1024,33 @@ class DistilledFactStore:
                 "source_chat_id": f.get("source_chat_id"),
                 "source_topic_id": f.get("source_topic_id"),
             })
+        # Fire-and-forget: refresh last_referenced_at on the returned facts.
+        # Time-decay scoring in _score_facts_against_kb_rules reads this
+        # field to down-rank stale facts. Bumping only the top-K returned
+        # (not all 282) keeps write amplification low.
+        if out:
+            texts = [r["text"] for r in out if r.get("text")]
+            self._touch_last_referenced(texts)
         return out
+
+    def _touch_last_referenced(self, texts: List[str]) -> None:
+        """Bump last_referenced_at=now on the docs matching `texts`. Fire-
+        and-forget — swallows DB errors. Called from search() after
+        ranking+limiting so write cost scales with k, not with corpus size.
+        """
+        if not texts:
+            return
+        try:
+            now = datetime.datetime.utcnow()
+            self.facts.update_many(
+                {"text": {"$in": texts}},
+                {"$set": {"last_referenced_at": now}},
+            )
+        except Exception as e:
+            logger.warning(
+                "distilled_facts_touch_last_referenced_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                count=len(texts),
+            )
 
