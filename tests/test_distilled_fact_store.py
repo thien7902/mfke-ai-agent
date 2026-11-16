@@ -291,22 +291,203 @@ def test_record_run_pokes_refresh_event():
 
 
 def test_refresh_snapshot_rebuilds_cache():
-    """_refresh_snapshot calls _fetch_injectable_facts_raw and stores the
-    result into _injectable_cache under the lock."""
+    """_refresh_snapshot calls full pipeline (dedup + score + slice) and
+    stores the result into _injectable_cache under the lock."""
+    facts = MagicMock()
+    runs = MagicMock()
+    runs.find.return_value = [{"latest_run_id": "r1", "topic_id": 5}]
+    cursor = MagicMock()
+    fact_doc = {
+        "text": "fact A",
+        "embedding": [1.0, 0.0],
+        "source_run_id": "r1",
+        "created_at": 1,
+    }
+    cursor.sort.return_value = iter([fact_doc])
+    facts.find.return_value = cursor
+    store = _store_with(facts=facts, runs=runs)
+
+    # Patch _load_matched_kb_rules to return [] (no kb matches → all facts
+    # get score 0, greedy slice includes them all under any positive budget).
+    with patch.object(dfs_mod.bot_config, "distilled_dedup_cosine", 0.0), \
+         patch.object(store, "_load_matched_kb_rules", return_value=[]), \
+         patch.object(store, "_compute_token_budget", return_value=8000), \
+         patch.object(store, "_estimate_tokens", return_value=100):
+        store._refresh_snapshot()
+
+    assert store._injectable_cache == [fact_doc]
+
+
+def test_score_facts_against_kb_rules_zero_kb_returns_all_zero_scores():
+    """Empty matched_kb list → all facts score 0, ordering stable (input order)."""
+    store = _store_with()
+    facts = [
+        {"text": "f1", "embedding": [1.0, 0.0]},
+        {"text": "f2", "embedding": [0.0, 1.0]},
+    ]
+    scored = store._score_facts_against_kb_rules(facts, [])
+    assert len(scored) == 2
+    assert all(s == 0.0 for _, s in scored)
+    # Order preserved
+    assert scored[0][0]["text"] == "f1"
+    assert scored[1][0]["text"] == "f2"
+
+
+def test_score_facts_against_kb_rules_cosine_max_picks_nearest():
+    """Each fact takes its max cosine over all matched kb_rules."""
+    store = _store_with()
+    facts = [
+        {"text": "f1 aligned with kb1", "embedding": [1.0, 0.0]},
+        {"text": "f2 aligned with kb2", "embedding": [0.0, 1.0]},
+        {"text": "f3 orthogonal", "embedding": [-1.0, -1.0]},
+    ]
+    matched_kb = [
+        {"rule_id": "kb1", "match_count": 0, "issue_title": "",
+         "embedding": __import__("numpy").array([1.0, 0.0], dtype="float32")},
+        {"rule_id": "kb2", "match_count": 0, "issue_title": "",
+         "embedding": __import__("numpy").array([0.0, 1.0], dtype="float32")},
+    ]
+    scored = store._score_facts_against_kb_rules(facts, matched_kb)
+    scored_dict = {f["text"]: s for f, s in scored}
+    # f1 cosine = 1.0 vs kb1 → 1.0 + cross_topic_bonus
+    # f2 cosine = 1.0 vs kb2 → 1.0 + cross_topic_bonus
+    # f3 cosine < 1.0 (orthogonal-ish but normalized → cos = -1)
+    assert scored_dict["f1 aligned with kb1"] >= 0.99
+    assert scored_dict["f2 aligned with kb2"] >= 0.99
+    assert scored_dict["f3 orthogonal"] < scored_dict["f1 aligned with kb1"]
+
+
+def test_score_facts_freq_bonus_applies_when_nearest_kb_match_high():
+    """Facts whose nearest kb_rule has match_count >= 10 get +freq_bonus."""
+    store = _store_with()
+    import numpy as np
+    facts = [{"text": "high-cos", "embedding": [1.0, 0.0]}]
+    matched_kb = [
+        {"rule_id": "kb-frequent", "match_count": 15,
+         "issue_title": "", "embedding": np.array([1.0, 0.0], dtype="float32")},
+    ]
+    with patch.object(dfs_mod.bot_config, "distilled_inject_freq_bonus", 0.10), \
+         patch.object(dfs_mod.bot_config, "distilled_inject_cross_topic_bonus", 0.0):
+        scored = store._score_facts_against_kb_rules(facts, matched_kb)
+    # cosine = 1.0 + freq_bonus = 0.10 → 1.10
+    assert abs(scored[0][1] - 1.10) < 0.01
+
+
+def test_score_facts_freq_bonus_skips_when_match_count_below_threshold():
+    """Facts whose nearest kb_rule has match_count < threshold get no freq bonus."""
+    store = _store_with()
+    import numpy as np
+    facts = [{"text": "high-cos", "embedding": [1.0, 0.0]}]
+    matched_kb = [
+        {"rule_id": "kb-rare", "match_count": 3,
+         "issue_title": "", "embedding": np.array([1.0, 0.0], dtype="float32")},
+    ]
+    with patch.object(dfs_mod.bot_config, "distilled_inject_freq_bonus", 0.10), \
+         patch.object(dfs_mod.bot_config, "distilled_inject_frequent_match_count", 10), \
+         patch.object(dfs_mod.bot_config, "distilled_inject_cross_topic_bonus", 0.0):
+        scored = store._score_facts_against_kb_rules(facts, matched_kb)
+    assert abs(scored[0][1] - 1.0) < 0.01  # cosine only, no freq bonus
+
+
+def test_ranked_slice_within_budget_enforces_token_cap():
+    """Greedy fill stops when next fact would exceed the token budget."""
+    store = _store_with()
+    facts = [
+        ({"text": "f1", "_scored_tokens": 100}, 1.0),
+        ({"text": "f2", "_scored_tokens": 100}, 0.9),
+        ({"text": "f3", "_scored_tokens": 100}, 0.8),
+    ]
+    out = store._ranked_slice_within_budget(facts, token_budget=250)
+    # 100 + 100 + 100 > 250 → only first two fit
+    assert len(out) == 2
+    assert [f["text"] for f in out] == ["f1", "f2"]
+
+
+def test_ranked_slice_within_budget_skips_oversized_fact():
+    """A single fact larger than budget is skipped (not included)."""
+    store = _store_with()
+    facts = [
+        ({"text": "huge", "_scored_tokens": 5000}, 1.0),
+        ({"text": "small", "_scored_tokens": 100}, 0.5),
+    ]
+    out = store._ranked_slice_within_budget(facts, token_budget=1000)
+    assert len(out) == 1
+    assert out[0]["text"] == "small"
+
+
+def test_compute_token_budget_at_watermarks():
+    """Budget follows min → mid → max as matched_kb_count grows."""
+    store = _store_with()
+    with patch.object(dfs_mod.bot_config, "distilled_inject_min_tokens", 3000), \
+         patch.object(dfs_mod.bot_config, "distilled_inject_max_tokens", 8000), \
+         patch.object(dfs_mod.bot_config, "distilled_inject_high_watermark_kb_match", 30), \
+         patch.object(dfs_mod.bot_config, "distilled_inject_max_watermark_kb_match", 60):
+        assert store._compute_token_budget(0) == 3000
+        assert store._compute_token_budget(60) == 8000
+        assert store._compute_token_budget(100) == 8000  # caps at max
+        # Below high watermark: 15/30 → halfway between min and mid (5500)
+        assert 3000 < store._compute_token_budget(15) < (3000 + 8000) // 2
+        # Above high: between mid and max
+        mid_to_max = store._compute_token_budget(45)
+        assert (3000 + 8000) // 2 < mid_to_max < 8000
+
+
+def test_search_returns_empty_for_empty_query():
+    store = _store_with()
+    assert store.search("", k=10) == []
+    assert store.search("   ", k=10) == []
+
+
+def test_search_returns_empty_when_embedder_fails():
+    store = _store_with()
+    with patch("src.bot.services.embedder.embed_text",
+               side_effect=RuntimeError("api down")):
+        assert store.search("OOM", k=10) == []
+
+
+def test_search_returns_topk_ordered_by_score_desc():
+    """Cosine ranking returns facts sorted by similarity to query (desc)."""
     facts = MagicMock()
     runs = MagicMock()
     runs.find.return_value = [{"latest_run_id": "r1", "topic_id": 5}]
     cursor = MagicMock()
     cursor.sort.return_value = iter([
-        {"text": "fact A", "embedding": [1.0, 0.0], "source_run_id": "r1", "created_at": 1},
+        {"text": "OOM fact", "embedding": [1.0, 0.0],
+         "source_run_id": "r1", "source_topic_id": 5, "source_chat_id": 1},
+        {"text": "disk fact", "embedding": [0.0, 1.0],
+         "source_run_id": "r1", "source_topic_id": 5, "source_chat_id": 1},
     ])
     facts.find.return_value = cursor
     store = _store_with(facts=facts, runs=runs)
+    # Query aligned with OOM fact → should rank first.
+    with patch.object(dfs_mod.bot_config, "distilled_dedup_cosine", 0.0), \
+         patch("src.bot.services.embedder.embed_text",
+               return_value=[1.0, 0.0]):
+        out = store.search("OOM k8s", k=10)
+    assert len(out) == 2
+    assert out[0]["text"] == "OOM fact"
+    assert out[1]["text"] == "disk fact"
+    assert out[0]["score"] > out[1]["score"]
+    assert out[0]["source_run_id"] == "r1"
+    assert out[0]["source_chat_id"] == 1
+    assert out[0]["source_topic_id"] == 5
 
-    with patch.object(dfs_mod.bot_config, "distilled_dedup_cosine", 0.0):
-        store._refresh_snapshot()
 
-    assert store._injectable_cache == [
-        {"text": "fact A", "embedding": [1.0, 0.0], "source_run_id": "r1", "created_at": 1},
-    ]
+def test_search_respects_k_limit():
+    """Top-k limit returns at most k facts."""
+    facts = MagicMock()
+    runs = MagicMock()
+    runs.find.return_value = [{"latest_run_id": "r1", "topic_id": 5}]
+    cursor = MagicMock()
+    cursor.sort.return_value = iter([
+        {"text": f"fact-{i}", "embedding": [float(i), 0.0],
+         "source_run_id": "r1", "source_topic_id": 5, "source_chat_id": 1}
+        for i in range(5)
+    ])
+    facts.find.return_value = cursor
+    store = _store_with(facts=facts, runs=runs)
+    with patch.object(dfs_mod.bot_config, "distilled_dedup_cosine", 0.0), \
+         patch("src.bot.services.embedder.embed_text", return_value=[1.0, 0.0]):
+        out = store.search("query", k=2)
+    assert len(out) == 2
 

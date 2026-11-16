@@ -153,6 +153,35 @@ class Config:
     # 0 disables the background loop and falls back to "recompute per call"
     # (legacy behavior, multi-second latency for ~1k facts).
     distilled_dedup_cache_seconds: int = 60
+    # Token budget for the distilled-facts block injected into the system
+    # prompt each turn. Old design injected all dedup'd facts (~48K tokens
+    # at 282 facts × ~170 tokens). New design ranks facts by overlap with
+    # verified kb_rules (match_count > 0) and slices top-K fitting the
+    # dynamic budget. min_tokens is the floor (always-fill), max_tokens is
+    # the ceiling. Greedy fill by score desc.
+    distilled_inject_min_tokens: int = 3000
+    distilled_inject_max_tokens: int = 8000
+    # Matched-kb-rules count thresholds used by the dynamic budget: if the
+    # count of kb_rules with match_count > 0 crosses the high watermark,
+    # budget bumps from `min_tokens` to a mid value (linear); crossing the
+    # max watermark bumps to `max_tokens`. Empirical: 79 matched_kbrules
+    # today → max_tokens 8000 ≈ 50-60 facts × 170 tokens.
+    distilled_inject_high_watermark_kb_match: int = 30
+    distilled_inject_max_watermark_kb_match: int = 60
+    # Match count threshold above which a kb_rule is considered "frequent";
+    # facts whose nearest kb_rule has match_count >= this get a small bonus
+    # on the score. Caps noise from one-off rule matches. Empirical: 48 of
+    # 79 matched rules have match_count >= 10.
+    distilled_inject_frequent_match_count: int = 10
+    # Score formula weights (see _score_facts_against_kb_rules in
+    # distilled_fact_store.py):
+    #   score = cosine_max_vs_matched_kb_rules
+    #         + freq_bonus * 1_if_nearest_kb_match_count_>=_frequent_threshold
+    #         + cross_topic_bonus * min(distinct_run_count, cross_topic_cap)
+    # cosine dominates (range 0-1); bonuses act as tie-breaker/booster only.
+    distilled_inject_freq_bonus: float = 0.10
+    distilled_inject_cross_topic_bonus: float = 0.05
+    distilled_inject_cross_topic_cap: int = 5
 
     # Known-issues KB (FPT Container). Disabled by default. Enable after
     # running `python -m scripts.ingest_kb_docx <docx path>` once to seed
@@ -272,6 +301,14 @@ def load_config() -> Config:
         consolidator_llm_timeout_seconds=int(os.getenv("CONSOLIDATOR_LLM_TIMEOUT_SECONDS", "60")),
         distilled_dedup_cosine=float(os.getenv("DISTILLED_DEDUP_COSINE", "0.92")),
         distilled_dedup_cache_seconds=int(os.getenv("DISTILLED_DEDUP_CACHE_SECONDS", "60")),
+        distilled_inject_min_tokens=int(os.getenv("DISTILLED_INJECT_MIN_TOKENS", "3000")),
+        distilled_inject_max_tokens=int(os.getenv("DISTILLED_INJECT_MAX_TOKENS", "8000")),
+        distilled_inject_high_watermark_kb_match=int(os.getenv("DISTILLED_INJECT_HIGH_WATERMARK_KB_MATCH", "30")),
+        distilled_inject_max_watermark_kb_match=int(os.getenv("DISTILLED_INJECT_MAX_WATERMARK_KB_MATCH", "60")),
+        distilled_inject_frequent_match_count=int(os.getenv("DISTILLED_INJECT_FREQUENT_MATCH_COUNT", "10")),
+        distilled_inject_freq_bonus=float(os.getenv("DISTILLED_INJECT_FREQ_BONUS", "0.10")),
+        distilled_inject_cross_topic_bonus=float(os.getenv("DISTILLED_INJECT_CROSS_TOPIC_BONUS", "0.05")),
+        distilled_inject_cross_topic_cap=int(os.getenv("DISTILLED_INJECT_CROSS_TOPIC_CAP", "5")),
         kb_enabled=os.getenv("KB_ENABLED", "").lower() in ("1", "true", "yes", "on"),
         kb_top_k=int(os.getenv("KB_TOP_K", "50")),
         kb_distill_model=os.getenv("KB_DISTILL_MODEL") or os.getenv("CONSOLIDATOR_MODEL") or None,

@@ -644,9 +644,13 @@ class HolmesService:
         'memory disabled' message so Holmes doesn't error if called.
         """
         te = tool_executor if tool_executor is not None else self._tool_executor
-        if not te or not self._memory:
+        if not te:
             return
-        tool = SearchMemoryTool(self._memory)
+        tool = SearchMemoryTool(
+            memory_service=self._memory,
+            distilled_store=self._distilled_store,
+            kb_store=self._kb_store,
+        )
         te.tools_by_name[tool.name] = tool
         logger.info("Registered search_memory tool")
 
@@ -1345,14 +1349,15 @@ class HolmesService:
     # from the distilled_facts MongoDB collection — newer runs replace older
     # runs for the same topic so chat #2's facts win over chat #1's.
     _DISTILLED_FACTS_HEADER = (
-        "\n\n--- DISTILLED KNOWLEDGE (auto-extracted from prior conversations, high priority) ---\n"
-        "The following facts were distilled by a background reviewer from past "
-        "conversations in this bot. For each conversation topic, only the latest "
-        "distillation run's facts appear here — newer extractions replace older "
-        "ones for the same topic. They are already in your context — you do NOT "
-        "need to call search_memory to access them. Trust them as authoritative "
-        "unless they conflict with live tool output. Call search_memory only for "
-        "explicit re-query or when these are insufficient.\n"
+        "\n\n--- DISTILLED KNOWLEDGE (top-K curated, high trust; full archive via search_memory) ---\n"
+        "The following distilled facts from prior conversations were ranked by "
+        "overlap with verified KB rules (FPT Container KB runbooks with "
+        "match_count > 0). Only the top-K highest-trust facts are loaded here "
+        "for context efficiency. The rest of the archive is retrievable through "
+        "the `search_memory` tool (sources='distilled' for chat-derived "
+        "observations, sources='kb_rule' for authoritative KB). Trust these "
+        "loaded facts unless they conflict with live tool output, in which case "
+        "trust the tools.\n"
     )
 
     # Default search_memory tool-use rule. Appended to HOLMES_SYSTEM_PROMPT_ADDITIONS

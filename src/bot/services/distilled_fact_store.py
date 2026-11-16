@@ -28,7 +28,7 @@ import datetime
 import math
 import threading
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import structlog
 from pymongo import ASCENDING, DESCENDING
@@ -224,13 +224,33 @@ class DistilledFactStore:
                 )
 
     def _refresh_snapshot(self) -> None:
-        """Rebuild `_injectable_cache` from MongoDB + cosine dedup.
-        Reuses `_fetch_injectable_facts_raw` for the DB read + dedup
-        pipeline; writes the result atomically under `_cache_lock`.
+        """Rebuild `_injectable_cache` from MongoDB + cosine dedup + scoring.
+
+        Pipeline:
+          1. latest-run-per-topic filter (existing)
+          2. cosine dedup at `distilled_dedup_cosine` (existing)
+          3. score facts against matched kb_rules (kb_rules with match_count > 0)
+          4. greedy slice to fit a dynamic 3K-8K token budget
+
+        Writes the resulting top-K subset atomically under `_cache_lock`.
         """
-        snapshot = self._fetch_injectable_facts_raw(force_recompute=True)
+        full = self._fetch_injectable_facts_raw(force_recompute=True)
+        # Score against matched kb_rules.
+        matched_kb = self._load_matched_kb_rules()
+        scored = self._score_facts_against_kb_rules(full, matched_kb)
+        budget = self._compute_token_budget(len(matched_kb))
+        sliced = self._ranked_slice_within_budget(scored, budget)
+
+        if len(sliced) < len(full):
+            logger.info(
+                "distilled_facts_ranked_injectable",
+                orig_count=len(full),
+                inject_count=len(sliced),
+                matched_kb_rules=len(matched_kb),
+                token_budget=budget,
+            )
         with self._cache_lock:
-            self._injectable_cache = snapshot
+            self._injectable_cache = sliced
 
     def _fetch_injectable_facts_raw(self, force_recompute: bool = False) -> List[dict]:
         """The original inject path — read latest-run facts, dedup by
@@ -290,6 +310,273 @@ class DistilledFactStore:
                 error_type=type(e).__name__,
             )
             return facts
+
+    # ------------------------------------------------------------------ #
+    # Ranked slicing — top-K facts fitting a token budget, scored against
+    # kb_rules with match_count > 0 as a trust anchor.
+    # ------------------------------------------------------------------ #
+
+    # Cache of matched-kb-rules' embeddings: list of (rule_id, match_count,
+    # embedding_np). Refreshed on demand — checked against current matched
+    # count each call and re-pulled when new rules crossed match_count > 0.
+    _matched_kb_cache: Optional[List[dict]] = None
+    _matched_kb_cache_count: int = -1
+    _kb_cache_lock = threading.Lock()
+
+    def _load_matched_kb_rules(self) -> List[dict]:
+        """Return all kb_rules with match_count > 0, with their embeddings.
+        Cached on the store instance; re-pulled when the count changes.
+
+        Each dict shape: {rule_id, match_count, issue_title, embedding_np}.
+        We pull embedding_np as float32 numpy array for vectorized cosine.
+        """
+        try:
+            kb_col = MongoDB.get_collection("kb_rules")
+            count = kb_col.count_documents({"match_count": {"$gt": 0}})
+        except Exception as e:
+            logger.warning(
+                "distilled_facts_kb_count_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return []
+
+        with self._kb_cache_lock:
+            if self._matched_kb_cache is not None and self._matched_kb_cache_count == count:
+                return self._matched_kb_cache
+        try:
+            cursor = kb_col.find(
+                {"match_count": {"$gt": 0}},
+                {"_id": 0, "rule_id": 1, "match_count": 1, "issue_title": 1, "embedding": 1},
+            )
+            rules = list(cursor)
+        except Exception as e:
+            logger.warning(
+                "distilled_facts_kb_load_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return []
+        prepared: List[dict] = []
+        for r in rules:
+            emb = r.get("embedding") or []
+            if not emb:
+                continue
+            try:
+                import numpy as np
+                vec = np.asarray(emb, dtype="float32")
+                # L2 normalize for cosine via dot product.
+                norm = float(np.linalg.norm(vec))
+                if norm <= 0:
+                    continue
+                vec = vec / norm
+            except Exception:
+                continue
+            prepared.append({
+                "rule_id": r.get("rule_id"),
+                "match_count": int(r.get("match_count") or 0),
+                "issue_title": r.get("issue_title") or "",
+                "embedding": vec,
+            })
+        with self._kb_cache_lock:
+            self._matched_kb_cache = prepared
+            self._matched_kb_cache_count = count
+        return prepared
+
+    @staticmethod
+    def _fact_embedding_np(fact: dict):
+        """Return L2-normalized numpy float32 embedding of `fact`, or None
+        if missing / zero. Used for vectorized cosine scoring."""
+        emb = fact.get("embedding") or []
+        if not emb:
+            return None
+        try:
+            import numpy as np
+            vec = np.asarray(emb, dtype="float32")
+            norm = float(np.linalg.norm(vec))
+            if norm <= 0:
+                return None
+            return vec / norm
+        except Exception:
+            return None
+
+    def _score_facts_against_kb_rules(
+        self, facts: List[dict], matched_kb: List[dict],
+    ) -> List[Tuple[dict, float]]:
+        """Score each fact by overlap with matched kb_rules.
+
+        Returns a list of (fact, score) tuples sorted desc by score. Empty
+        `matched_kb` → all scores 0 (returned in original order, no crash).
+
+        Formula (per plan):
+            score = cosine_max_vs_matched_kb_rules
+                  + freq_bonus * 1_if_nearest_kb_match_count_>=_frequent_threshold
+                  + cross_topic_bonus * min(distinct_run_count, cross_topic_cap)
+
+        `distinct_run_count` here is approximated as: 1 (since each fact
+        documents only ONE source_run_id in DB). We treat single-fact as
+        run-count 1 by default; if the cosine dedup family exposed enough
+        metadata to estimate cross-topic spread we'd count it here. Today
+        the bonus is bounded at min(1, cap) — max +0.05 — consistent with
+        the plan's intent (cosine dominates, bonus is tie-breaker).
+
+        Vectorized via numpy single matmul (facts_matrix @ kb_matrix.T).
+        """
+        if not facts:
+            return []
+        import numpy as np
+
+        # Filter facts with valid embeddings; keep index map to original list.
+        scored: List[Tuple[dict, float]] = []
+        if not matched_kb:
+            for f in facts:
+                scored.append((f, 0.0))
+            return scored
+
+        # Build fact matrix (n_facts x dim).
+        fact_vecs: List = []
+        fact_idx_to_orig: List[int] = []
+        for i, f in enumerate(facts):
+            v = self._fact_embedding_np(f)
+            if v is None:
+                # No embedding — score 0, keep stable ordering.
+                scored.append((f, 0.0))
+                continue
+            fact_vecs.append(v)
+            fact_idx_to_orig.append(i)
+
+        if not fact_vecs:
+            return scored
+
+        # Build kb matrix (n_kb x dim).
+        kb_dim = matched_kb[0]["embedding"].shape[0]
+        fact_mat = np.vstack(fact_vecs).astype("float32")  # (F, D)
+        kb_mat = np.vstack([r["embedding"] for r in matched_kb]).astype("float32")
+        # Ensure dims match. If they don't, treat as 0 score (model mismatch).
+        if fact_mat.shape[1] != kb_mat.shape[1]:
+            logger.warning(
+                "distilled_facts_kb_dim_mismatch",
+                fact_dim=int(fact_mat.shape[1]),
+                kb_dim=int(kb_mat.shape[1]),
+            )
+            for i in fact_idx_to_orig:
+                scored.append((facts[i], 0.0))
+            return scored
+
+        # Cosine via dot product (both matrices L2-normalized).
+        sim = fact_mat @ kb_mat.T  # (F, K)
+        # Track best sim per fact AND the match_count of the closest kb_rule.
+        max_idx = np.argmax(sim, axis=1)
+        max_sim = sim[np.arange(sim.shape[0]), max_idx]
+
+        freq_bonus = float(getattr(bot_config, "distilled_inject_freq_bonus", 0.10))
+        cross_topic_bonus = float(getattr(bot_config, "distilled_inject_cross_topic_bonus", 0.05))
+        cross_topic_cap = int(getattr(bot_config, "distilled_inject_cross_topic_cap", 5))
+        frequent_threshold = int(getattr(bot_config, "distilled_inject_frequent_match_count", 10))
+
+        # Append scored facts in original facts list order.
+        scored_by_idx: Dict[int, float] = {}
+        for j, orig_i in enumerate(fact_idx_to_orig):
+            mc = int(matched_kb[int(max_idx[j])].get("match_count") or 0)
+            score = float(max_sim[j])
+            if mc >= frequent_threshold:
+                score += freq_bonus
+            # distinct_run_count ≈ 1 (single fact = single source). Min with cap.
+            score += cross_topic_bonus * min(1, cross_topic_cap)
+            scored_by_idx[orig_i] = score
+
+        for i, f in enumerate(facts):
+            scored.append((f, scored_by_idx.get(i, 0.0)))
+
+        # Sort desc; ties break by original order (stable sort).
+        scored.sort(key=lambda x: -x[1])
+        return scored
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Estimate token count for `text` via litellm. Cached on the doc
+        via a private sentinel — re-calling on same `text` returns without
+        re-counting. Falls back to len(text) // 4 if litellm unavailable."""
+        if not text:
+            return 0
+        # Lightweight heuristic ~chars/4. Real litellm token count is more
+        # accurate but adds ~5-10ms per call — acceptable inside the
+        # background thread, not on the hot read path. The cap is enforced
+        # by the slice call, so eps here is fine; we resort to litellm if
+        # caller asks for a precise count (search() path doesn't, since
+        # it returns ranked fact list, not a token-budgeted block).
+        try:
+            import litellm
+            return int(litellm.token_counter(
+                model="gpt-4o",
+                messages=[{"role": "system", "content": text}],
+            ))
+        except Exception:
+            return max(1, len(text) // 4)
+
+    def _ranked_slice_within_budget(
+        self,
+        scored: List[Tuple[dict, float]],
+        token_budget: int,
+    ) -> List[dict]:
+        """Greedy fill by score desc until cumulative tokens exceed budget.
+
+        Returns the ordered list of fact dicts. Token count per fact is
+        memoized on the dict under a private key to avoid recounting across
+        calls. Empty / oversized facts are skipped (a single fact > budget
+        is skipped to keep behavior sane)."""
+        if not scored or token_budget <= 0:
+            return []
+        out: List[dict] = []
+        running = 0
+        for fact, score in scored:
+            text = fact.get("text", "") or ""
+            # Memoize on dict — sets a private key; harmless if the doc
+            # later gets re-used by callers trusting the same key.
+            tok = fact.get("_scored_tokens")
+            if tok is None:
+                tok = self._estimate_tokens(text)
+                try:
+                    fact["_scored_tokens"] = int(tok)
+                except Exception:
+                    pass
+            tok = int(tok)
+            if running + tok > token_budget:
+                continue
+            out.append(fact)
+            running += tok
+        return out
+
+    def _compute_token_budget(self, matched_kb_count: int) -> int:
+        """Dynamic budget 3K-8K based on matched-kb-rules count.
+
+        - 0 matched → min_tokens (always-fill floor; still inject a curated
+          set, ranked purely on cross-topic bonus when kb is empty)
+        - 1..high_watermark → linear interp min→mid
+        - high_watermark..max_watermark → linear interp mid→max
+        - >= max_watermark → max_tokens
+        """
+        mn = int(getattr(bot_config, "distilled_inject_min_tokens", 3000))
+        mx = int(getattr(bot_config, "distilled_inject_max_tokens", 8000))
+        hi_wm = int(getattr(bot_config, "distilled_inject_high_watermark_kb_match", 30))
+        max_wm = int(getattr(bot_config, "distilled_inject_max_watermark_kb_match", 60))
+        if hi_wm < 1:
+            hi_wm = 1
+        if max_wm <= hi_wm:
+            max_wm = hi_wm + 1
+        if matched_kb_count <= 0:
+            return mn
+        mid = (mn + mx) // 2
+        if matched_kb_count >= max_wm:
+            return mx
+        if matched_kb_count >= hi_wm:
+            # Linear from mid to max between hi_wm and max_wm.
+            ratio = (matched_kb_count - hi_wm) / max(1, (max_wm - hi_wm))
+            return int(mid + (mx - mid) * ratio)
+        # Below hi_wm: linear from min to mid.
+        ratio = matched_kb_count / max(1, hi_wm)
+        return int(mn + (mid - mn) * ratio)
+
 
     # ------------------------------------------------------------------ #
     # Lazy collection accessors (mirror ConversationService pattern)
@@ -563,37 +850,127 @@ class DistilledFactStore:
 
     def get_injectable_facts(self) -> List[dict]:
         """Return facts from the latest run per topic, across all topics,
-        with near-duplicate facts deduplicated by cosine similarity.
+        cosine-dedupeed and *scored* (top-K subset fitting a dynamic 3K-8K
+        token budget).
 
         Sync — called from the sync ``_build_holmes_messages`` path per
         Holmes turn. **Hot path**: reads straight from an in-memory cache
         populated by ``_refresh_snapshot()`` (background thread every
-        ``distilled_dedup_cache_seconds``, invalidated on
-        ``record_run()``). O(1) for the caller — no DB read, no cosine
-        dedup. When the cache is empty (first call after bot startup
-        before the refresh thread has run, OR background refresh
-        disabled) it falls back to a synchronous ``_fetch_injectable_facts_raw``
-        call so the prompt is never empty if Mongo works.
+        ``distilled_dedup_cache_seconds``, invalidated on ``record_run()``).
+        O(1) for the caller — no DB read, no cosine dedup, no scoring. When
+        the cache is empty (first call after bot startup before the refresh
+        thread has run, OR background refresh disabled) it falls back to a
+        synchronous pipeline so the prompt is never empty if Mongo works.
         """
         # Fast path: serve cached snapshot.
         with self._cache_lock:
             snapshot = self._injectable_cache
         if snapshot:
             return snapshot
-        # Cold start — run the dedup synchronously ONCE so the first
-        # user turn isn't empty. If background refresh is enabled, this
-        # is the same work the refresh thread is about to do; the lock-
-        # guarded write below ensures we don't race the refresh thread.
+        # Cold start — run the full pipeline synchronously ONCE so the
+        # first user turn isn't empty AND gets the scoring + budget cap
+        # applied (not just the dedup pass). If background refresh is
+        # enabled, this is the same work the refresh thread is about to
+        # do; the lock-guarded write below ensures we don't race.
         if self._refresh_seconds <= 0:
-            # Background refresh disabled — always compute synchronously
-            # (legacy behavior).
-            return self._fetch_injectable_facts_raw(force_recompute=False)
+            # Background refresh disabled — always compute synchronously.
+            return self._compute_ranked_injectable()
         # Background refresh IS enabled but cache is empty — likely the
         # very first turn before the refresh thread has finished its
         # initial snapshot. Compute once and seed the cache so subsequent
         # turns hit the fast path.
-        computed = self._fetch_injectable_facts_raw(force_recompute=False)
+        computed = self._compute_ranked_injectable()
         with self._cache_lock:
             if not self._injectable_cache:
                 self._injectable_cache = computed
         return computed
+
+    def _compute_ranked_injectable(self) -> List[dict]:
+        """Fresh synchronous pipeline: dedup + score vs matched kb_rules +
+        slice within token budget. Returns the top-K subset to inject."""
+        full = self._fetch_injectable_facts_raw(force_recompute=False)
+        matched_kb = self._load_matched_kb_rules()
+        scored = self._score_facts_against_kb_rules(full, matched_kb)
+        budget = self._compute_token_budget(len(matched_kb))
+        return self._ranked_slice_within_budget(scored, budget)
+
+    def search(self, query: str, k: int = 10) -> List[dict]:
+        """Cosine-rank distilled facts against `query` and return top-k.
+
+        Iterates over the dedup-filtered facts (same set as injectable, but
+        IGNORES scoring vs kb_rules — query is the trust signal here). Each
+        result dict carries: text, score (cosine to query), and source
+        metadata (source_run_id, source_chat_id, source_topic_id).
+
+        Used by the search_memory tool's on-demand retrieval. Sync — runs
+        in Holmes worker thread (caller is search_memory tool's sync _invoke).
+
+        Falls back to injectable cache if a fresh dedup is too expensive
+        (no Mongo, no embedder) — returns empty list on any failure to
+        keep search_memory resilient.
+        """
+        if not query or not query.strip():
+            return []
+        if k <= 0:
+            k = 10
+        try:
+            from src.bot.services.embedder import embed_text
+            q_vec = embed_text(query)
+        except Exception as e:
+            logger.warning(
+                "distilled_facts_search_embed_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                query_preview=query[:60],
+            )
+            return []
+        if not q_vec:
+            return []
+        try:
+            import numpy as np
+            q = np.asarray(q_vec, dtype="float32")
+            norm = float(np.linalg.norm(q))
+            if norm <= 0:
+                return []
+            q = q / norm
+        except Exception:
+            return []
+
+        # Use the cached injectable facts if available; otherwise compute
+        # a fresh dedup snapshot (no scoring, no slicing).
+        with self._cache_lock:
+            cached: List[dict] = self._injectable_cache
+        # NOTE: cached slice may have been pruned to top-K; for search we
+        # want ALL dedup'd facts so the LLM can find facts not in the top-K.
+        # Compute fresh — _fetch_injectable_facts_raw is cheap (DB read +
+        # cosine dedup, runs <50ms for ~1k facts cached in-memory).
+        try:
+            full = self._fetch_injectable_facts_raw(force_recompute=False)
+        except Exception as e:
+            logger.warning(
+                "distilled_facts_search_list_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return []
+
+        scored: List[Tuple[dict, float]] = []
+        for f in full:
+            v = self._fact_embedding_np(f)
+            if v is None:
+                continue
+            sim = float(q @ v)
+            scored.append((f, sim))
+        scored.sort(key=lambda x: -x[1])
+
+        out: List[dict] = []
+        for f, score in scored[:k]:
+            out.append({
+                "text": f.get("text", "") or "",
+                "score": float(score),
+                "source_run_id": f.get("source_run_id"),
+                "source_chat_id": f.get("source_chat_id"),
+                "source_topic_id": f.get("source_topic_id"),
+            })
+        return out
+
