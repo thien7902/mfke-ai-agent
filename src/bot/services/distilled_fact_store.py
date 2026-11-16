@@ -894,7 +894,7 @@ class DistilledFactStore:
         budget = self._compute_token_budget(len(matched_kb))
         return self._ranked_slice_within_budget(scored, budget)
 
-    def search(self, query: str, k: int = 10) -> List[dict]:
+    def search(self, query: str, k: int = 50) -> List[dict]:
         """Cosine-rank distilled facts against `query` and return top-k.
 
         Iterates over the dedup-filtered facts (same set as injectable, but
@@ -912,7 +912,7 @@ class DistilledFactStore:
         if not query or not query.strip():
             return []
         if k <= 0:
-            k = 10
+            k = 50
         try:
             from src.bot.services.embedder import embed_text
             q_vec = embed_text(query)

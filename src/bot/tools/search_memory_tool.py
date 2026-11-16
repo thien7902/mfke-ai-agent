@@ -28,7 +28,7 @@ logger = structlog.get_logger(__name__)
 
 _DEFAULT_SOURCES = "graphiti,distilled,kb_rule"
 _VALID_SOURCES = {"graphiti", "distilled", "kb_rule"}
-_DEFAULT_K = 10
+_DEFAULT_K = 50
 
 
 class SearchMemoryTool(Tool):
@@ -62,7 +62,7 @@ class SearchMemoryTool(Tool):
             required=True,
         ),
         "k": ToolParameter(
-            description="Max number of results to return PER source. Default 10.",
+            description="Max number of results to return PER source. Default 50.",
             type="integer",
             required=False,
         ),
@@ -106,6 +106,11 @@ class SearchMemoryTool(Tool):
             k = _DEFAULT_K
         if k <= 0:
             k = _DEFAULT_K
+        # Guard: large k is fine, but cap an absurd LLM request to keep the
+        # tool output bounded. 200 per source is already far beyond useful
+        # retrieval and keeps the response under Holmes' tool-result cap.
+        if k > 200:
+            k = 200
         sources_raw = (params or {}).get("sources") or _DEFAULT_SOURCES
         sources = self._parse_sources(sources_raw)
         if not sources:

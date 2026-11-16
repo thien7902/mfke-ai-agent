@@ -134,9 +134,9 @@ def test_default_k_when_not_provided():
     tool = _make_stores(memory=svc, distilled=distilled, kb=kb)
     tool.invoke({"query": "hello"}, context=_make_context())
     call_kwargs = svc.retrieve_relevant.call_args
-    assert call_kwargs.kwargs.get("k") == 10
-    distilled.search.assert_called_once_with("hello", k=10)
-    kb.get_relevant_rules.assert_called_once_with("hello", top_k=10)
+    assert call_kwargs.kwargs.get("k") == 50
+    distilled.search.assert_called_once_with("hello", k=50)
+    kb.get_relevant_rules.assert_called_once_with("hello", top_k=50)
 
 
 def test_default_k_when_invalid():
@@ -147,10 +147,24 @@ def test_default_k_when_invalid():
     kb = MagicMock()
     kb.get_relevant_rules = MagicMock(return_value=[])
     tool = _make_stores(memory=svc, distilled=distilled, kb=kb)
-    # Non-integer k → falls back to 10
+    # Non-integer k → falls back to 50
     tool.invoke({"query": "hello", "k": "many"}, context=_make_context())
     call_kwargs = svc.retrieve_relevant.call_args
-    assert call_kwargs.kwargs.get("k") == 10
+    assert call_kwargs.kwargs.get("k") == 50
+
+
+def test_absurd_k_capped_at_200():
+    """LLM asking k=9999 is clamped to 200 to keep tool output bounded."""
+    svc = MagicMock()
+    svc.retrieve_relevant = AsyncMock(return_value=[])
+    distilled = MagicMock()
+    distilled.search = MagicMock(return_value=[])
+    kb = MagicMock()
+    kb.get_relevant_rules = MagicMock(return_value=[])
+    tool = _make_stores(memory=svc, distilled=distilled, kb=kb)
+    tool.invoke({"query": "hello", "k": 9999}, context=_make_context())
+    call_kwargs = svc.retrieve_relevant.call_args
+    assert call_kwargs.kwargs.get("k") == 200
 
 
 def test_sources_param_restricts_to_kb_rule_only():
