@@ -36,6 +36,32 @@ from src.bot.tools.admin_gate import (
 logger = structlog.get_logger(__name__)
 
 
+def _strip_starlark_noise(stdout: str) -> str:
+    """Drop the gardener kubectl-plugin Starlark warning lines from bash output.
+
+    The gardener kubectl plugin (go-plugin) emits, on (nearly) every kubectl
+    call, a line like:
+
+        2026/11/17 09:28:07 Starlark failed to allocate 4GB address space:
+        cannot allocate memory. Integer performance may suffer.
+
+    to stderr. Because `execute_bash_command` merges stderr into stdout
+    (`stderr=subprocess.STDOUT`), this warning interleaves with the real
+    command output and pollutes the LLM's context — in practice it made the
+    model distrust results and re-run the same query, feeding the tool-loop
+    churn. It is a harmless performance warning, so we strip the whole line
+    (including its leading timestamp) before the result is returned.
+    """
+    if not stdout or "Starlark failed to allocate" not in stdout:
+        return stdout
+    trailing_nl = stdout.endswith("\n")
+    lines = [ln for ln in stdout.splitlines() if "Starlark failed to allocate" not in ln]
+    out = "\n".join(lines)
+    if trailing_nl:
+        out += "\n"
+    return out
+
+
 def _patch_bash_kill_process_group():
     """Monkey-patch Holmes' execute_bash_command to kill the whole process group on timeout.
 
@@ -87,6 +113,7 @@ def _patch_bash_kill_process_group():
         try:
             stdout, _ = process.communicate(timeout=timeout)
             stdout = stdout.strip() if stdout else ""
+            stdout = _strip_starlark_noise(stdout)
             stdout = check_oom_and_append_hint(stdout, process.returncode)
             return holmes_bash.BashResult(
                 stdout=stdout,
@@ -104,6 +131,7 @@ def _patch_bash_kill_process_group():
                 process.kill()
             stdout, _ = process.communicate()
             stdout = stdout.strip() if stdout else ""
+            stdout = _strip_starlark_noise(stdout)
             return holmes_bash.BashResult(
                 stdout=stdout,
                 return_code=None,

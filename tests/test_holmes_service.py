@@ -216,3 +216,39 @@ class TestHolmesService:
                     conversation=sample_conversation,
                     user_permissions=[],  # No agent permission
                 )
+
+class TestStripStarlarkNoise:
+    """Tests for _strip_starlark_noise — drops the gardener kubectl-plugin
+    Starlark 4GB allocation warning that pollutes bash tool output."""
+
+    def test_removes_warning_line_keeps_rest(self):
+        from src.bot.services.holmes_service import _strip_starlark_noise
+        sample = (
+            "kubectl get shoot x -o jsonpath='{.status.seedName}' && echo \"\"\n"
+            "2026/11/17 09:28:07 Starlark failed to allocate 4GB address space: "
+            "cannot allocate memory. Integer performance may suffer.\n"
+            "seed2-private\n"
+        )
+        out = _strip_starlark_noise(sample)
+        assert "Starlark" not in out
+        assert "kubectl get shoot x" in out
+        assert "seed2-private" in out
+
+    def test_removes_multiple_warning_lines(self):
+        from src.bot.services.holmes_service import _strip_starlark_noise
+        warn = ("2026/11/17 09:28:07 Starlark failed to allocate 4GB address space: "
+                "cannot allocate memory. Integer performance may suffer.")
+        out = _strip_starlark_noise(f"a\n{warn}\nb\n{warn}\nc\n")
+        assert out == "a\nb\nc\n"
+
+    def test_noop_when_no_warning(self):
+        from src.bot.services.holmes_service import _strip_starlark_noise
+        assert _strip_starlark_noise("ok\nno noise\n") == "ok\nno noise\n"
+        assert _strip_starlark_noise("") == ""
+        assert _strip_starlark_noise(None) is None
+
+    def test_warning_only_line(self):
+        from src.bot.services.holmes_service import _strip_starlark_noise
+        warn = ("2026/11/17 09:28:07 Starlark failed to allocate 4GB address space: "
+                "cannot allocate memory. Integer performance may suffer.\n")
+        assert _strip_starlark_noise(warn) == "\n"
