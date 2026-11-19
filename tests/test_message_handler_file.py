@@ -118,8 +118,9 @@ async def test_handle_file_text_upload_enqueues_text(msg_handler, tmp_path, monk
     assert "summarize this" in combined
     assert "--- File: note.txt ---" in combined
     assert "hello world, this is extracted text" in combined
-    # File uploads must skip the debounce quiet window.
-    assert kwargs.get("force_flush") is True
+    # File uploads use a short debounce (file_batch) so multiple files
+    # uploaded together combine into one request.
+    assert kwargs.get("file_batch") is True
     # Tmp file cleaned up
     leftover = list(pathlib.Path(str(tmp_path)).glob("*"))
     assert leftover == []
@@ -373,3 +374,100 @@ async def test_handle_file_tmp_cleanup_on_extraction_error(msg_handler, tmp_path
     leftover = list(pathlib.Path(str(tmp_path)).glob("*"))
     assert leftover == [], "tmp file should be cleaned up even on extraction error"
     update.message.reply_text.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_multiple_files_upload_combine_into_one_request(
+    msg_handler, tmp_path, monkeypatch
+):
+    """Uploading 3 files in the same topic dispatches ONE combined Holmes
+    request after the short file-batch quiet window — not 3 separate ones."""
+    import src.bot.handlers.message_handler as mh
+    from src.bot.models.user import User
+
+    monkeypatch.setattr("src.bot.handlers.message_handler.config.file_upload_tmp_dir", str(tmp_path))
+    monkeypatch.setattr(mh.config, "test_mode", False)
+    monkeypatch.setattr(mh.config, "file_batch_quiet_period_seconds", 0.05)
+    monkeypatch.setattr(mh.config, "message_batch_max_wait_seconds", 30)
+    monkeypatch.setattr(mh.config, "message_batch_max_messages", 20)
+
+    msg_handler.permissions.get_or_create_user = AsyncMock(
+        return_value=User(telegram_id=42, permissions=[])
+    )
+    conv = MagicMock()
+    conv.messages = []
+    msg_handler.conversations.get_conversation = AsyncMock(return_value=conv)
+    msg_handler.conversations.save_conversation = AsyncMock()
+
+    async def _stream():
+        yield {"type": "content", "content": "ok"}
+    msg_handler.holmes.chat = AsyncMock(return_value=_stream())
+
+    def _make_update(message_id, filename):
+        update = _file_update(
+            filename=filename, mime="text/plain",
+            message_id=message_id, topic_id=123,
+        )
+        return update
+
+    context = _mock_context(tmp_path)
+    context.bot.send_chat_action = AsyncMock()
+
+    # Simulate 3 rapid file uploads (distinct message ids, same topic).
+    for mid, fname in [(301, "a.txt"), (302, "b.txt"), (303, "c.txt")]:
+        update = _make_update(mid, fname)
+        update.message.reply_text = AsyncMock()
+        await msg_handler.handle_file(update, context)
+
+    # Let the file-batch quiet timer fire.
+    await asyncio.sleep(0.3)
+
+    assert msg_handler.holmes.chat.call_count == 1
+    kwargs = msg_handler.holmes.chat.call_args.kwargs
+    user_message = kwargs["user_message"]
+    assert "--- File: a.txt ---" in user_message
+    assert "--- File: b.txt ---" in user_message
+    assert "--- File: c.txt ---" in user_message
+    mh._topic_batches.clear()
+
+
+@pytest.mark.asyncio
+async def test_single_file_upload_dispatches_quickly(
+    msg_handler, tmp_path, monkeypatch
+):
+    """A lone file upload still dispatches after the short file-batch window
+    (not the 10s message quiet period)."""
+    import src.bot.handlers.message_handler as mh
+    from src.bot.models.user import User
+
+    monkeypatch.setattr("src.bot.handlers.message_handler.config.file_upload_tmp_dir", str(tmp_path))
+    monkeypatch.setattr(mh.config, "test_mode", False)
+    monkeypatch.setattr(mh.config, "file_batch_quiet_period_seconds", 0.05)
+    monkeypatch.setattr(mh.config, "message_batch_quiet_period_seconds", 10)
+    monkeypatch.setattr(mh.config, "message_batch_max_wait_seconds", 30)
+    monkeypatch.setattr(mh.config, "message_batch_max_messages", 20)
+
+    msg_handler.permissions.get_or_create_user = AsyncMock(
+        return_value=User(telegram_id=42, permissions=[])
+    )
+    conv = MagicMock()
+    conv.messages = []
+    msg_handler.conversations.get_conversation = AsyncMock(return_value=conv)
+    msg_handler.conversations.save_conversation = AsyncMock()
+
+    async def _stream():
+        yield {"type": "content", "content": "ok"}
+    msg_handler.holmes.chat = AsyncMock(return_value=_stream())
+
+    update = _file_update(filename="solo.txt", mime="text/plain", message_id=401, topic_id=123)
+    context = _mock_context(tmp_path)
+    context.bot.send_chat_action = AsyncMock()
+    update.message.reply_text = AsyncMock()
+
+    await msg_handler.handle_file(update, context)
+
+    # Lone file should flush after the SHORT file window (~0.05s), not 10s.
+    await asyncio.sleep(0.3)
+
+    assert msg_handler.holmes.chat.call_count == 1
+    mh._topic_batches.clear()

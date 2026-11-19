@@ -118,7 +118,7 @@ async def test_image_upload_attaches_data_url_when_main_model_supports_images(
     text, kwargs = enqueued[0]
     # Caption forwarded verbatim — no "--- File ---" wrapper
     assert text == "what is this?"
-    assert kwargs.get("force_flush") is True
+    assert kwargs.get("file_batch") is True
     images = kwargs.get("images")
     assert isinstance(images, list) and len(images) == 1
     data_url = images[0]["url"]

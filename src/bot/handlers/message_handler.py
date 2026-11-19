@@ -281,13 +281,16 @@ class MessageHandler:
         message_text: str,
         force_flush: bool = False,
         images: Optional[list] = None,
+        file_batch: bool = False,
     ):
         """Validate chat context and enqueue a text turn into the per-topic batch.
 
         Shared by `handle_message` (plain text/sticker/etc.) and `handle_file`
         (file uploads whose contents have been extracted to text). Set
         `force_flush=True` to skip the debounce quiet window and dispatch
-        immediately (used for file/image uploads). `images` (optional list of
+        immediately. `file_batch=True` (file uploads) uses a short quiet window
+        so multiple files uploaded together combine into one request while a
+        lone file still dispatches quickly. `images` (optional list of
         OpenAI vision image dicts) attaches the image to the user message so
         a multimodal main LLM can read it directly; text-only main LLMs should
         not pass `images` (they should extract text first).
@@ -323,7 +326,7 @@ class MessageHandler:
         # Batch per topic: rapid consecutive messages combine into one Holmes request.
         await self._enqueue_for_batch(
             update, context, chat_id, topic_id, user, message_text,
-            force_flush=force_flush, images=images,
+            force_flush=force_flush, images=images, file_batch=file_batch,
         )
 
     async def handle_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -431,8 +434,8 @@ class MessageHandler:
                     # wrapper needed since the model sees the image itself.
                     combined = caption or "(_image uploaded — please inspect)"
                     await self._enqueue_text(
-                        update, context, combined, force_flush=True,
-                        images=[{"url": data_url}],
+                        update, context, combined,
+                        images=[{"url": data_url}], file_batch=True,
                     )
                     return
                 # else: fall through to extraction
@@ -469,10 +472,10 @@ class MessageHandler:
                 f"\n[Original file kept for re-sending: {stashed}]" if stashed else ""
             )
             combined = f"{caption}\n\n--- File: {filename} ---\n{extracted}{reattach_note}".strip() if caption else f"--- File: {filename} ---\n{extracted}{reattach_note}"
-            # File uploads skip the debounce quiet window — extracted text is
-            # already a complete turn; no benefit to waiting for more messages
-            # to batch together.
-            await self._enqueue_text(update, context, combined, force_flush=True)
+            # File uploads use a short quiet window instead of immediate flush:
+            # files uploaded together (same topic, a few seconds apart) combine
+            # into ONE request, while a lone file still dispatches quickly.
+            await self._enqueue_text(update, context, combined, file_batch=True)
         except Exception as e:
             logger.error("File upload handling failed", message_id=message_id, filename=filename, error=str(e))
             try:
@@ -499,11 +502,21 @@ class MessageHandler:
         message_text: str,
         force_flush: bool = False,
         images: Optional[list] = None,
+        file_batch: bool = False,
     ):
-        """Accumulate messages per topic and flush after a quiet period (debounce)."""
+        """Accumulate messages per topic and flush after a quiet period (debounce).
+
+        `file_batch=True` (file uploads) uses the shorter
+        `file_batch_quiet_period_seconds` window instead of the regular
+        message quiet period, so files uploaded together combine into one
+        request without the long text-message wait.
+        """
         key = (chat_id, topic_id)
         now = time.time()
-        quiet = config.message_batch_quiet_period_seconds
+        quiet = (
+            config.file_batch_quiet_period_seconds if file_batch
+            else config.message_batch_quiet_period_seconds
+        )
         max_wait = config.message_batch_max_wait_seconds
         max_messages = config.message_batch_max_messages
 
@@ -525,8 +538,6 @@ class MessageHandler:
             batch.timer.cancel()
             batch.timer = None
 
-        # File/image uploads skip the debounce quiet window — extracted text
-        # is already a complete turn; no benefit to waiting for more messages.
         if force_flush:
             await self._flush_batch(context, chat_id, topic_id)
             return

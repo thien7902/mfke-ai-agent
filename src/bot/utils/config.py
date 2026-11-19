@@ -41,6 +41,10 @@ class Config:
     message_batch_quiet_period_seconds: int = 10
     message_batch_max_wait_seconds: int = 30
     message_batch_max_messages: int = 20
+    # File uploads reuse the same batching pipeline but with a shorter quiet
+    # window so multiple files uploaded together combine into one request,
+    # while a lone file still dispatches quickly.
+    file_batch_quiet_period_seconds: float = 3.0
 
     # File uploads: max extracted text fed to Holmes, tmp dir for downloads,
     # and an optional vision model name (same provider as main LLM) used as
@@ -278,6 +282,7 @@ def load_config() -> Config:
         message_batch_quiet_period_seconds=int(os.getenv("MESSAGE_BATCH_QUIET_PERIOD_SECONDS", "10")),
         message_batch_max_wait_seconds=int(os.getenv("MESSAGE_BATCH_MAX_WAIT_SECONDS", "30")),
         message_batch_max_messages=int(os.getenv("MESSAGE_BATCH_MAX_MESSAGES", "20")),
+        file_batch_quiet_period_seconds=float(os.getenv("FILE_BATCH_QUIET_PERIOD_SECONDS", "3")),
         file_upload_max_text_bytes=int(os.getenv("FILE_UPLOAD_MAX_TEXT_BYTES", str(10 * 1024 * 1024))),
         file_upload_tmp_dir=os.getenv("FILE_UPLOAD_TMP_DIR", "/tmp/bot_uploads"),
         vision_model=os.getenv("VISION_MODEL") or "Qwen3.8-27B",
