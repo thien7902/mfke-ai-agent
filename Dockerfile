@@ -57,16 +57,18 @@ ENV PIP_BREAK_SYSTEM_PACKAGES=1
 RUN pip install --no-cache-dir --ignore-installed --upgrade pip setuptools wheel pipx
 
 # Install OpenStack CLIs and HolmesGPT via pip.
-# clickhouse-driver (holmesgpt transitive dep) is pre-installed FIRST: its
-# sdist metadata uses the legacy `>=3.4.*` python_requires specifier that
-# pip >= 24.1 rejects, but 0.2.11 ships a prebuilt cp312 manylinux wheel
-# whose metadata bypasses the sdist parse. Without this the holmesgpt
-# install dies resolving clickhouse-driver from source.
-RUN pip install --no-cache-dir "clickhouse-driver==0.2.11" --only-binary :all: && \
-    pip install --no-cache-dir \
-        python-openstackclient \
+# Both are pinned to the versions the running fleet uses:
+# - holmesgpt 0.48.0's dependency tree backtracks into broken
+#   clickhouse-driver sdists (legacy `>=3.4.*` python_requires rejected
+#   by pip >= 24.1) while resolving conflicting mcp pins.
+# - python-openstackclient 10.6.0 pulls cliff 4.17 which needs rich>=15,
+#   conflicting with holmesgpt's rich<14 pin -> resolver backtracks
+#   through every cmd2/clickhouse-driver version and dies. 10.5.0's
+#   cliff 4.13.3 has no rich floor, so rich 13.9.4 satisfies both.
+RUN pip install --no-cache-dir \
+        "python-openstackclient==10.5.0" \
         python-octaviaclient \
-        holmesgpt
+        "holmesgpt==0.46.0"
 
 # Install kubectl
 RUN curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg && \
