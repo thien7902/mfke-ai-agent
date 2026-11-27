@@ -56,8 +56,14 @@ ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
 RUN pip install --no-cache-dir --ignore-installed --upgrade pip setuptools wheel pipx
 
-# Install OpenStack CLIs and HolmesGPT via pip
-RUN pip install --no-cache-dir \
+# Install OpenStack CLIs and HolmesGPT via pip.
+# clickhouse-driver (holmesgpt transitive dep) is pre-installed FIRST: its
+# sdist metadata uses the legacy `>=3.4.*` python_requires specifier that
+# pip >= 24.1 rejects, but 0.2.11 ships a prebuilt cp312 manylinux wheel
+# whose metadata bypasses the sdist parse. Without this the holmesgpt
+# install dies resolving clickhouse-driver from source.
+RUN pip install --no-cache-dir "clickhouse-driver==0.2.11" --only-binary :all: && \
+    pip install --no-cache-dir \
         python-openstackclient \
         python-octaviaclient \
         holmesgpt
