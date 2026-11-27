@@ -1538,7 +1538,14 @@ class HolmesService:
                 "/shell manually after review. Restate the exact command if useful.\n"
                 "Other mutating commands (kubectl create, kubectl delete pod/deploy, "
                 "kubectl scale in non-protected ns, helm upgrade, openstack ... fke-*) "
-                "pass through and execute."
+                "pass through and execute.\n"
+                "\nNAMESPACE RULE for helper pods: when creating a pod on a specific "
+                "node (reboot via nsenter, debug, tcpdump, ...), do NOT put it in "
+                "kube-system — a manifest's `namespace: kube-system` field slips past "
+                "the `-n` flag check. Use a neutral workload namespace (e.g. `default`) "
+                "with the same nodeName/hostPID/privileged spec. kube-system is "
+                "reserved for control-plane components; helper pods there risk "
+                "colliding with system state.\n"
             )
         else:
             rule_line = (

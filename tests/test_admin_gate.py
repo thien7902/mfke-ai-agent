@@ -653,6 +653,82 @@ def test_hard_block_chained_with_separator_triggers(monkeypatch):
     assert "hard_block_protected_ns" in r.error or "hard_block_delete_critical" in r.error
 
 
+# ---------- Hard-block Pattern J: create with protected-ns manifest ----------
+
+# The exact production incident command (2026-11-27): reboot helper pod
+# created in kube-system via echo-piped YAML — the -n flag check in
+# Pattern C cannot see inside the manifest.
+_INCIDENT_REBOOT_CMD = (
+    "echo 'apiVersion: v1\n"
+    "kind: Pod\n"
+    "metadata:\n"
+    "  name: node-reboot-me3nu899\n"
+    "  namespace: kube-system\n"
+    "spec:\n"
+    "  nodeName: sgn-seed1-worker-me3nu899\n"
+    "  hostPID: true\n"
+    "  containers:\n"
+    "  - name: reboot\n"
+    "    image: busybox:1.36\n"
+    "restartPolicy: Never' | kubectl create -f -"
+)
+
+@pytest.mark.parametrize("cmd", [
+    _INCIDENT_REBOOT_CMD,
+    # heredoc form
+    "kubectl create -f - <<'EOF'\napiVersion: v1\nkind: Pod\nmetadata:\n  name: dbg\n  namespace: kube-system\nEOF",
+    # explicit file arg with inline yaml content
+    "kubectl create -f manifest.yaml\nnamespace: kube-system",
+    # quoted namespace value
+    "echo 'metadata:\n  namespace: \"kube-system\"' | kubectl create -f -",
+    # garden- prefix in manifest
+    "echo 'metadata:\n  namespace: garden-proj-x' | kubectl create -f -",
+    # kubectl not first token (piped after echo)
+    "echo 'metadata:\n  namespace: kube-system' | kubectl create -f -",
+])
+def test_hard_block_protected_ns_manifest_blocks(monkeypatch, cmd):
+    """Pattern J: kubectl create whose manifest names a protected namespace
+    in its `namespace:` field is hard-blocked, admins included."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    ctx = FakeCtx(request_context={"user_id": "12345"})
+    r = tool.invoke({"command": cmd}, ctx)
+    assert r.status.value == "error"
+    assert "hard_block_protected_ns_manifest" in r.error
+
+
+@pytest.mark.parametrize("cmd", [
+    # create with no manifest (imperative form) — admin-gate only, not hard
+    "kubectl create configmap foo --from-literal=a=b",
+    "kubectl create deployment nginx --image=nginx",
+    # manifest with a neutral namespace
+    "echo 'kind: Pod\nmetadata:\n  name: x\n  namespace: default' | kubectl create -f -",
+    # manifest with a workload namespace
+    "echo 'kind: Pod\nmetadata:\n  name: x\n  namespace: my-app' | kubectl create -f -",
+    # shoot-- namespaces deliberately not protected
+    "echo 'metadata:\n  namespace: shoot--proj--name' | kubectl create -f -",
+    # read-only -o yaml output mentioning kube-system must NOT fire
+    "kubectl get pod x -n kube-system -o yaml",
+    "kubectl get pods -A | grep kube-system",
+    # get/describe in protected ns (Pattern C read-only pass-through)
+    "kubectl get -n kube-system pods",
+])
+def test_hard_block_protected_ns_manifest_not_triggered(monkeypatch, cmd):
+    """Pattern J must not fire on imperative create, neutral-ns manifests,
+    shoot-- namespaces, or read-only commands."""
+    monkeypatch.setattr(admin_gate.config, "admin_user_ids", [12345])
+    tool = FakeBashTool()
+    ex = FakeExecutor([FakeToolset([tool])])
+    admin_gate.wrap_tools_with_admin_gate(ex)
+
+    ctx = FakeCtx(request_context={"user_id": "12345"}, user_approved=False)
+    r = tool.invoke({"command": cmd}, ctx)
+    assert "hard_block_protected_ns_manifest" not in (r.error or "")
+
+
 # ---------- Hard-block rules (Pattern D: openstack non-fke mutations) ----------
 
 @pytest.mark.parametrize("cmd", [

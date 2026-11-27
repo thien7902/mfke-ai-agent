@@ -242,6 +242,28 @@ _HARD_BLOCK_MUTATING_VERBS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Pattern J — `kubectl create -f <manifest>` (or `create -f -` with piped
+# stdin) where the manifest TEXT itself names a protected namespace in its
+# `namespace:` field. The `-n` flag check in Pattern C cannot see inside a
+# heredoc/echo-piped YAML — that is how the LLM created a reboot helper pod
+# in kube-system (production incident 2026-11-27). Only `create` is checked
+# here — `apply` is already globally blocked by Pattern A, and read-only
+# verbs (`get -o yaml`, `describe`) never carry a manifest payload.
+_HARD_BLOCK_CREATE_MANIFEST_RE = re.compile(
+    rf"kubectl\s+{_KUBECTL_GLOBAL_FLAGS}create\b",
+    re.IGNORECASE,
+)
+# Matches `namespace: kube-system` (YAML field) anywhere in the command
+# text. Anchored on the colon so it only fires on manifest content, never
+# on flag forms (`-n kube-system`) — those belong to Pattern C. The value
+# must be followed by end-of-line (newline, quote, or end-of-string) so
+# `namespace: kube-system-note` style longer names don't false-positive on
+# the `kube-system` prefix.
+_MANIFEST_PROTECTED_NS_RE = re.compile(
+    r"namespace\s*:\s*[\"']?(" + _PROTECTED_NS_NAME_RE.pattern + r")[\"']{0,2}(?:\s|$)",
+    re.IGNORECASE,
+)
+
 # Pattern D — OpenStack mutating verbs on resources whose name does NOT
 # contain "fke". OpenStack CLI verbs that change state: delete (destroy),
 # set/unset (mutate properties), update (Heat stack update), remove (role/
@@ -539,6 +561,14 @@ def _mutation_reason(cmd: Any, *, hard_block_only: bool = False) -> Optional[str
     # quote-naive like Pattern G's case.
     if _CURL_MUTATING_METHOD_RE.search(cmd) and _K8S_API_URL_RE.search(cmd):
         return "hard_block_curl_k8s_api"
+    # Pattern J: `kubectl create -f -` with an inline/piped manifest whose
+    # `namespace:` field names a protected namespace. Checked on the RAW
+    # command — like Patterns G/F, the manifest YAML may contain shell
+    # separators inside quoted strings that the naive splitter would mangle.
+    # Raw command also spans the `echo '...' |` prefix and the
+    # `| kubectl create` tail in one string, so both halves are visible.
+    if _HARD_BLOCK_CREATE_MANIFEST_RE.search(cmd) and _MANIFEST_PROTECTED_NS_RE.search(cmd):
+        return "hard_block_protected_ns_manifest"
     # Pattern I/H together: restrict ALL python3 invocations to the
     # inline `-c "..."` form. Pattern G only sees source that's
     # literally in the bash command; running `python3 outbox/x.py` (or
@@ -815,6 +845,18 @@ _HARD_BLOCK_MESSAGES = {
         "different protected namespace. Pivot to read-only investigation: "
         "`kubectl get` / `describe` / `logs` to gather context, then "
         "instruct the user to run the change via /shell manually."
+    ),
+    "hard_block_protected_ns_manifest": (
+        "kubectl create with a manifest that sets `namespace: <protected-ns>` "
+        "(kube-system / kube-public / kube-node-lease / garden / "
+        "gardener-system / extension* / garden-*) is blocked by the bot's "
+        "safety policy — the -n flag check cannot see inside piped YAML but "
+        "the policy is the same: protected namespaces hold control-plane "
+        "state and must not receive workloads from the bot. Do NOT retry "
+        "with a modified manifest. If a node-targeted helper pod (reboot/"
+        "debug/tcpdump) is needed, target a neutral workload namespace (e.g. "
+        "`default`) with the same nodeName/hostPID/privileged spec, or "
+        "instruct the user to run it via /shell manually."
     ),
     "hard_block_openstack_non_fke": (
         "openstack <delete|set|unset|update|remove> on a resource whose "
